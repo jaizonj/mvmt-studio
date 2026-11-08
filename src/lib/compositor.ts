@@ -16,6 +16,7 @@ export {
   createPreview,
   inspectAsset,
   isCompositorAvailable,
+  measureTakeSync,
   releasePreview,
   renderVideo,
   seekPreview,
@@ -28,4 +29,6 @@ export {
   type PreviewProgressEvent,
   type PreviewStatus,
   type PreviewStatusEvent,
+  type TakeSyncMeasurement,
+  type TakeSyncStatus,
 } from '../../modules/mvmt-compositor/src/index';

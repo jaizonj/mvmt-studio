@@ -45,9 +45,38 @@ export interface Take {
    */
   syncOffsetSeconds?: number;
   /**
+   * Manual per-take sync calibration, in INTEGER frames at the project
+   * fps (30) — Jaizon's by-ear/eye correction when automatic sync is
+   * still imperfect. Added to the measured offset inside the ONE shared
+   * offset function (`takeSyncOffsetSeconds` in src/lib/edl.ts), so the
+   * shuffle bridge, the editor's sync anchor, preview and export all
+   * honour it identically. Same sign convention as syncOffsetSeconds:
+   * positive = the capture is treated as having started later (the
+   * footage for a given song position is read earlier in the file).
+   * Undefined = no correction (0). Optional — never required.
+   */
+  syncAdjustFrames?: number;
+  /**
+   * Provenance of `syncOffsetSeconds`: 'playerSample' = the audio
+   * player's position sampled at record start/stop (the original
+   * estimate); 'fileCorrelation' = measured after the fact from the
+   * recorded file itself (native correlation of the take's mic audio
+   * against the master track). Undefined for older takes.
+   */
+  syncSource?: 'playerSample' | 'fileCorrelation';
+  /**
+   * Confidence (0..1) of a 'fileCorrelation' measurement — peak
+   * prominence of the correlation match. Only meaningful when
+   * syncSource is 'fileCorrelation'; low-confidence measurements must
+   * not silently replace a playerSample value.
+   */
+  syncConfidence?: number;
+  /**
    * Measured drift over the take, seconds: (song elapsed between the
    * record-start and record-stop samples) − (the take's measured
-   * duration). Near zero = clocks agree; grows with device load.
+   * duration). Diagnostic only — never consumed by the sync mapping:
+   * dominated by capture-start latency, not clock drift (2026-11-09
+   * audit).
    */
   syncDriftSeconds?: number;
   /** User-facing name for the take (Takes screen rename). Default: "Take N". */

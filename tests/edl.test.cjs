@@ -9,7 +9,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { buildEdlFromShuffle, validateAgainstAssets, sequenceKey } = require('./.build-edl/src/lib/shuffleEdl.js');
 const { buildSections } = require('./.build-edl/src/lib/analysis.js');
-const { sourceFrameForTimelineFrame, secondsToFrames, DEFAULT_FPS } = require('./.build-edl/src/lib/edl.js');
+const {
+  sourceFrameForTimelineFrame,
+  takeSyncOffsetSeconds,
+  secondsToFrames,
+  framesToSeconds,
+  DEFAULT_FPS,
+} = require('./.build-edl/src/lib/edl.js');
 
 const FPS = DEFAULT_FPS; // 30
 const REGION_SECONDS = 15;
@@ -105,7 +111,7 @@ test('source mapping: every segment follows the shared timeline→source formula
   const byId = new Map(takes.map((t) => [t.id, t]));
   for (const segment of edl.segments) {
     const take = byId.get(segment.takeId);
-    const offset = take.trackOffsetSeconds - 0 + (take.syncOffsetSeconds ?? 0);
+    const offset = takeSyncOffsetSeconds(take, 0, FPS);
     const expected = Math.max(0, sourceFrameForTimelineFrame(segment.timelineStartFrame, offset, FPS));
     assert.equal(segment.sourceStartFrame, expected, `segment ${segment.id} (${segment.takeId})`);
   }
@@ -219,4 +225,170 @@ test('fallback: with no sampled sections, the grid is built from take durations'
   const { edl, shuffleInfo } = build({ sections: [] });
   assert.ok(shuffleInfo);
   assertGapless(edl, REGION_FRAMES);
+});
+
+// ---------------------------------------------------------------------
+// Sync fix (2026-11-09): ONE shared offset (takeSyncOffsetSeconds),
+// drift exclusion, manual frame calibration, legacy safety.
+// ---------------------------------------------------------------------
+
+const near = (a, b) => Math.abs(a - b) < 1e-9;
+
+test('shared offset: takeSyncOffsetSeconds composes window + measured + calibration', () => {
+  // Window position relative to the region start is the base.
+  assert.equal(takeSyncOffsetSeconds({ trackOffsetSeconds: 10 }, 4, FPS), 6);
+  // The measured capture error adds directly (positive = started late).
+  assert.equal(takeSyncOffsetSeconds({ trackOffsetSeconds: 10, syncOffsetSeconds: 0.5 }, 4, FPS), 6.5);
+  // Manual calibration adds in whole frames: +3 frames @30fps = +0.1s.
+  assert.ok(near(takeSyncOffsetSeconds({ trackOffsetSeconds: 10, syncAdjustFrames: 3 }, 4, FPS), 6.1));
+  assert.ok(near(takeSyncOffsetSeconds({ trackOffsetSeconds: 10, syncAdjustFrames: -3 }, 4, FPS), 5.9));
+  // All three terms compose.
+  assert.ok(
+    near(
+      takeSyncOffsetSeconds({ trackOffsetSeconds: 10, syncOffsetSeconds: 0.5, syncAdjustFrames: 3 }, 4, FPS),
+      6.6,
+    ),
+  );
+  // Undefined sync fields are exactly zero — the pre-fix formula.
+  assert.equal(takeSyncOffsetSeconds({ trackOffsetSeconds: 7 }, 2, FPS), 7 - 2);
+});
+
+test('alignment: takes with different capture-start delays point at the same song positions', () => {
+  // Direct mapping at one timeline frame (10s into the region): the
+  // take that started capturing 0.5s later must be read 15 frames
+  // earlier in its file, so both files show the SAME song moment.
+  const F = 300;
+  const punctual = { trackOffsetSeconds: 0, syncOffsetSeconds: 0.2 };
+  const delayed = { trackOffsetSeconds: 0, syncOffsetSeconds: 0.7 };
+  const sPunctual = sourceFrameForTimelineFrame(F, takeSyncOffsetSeconds(punctual, 0, FPS), FPS);
+  const sDelayed = sourceFrameForTimelineFrame(F, takeSyncOffsetSeconds(delayed, 0, FPS), FPS);
+  assert.equal(sPunctual - sDelayed, 15);
+  // Recovered song position = file time + when capture actually began.
+  const songOf = (take, sourceFrame) =>
+    framesToSeconds(sourceFrame, FPS) + take.trackOffsetSeconds + (take.syncOffsetSeconds ?? 0);
+  assert.equal(songOf(punctual, sPunctual), framesToSeconds(F, FPS));
+  assert.equal(songOf(delayed, sDelayed), framesToSeconds(F, FPS));
+
+  // End to end through the bridge: every (unclamped) segment of every
+  // take satisfies the same identity against its timeline position.
+  const takes = makeTakes(0);
+  takes[0].syncOffsetSeconds = 0.2;
+  takes[1].syncOffsetSeconds = 0.7;
+  takes[2].syncOffsetSeconds = -0.1; // captured slightly early
+  const { edl } = build({ takes });
+  const byId = new Map(takes.map((t) => [t.id, t]));
+  let checked = 0;
+  for (const segment of edl.segments) {
+    if (segment.sourceStartFrame === 0) continue; // clamped: not enough footage before the window
+    const take = byId.get(segment.takeId);
+    assert.ok(
+      near(songOf(take, segment.sourceStartFrame), framesToSeconds(segment.timelineStartFrame, FPS)),
+      `segment ${segment.id} (${segment.takeId}) must show the song at its timeline position`,
+    );
+    checked += 1;
+  }
+  assert.ok(checked >= 3, `expected several segments to verify, got ${checked}`);
+});
+
+test('drift invariance: syncDriftSeconds never enters the mapping', () => {
+  // Audit verdict (2026-11-09): the stored drift figure is dominated
+  // by capture-start latency, not clock drift — so wildly different
+  // drift values must produce byte-identical edits.
+  const driftPlusMinus = makeTakes(0).map((t, i) => ({ ...t, syncDriftSeconds: i === 0 ? 5 : -5 }));
+  const driftHuge = makeTakes(0).map((t) => ({ ...t, syncDriftSeconds: 123.456 }));
+  const plain = build();
+  assert.equal(JSON.stringify(build({ takes: driftPlusMinus }).edl), JSON.stringify(plain.edl));
+  assert.equal(JSON.stringify(build({ takes: driftHuge }).edl), JSON.stringify(plain.edl));
+});
+
+test('calibration: syncAdjustFrames shifts the source by whole frames, honoured on every shuffle', () => {
+  // Sign, per the formula: the adjustment ADDS to the offset, and the
+  // offset is SUBTRACTED from the timeline frame — so +3 frames of
+  // calibration reads the footage 3 frames EARLIER in the file.
+  const F = 300;
+  const unadjusted = sourceFrameForTimelineFrame(
+    F,
+    takeSyncOffsetSeconds({ trackOffsetSeconds: 0 }, 0, FPS),
+    FPS,
+  );
+  const adjusted = sourceFrameForTimelineFrame(
+    F,
+    takeSyncOffsetSeconds({ trackOffsetSeconds: 0, syncAdjustFrames: 3 }, 0, FPS),
+    FPS,
+  );
+  assert.equal(adjusted, unadjusted - 3);
+
+  // End to end: only the calibrated take's segments move, by exactly
+  // −3 frames (clamped at 0); take selection is unchanged.
+  const base = build();
+  const calTakes = makeTakes(0);
+  calTakes[1].syncAdjustFrames = 3; // 'mid'
+  const cal = build({ takes: calTakes });
+  assert.equal(sequenceKey(cal.edl), sequenceKey(base.edl));
+  cal.edl.segments.forEach((segment, i) => {
+    const before = base.edl.segments[i];
+    if (segment.takeId === 'mid') {
+      assert.equal(segment.sourceStartFrame, Math.max(0, before.sourceStartFrame - 3));
+    } else {
+      assert.equal(segment.sourceStartFrame, before.sourceStartFrame);
+    }
+  });
+
+  // Re-shuffling with other seeds must not mutate the input takes,
+  // and the calibration is honoured in every resulting edit.
+  const snapshot = JSON.stringify(calTakes);
+  let midChecked = 0;
+  for (const seed of [7, 99]) {
+    const { edl } = build({ takes: calTakes, seed });
+    for (const segment of edl.segments) {
+      if (segment.takeId !== 'mid') continue;
+      const expected = Math.max(
+        0,
+        sourceFrameForTimelineFrame(
+          segment.timelineStartFrame,
+          takeSyncOffsetSeconds(calTakes[1], 0, FPS),
+          FPS,
+        ),
+      );
+      assert.equal(segment.sourceStartFrame, expected);
+      midChecked += 1;
+    }
+  }
+  assert.ok(midChecked > 0, 'expected at least one mid segment across the re-shuffles');
+  assert.equal(JSON.stringify(calTakes), snapshot, 'the bridge must not mutate its input takes');
+});
+
+test('legacy safety: takes with no sync metadata build and validate exactly as before', () => {
+  // The default fixture carries NO sync fields at all (pre-measurement
+  // takes): the offset collapses to trackOffset − regionStart.
+  const { edl, shuffleInfo } = build({
+    sections: makeSections(10),
+    takes: makeTakes(10),
+    regionStartSeconds: 10,
+  });
+  assert.ok(shuffleInfo);
+  assert.equal(edl.segments[0].sourceStartFrame, 0);
+  const validated = validateAgainstAssets(edl, makeTakes(10), FPS);
+  assert.equal(validated.ok, true);
+  assert.deepEqual(validated.errors, []);
+});
+
+test('persistence: sync fields survive the project JSON round-trip', () => {
+  // src/lib/persistence.ts serialises the whole project state with
+  // JSON.stringify and restores it with JSON.parse (no field picking),
+  // so a plain JSON round-trip of a Take fixture is the honest
+  // headless proxy for the app-restart check.
+  const take = {
+    id: 'take-1',
+    trackOffsetSeconds: 3.25,
+    syncOffsetSeconds: 0.42,
+    syncAdjustFrames: -2,
+    syncSource: 'fileCorrelation',
+    syncConfidence: 0.87,
+    syncDriftSeconds: 0.03,
+  };
+  const revived = JSON.parse(JSON.stringify({ id: 'project-1', takes: [take] })).takes[0];
+  assert.deepEqual(revived, take);
+  // The revived take drives the shared offset identically.
+  assert.equal(takeSyncOffsetSeconds(revived, 1, FPS), takeSyncOffsetSeconds(take, 1, FPS));
 });

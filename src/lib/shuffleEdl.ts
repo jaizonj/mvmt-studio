@@ -7,6 +7,7 @@ import {
   layoutSegments,
   secondsToFrames,
   sourceFrameForTimelineFrame,
+  takeSyncOffsetSeconds,
   validateEdl,
   type AssetMeasure,
   type Edl,
@@ -55,11 +56,16 @@ export interface ShuffleEdlTake {
   trackOffsetSeconds: number;
   /**
    * Optional MEASURED sync correction in seconds (positive = capture
-   * actually started late). `Take` does not carry this field yet; it is
-   * read defensively so measured-sync work can land without changing
-   * this bridge's signature.
+   * actually started late) — `Take.syncOffsetSeconds`. Consumed only
+   * through `takeSyncOffsetSeconds` (src/lib/edl.ts), never inline.
    */
   syncOffsetSeconds?: number;
+  /**
+   * Optional manual sync calibration in integer frames at the project
+   * fps — `Take.syncAdjustFrames`. Added inside the shared offset
+   * function, like the measured correction.
+   */
+  syncAdjustFrames?: number;
   /**
    * Recorded length in seconds. Only used to size the fallback section
    * grid when the caller supplies no sections.
@@ -150,21 +156,13 @@ export function buildEdlFromShuffle(input: BuildEdlFromShuffleInput): BuildEdlFr
     const take = takeById.get(slot.takeId);
     const startFrame = secondsToFrames(Math.max(0, slot.startSeconds - regionStartSeconds), fps);
     const endFrame = secondsToFrames(Math.max(0, slot.endSeconds - regionStartSeconds), fps);
-    // SYNC OFFSET DEFINITION — the value handed to
-    // sourceFrameForTimelineFrame for this take:
-    //
-    //   takeSyncOffsetSeconds
-    //     = take.trackOffsetSeconds − regionStartSeconds
-    //       + (take.syncOffsetSeconds ?? 0)
-    //
-    // i.e. where the take's recording window sat relative to the region
-    // start, corrected by the take's MEASURED capture error (positive =
-    // capture started late, so the footage for a given timeline frame
-    // lives earlier inside the file). This is the single definition;
-    // preview, export and the editor all inherit it via the EDL.
-    const takeSyncOffsetSeconds = take
-      ? take.trackOffsetSeconds - regionStartSeconds + (take.syncOffsetSeconds ?? 0)
-      : 0;
+    // SYNC OFFSET — the value handed to sourceFrameForTimelineFrame
+    // for this take comes from the ONE shared definition,
+    // takeSyncOffsetSeconds (src/lib/edl.ts): the take's window
+    // relative to the region start, corrected by its MEASURED capture
+    // error and its manual frame calibration. Preview, export and the
+    // editor all inherit it via the EDL.
+    const offsetSeconds = take ? takeSyncOffsetSeconds(take, regionStartSeconds, fps) : 0;
     return {
       // Positional ids: stable across identical runs (determinism) and
       // unique within the edit.
@@ -172,7 +170,7 @@ export function buildEdlFromShuffle(input: BuildEdlFromShuffleInput): BuildEdlFr
       takeId: slot.takeId,
       sourceStartFrame: Math.max(
         0,
-        sourceFrameForTimelineFrame(startFrame, takeSyncOffsetSeconds, fps),
+        sourceFrameForTimelineFrame(startFrame, offsetSeconds, fps),
       ),
       durationFrames: endFrame - startFrame,
     };

@@ -70,6 +70,65 @@ export interface AssetInfo {
   frameRate: number;
   hasVideo: boolean;
   hasAudio: boolean;
+  /**
+   * Start time of the first video track inside the file, in seconds (its
+   * timeRange start — where the first frame sits on the asset timeline).
+   * Optional: absent in older native builds; 0 when there is no video track.
+   */
+  videoStartSeconds?: number;
+  /**
+   * Start time of the first audio track inside the file, in seconds.
+   * Optional: absent in older native builds; 0 when there is no audio track.
+   */
+  audioStartSeconds?: number;
+  /**
+   * Duration of the first video track's timeRange, in seconds.
+   * Optional: absent in older native builds; 0 when there is no video track.
+   */
+  videoDurationSeconds?: number;
+  /**
+   * Duration of the first audio track's timeRange, in seconds.
+   * Optional: absent in older native builds; 0 when there is no audio track.
+   */
+  audioDurationSeconds?: number;
+}
+
+/**
+ * Outcome of a native per-take sync measurement (`measureTakeSync`).
+ *
+ * - `measured` — the mic audio correlated confidently with the master
+ *   song; `songPositionAtFirstFrameSeconds` is set.
+ * - `noSongInMic` — the take has no audio track, or its audio is too
+ *   quiet to contain the song (e.g. recorded with earbuds).
+ * - `lowConfidence` — a best alignment was found but failed the
+ *   confidence gates; the numbers are diagnostics only and
+ *   `songPositionAtFirstFrameSeconds` is null so callers cannot
+ *   accidentally apply the correction.
+ * - `outOfWindow` — the best alignment falls outside the search window
+ *   around the expected position.
+ * - `error` — the measurement could not run (missing/unreadable file,
+ *   decode failure).
+ */
+export type TakeSyncStatus = 'measured' | 'noSongInMic' | 'lowConfidence' | 'outOfWindow' | 'error';
+
+/** Result of measuring a take's true sync offset from its recorded file. */
+export interface TakeSyncMeasurement {
+  status: TakeSyncStatus;
+  /**
+   * Song position (seconds into the master song) at the take's first
+   * VIDEO frame. Only set when `status` is `'measured'`.
+   */
+  songPositionAtFirstFrameSeconds: number | null;
+  /**
+   * Intra-file A/V offset δ = audioTrack.start − videoTrack.start, in
+   * seconds — a pure file fact, set whenever both tracks exist, even
+   * when the correlation itself was not confident.
+   */
+  intraFileAvOffsetSeconds: number | null;
+  /** Normalised correlation ρ ∈ [0, 1] at the refined peak. */
+  confidence: number | null;
+  /** Peak / second-peak ratio (second peak ≥ 50 ms from the winner). */
+  peakRatio: number | null;
 }
 
 export interface ExportProgressEvent {
@@ -102,6 +161,12 @@ interface NativeMvmtCompositorModule {
   renderVideo(request: CompositeRequest): Promise<CompositeResult>;
   cancelExport(exportId: string): Promise<void>;
   inspectAsset(uri: string): Promise<AssetInfo>;
+  measureTakeSync(
+    takeUri: string,
+    songUri: string,
+    expectedSongPositionAtTakeStartSeconds: number,
+    searchWindowSeconds: number,
+  ): Promise<TakeSyncMeasurement>;
   createPreview(request: CompositeRequest): Promise<string>;
   setPreviewPaused(previewId: string, paused: boolean): Promise<void>;
   seekPreview(previewId: string, seconds: number): Promise<void>;
@@ -156,6 +221,46 @@ export async function cancelExport(exportId: string): Promise<void> {
 /** Measure a media file natively (true duration, display size, fps, tracks). */
 export async function inspectAsset(uri: string): Promise<AssetInfo> {
   return requireModule().inspectAsset(uri);
+}
+
+/**
+ * Measure a take's TRUE sync offset from the recorded file itself —
+ * the replacement for the JS player-position estimate sampled before
+ * `recordAsync` (which misses the camera's variable spin-up time).
+ *
+ * Natively: the take's per-track timeRanges give the intra-file A/V
+ * offset, and the take's mic audio (which captured the song playing
+ * aloud) is cross-correlated against the master song — a coarse
+ * envelope pass over the search window, then a sample-accurate raw-PCM
+ * refinement. The result is the song position at the take's first
+ * video frame.
+ *
+ * Expected failure modes (no song in the mic track, low correlation
+ * confidence, alignment outside the window, unreadable files) are
+ * reported via `TakeSyncMeasurement.status`, NOT thrown. Only call
+ * this when `isCompositorAvailable()` — like `inspectAsset`, it throws
+ * the "not available in this build" error when the module is missing.
+ *
+ * @param takeUri  The recorded take (`file://` URI or absolute path).
+ * @param songUri  The master song file.
+ * @param expectedSongPositionAtTakeStartSeconds  The existing JS
+ *   estimate of the song position at the take's audio-track start —
+ *   the centre of the search window.
+ * @param searchWindowSeconds  ± window around the estimate to search.
+ *   Default 2.
+ */
+export async function measureTakeSync(
+  takeUri: string,
+  songUri: string,
+  expectedSongPositionAtTakeStartSeconds: number,
+  searchWindowSeconds = 2,
+): Promise<TakeSyncMeasurement> {
+  return requireModule().measureTakeSync(
+    takeUri,
+    songUri,
+    expectedSongPositionAtTakeStartSeconds,
+    searchWindowSeconds,
+  );
 }
 
 /**

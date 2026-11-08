@@ -23,6 +23,21 @@ import { TrackSheet } from '../../components/TrackSheet';
 import { Image } from 'expo-image';
 
 import { NativePreview } from '../../components/NativePreview';
+import {
+  isCompositorAvailable,
+  measureTakeSync,
+  type CompositeRequest,
+  type TakeSyncMeasurement,
+} from '../../lib/compositor';
+import {
+  DEFAULT_FPS,
+  edlToCompositeRequest,
+  emptyEdl,
+  secondsToFrames,
+  sourceFrameForTimelineFrame,
+  takeSyncOffsetSeconds,
+  type Edl,
+} from '../../lib/edl';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import type { Take } from '../../types';
 import { measureTakeDurationSeconds, persistTake, pickAudioTrack } from '../../lib/media';
@@ -70,18 +85,71 @@ const LENGTH_PRESETS: { label: string; seconds: number | null }[] = [
  * studio store so Settings shows the real values from any screen.
  */
 /**
- * Sync status in human words, from the take's MEASURED sync offset
- * (same mapping the Takes rail preview uses everywhere): ~1 frame at
- * 30 fps (0.04s) is plainly in sync; up to 0.10s is a slight offset;
- * beyond that, check before export. No raw values are shown.
+ * Sync status in human words, PROVENANCE-AWARE (2026-11-09). The base
+ * wording still comes from the take's sync offset — ~1 frame at 30 fps
+ * (0.04s) is plainly in sync, up to 0.10s is a slight offset, beyond
+ * that, check before export — but where the number came from is part
+ * of the label: a file-correlated measurement says so ("measured from
+ * file"), while a player-sampled (or legacy, provenance-less) figure
+ * is honestly labelled an estimate. A manual frame calibration
+ * appends "· adjusted ±Nf" (sign as stored). No raw second values are
+ * ever shown.
  */
 function syncStatusText(take: Take): string {
+  const adjust = take.syncAdjustFrames ?? 0;
+  const adjustSuffix = adjust !== 0 ? ` · adjusted ${adjust > 0 ? '+' : '−'}${Math.abs(adjust)}f` : '';
   const offset = take.syncOffsetSeconds;
-  if (offset === undefined) return 'Sync not measured';
+  if (offset === undefined) return `Sync unmeasured${adjustSuffix}`;
+  const provenance = take.syncSource === 'fileCorrelation' ? ' · measured from file' : ' · sync estimated';
   const magnitude = Math.abs(offset);
-  if (magnitude <= 0.04) return 'In sync';
-  if (magnitude <= 0.1) return 'In sync · slight offset';
-  return 'Off sync — check before export';
+  if (magnitude <= 0.04) return `In sync${provenance}${adjustSuffix}`;
+  if (magnitude <= 0.1) return `In sync · slight offset${provenance}${adjustSuffix}`;
+  return `Off sync${provenance} — check before export${adjustSuffix}`;
+}
+
+/**
+ * Song-referenced calibration preview for one take: a synthetic
+ * one-segment EDL converted with the SAME edlToCompositeRequest the
+ * Editor uses, so the rail card plays the take against the master
+ * song exactly as a cut at the take's region start would (master song
+ * only — the take's own audio stays muted, per the EDL audio policy).
+ * The segment's source start comes from the ONE shared offset
+ * (takeSyncOffsetSeconds: measured offset + manual frame
+ * calibration), so a nudge here previews identically to the real
+ * edit. The requestKey carries every sync input, so a nudge — or a
+ * fresh file measurement landing — rebuilds the preview.
+ */
+function calibrationPreviewFor(take: Take, songUri: string): { request: CompositeRequest; requestKey: string } {
+  const fps = DEFAULT_FPS;
+  const durationFrames = secondsToFrames(take.durationSeconds ?? 0, fps);
+  const sourceStartFrame = Math.max(
+    0,
+    sourceFrameForTimelineFrame(0, takeSyncOffsetSeconds(take, take.trackOffsetSeconds, fps), fps),
+  );
+  const edl: Edl = {
+    ...emptyEdl(fps),
+    segments: [
+      {
+        id: `sync-preview-${take.id}`,
+        takeId: take.id,
+        timelineStartFrame: 0,
+        sourceStartFrame,
+        durationFrames,
+      },
+    ],
+    totalFrames: durationFrames,
+    audio: { uri: songUri, regionStartFrame: secondsToFrames(take.trackOffsetSeconds, fps), volume: 1 },
+  };
+  const request = edlToCompositeRequest(edl, (id) => (id === take.id ? take.uri : undefined));
+  const requestKey = [
+    'sync-preview',
+    take.id,
+    take.syncAdjustFrames ?? 0,
+    take.syncOffsetSeconds ?? 'unmeasured',
+    take.syncSource ?? 'legacy',
+    songUri,
+  ].join('|');
+  return { request, requestKey };
 }
 
 /** The rail tile's thumbnail moment: 40% into the take. */
@@ -230,6 +298,97 @@ export default function CameraScreen() {
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []),
+  );
+
+  // Latest takes, mirrored into a ref for async sync work: a file
+  // measurement that resolves after the user deleted the take or
+  // switched projects must not patch anything (updateTake would
+  // no-op on a missing id anyway — this makes the intent explicit
+  // and avoids even the state write).
+  const liveTakesRef = useRef(takes);
+  useEffect(() => {
+    liveTakesRef.current = takes;
+  }, [takes]);
+
+  /**
+   * FILE-BASED SYNC REFINEMENT — after a take exists, ask the native
+   * engine to measure its TRUE capture offset from the recorded file
+   * itself (correlation of the song bleed in the take's mic audio
+   * against the master song). Fire-and-forget: it NEVER blocks or
+   * fails a save, and any outcome other than a confident 'measured'
+   * leaves the take exactly as it is.
+   *
+   * The expected position is ACOUSTIC — where the song should be at
+   * the take's start if the stored offset is right. The stored JS
+   * offset had the Settings audio correction (audioOffsetMs)
+   * SUBTRACTED out at record time; correlation hears the song as
+   * actually emitted, so the expectation adds it back. Symmetrically,
+   * the measured result is stored with NO audioOffset subtraction:
+   * the file's timeline already embodies the acoustic path.
+   */
+  const refineTakeSyncFromFile = useCallback(
+    async (candidate: { id: string; uri: string; trackOffsetSeconds: number; syncOffsetSeconds?: number }) => {
+      if (!track || !isCompositorAvailable()) return;
+      let result: TakeSyncMeasurement;
+      try {
+        result = await measureTakeSync(
+          candidate.uri,
+          track.uri,
+          candidate.trackOffsetSeconds + (candidate.syncOffsetSeconds ?? 0) + audioOffsetMs / 1000,
+          2,
+        );
+      } catch {
+        // Module unlinked in this build — same as status 'error':
+        // keep the player-sample estimate.
+        return;
+      }
+      if (result.status !== 'measured' || result.songPositionAtFirstFrameSeconds === null) return;
+      // Gone meanwhile (deleted, or the user switched projects)?
+      if (!liveTakesRef.current.some((t) => t.id === candidate.id)) return;
+      studio.updateTake(candidate.id, {
+        // The correlated position is absolute in the track; the stored
+        // offset is relative to the take's region start — the same
+        // definition the player-sample path stores (positive = capture
+        // started late), on the acoustic timeline (see above).
+        syncOffsetSeconds: result.songPositionAtFirstFrameSeconds - candidate.trackOffsetSeconds,
+        syncSource: 'fileCorrelation',
+        ...(result.confidence !== null ? { syncConfidence: result.confidence } : {}),
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [audioOffsetMs, track],
+  );
+
+  // LEGACY SYNC UPGRADE — takes recorded before file-based
+  // measurement existed carry player-sample estimates (or nothing)
+  // and no syncSource. Once per project per mount, on focus, quietly
+  // run the same file measurement over them — SEQUENTIALLY (the
+  // correlation is real native work; never fan it out) and silently
+  // (no notices, no UI). Idempotent via syncSource: once a take is
+  // file-measured it is never a candidate again. Bails the moment
+  // focus is lost.
+  const syncUpgradedProjectRef = useRef<string | null>(null);
+  useFocusEffect(
+    useCallback(() => {
+      if (!track || !isCompositorAvailable()) return;
+      if (takes.length === 0) return; // Store still hydrating — retry on a later focus.
+      const projectKey = studio.activeProjectId ?? 'no-active-project';
+      if (syncUpgradedProjectRef.current === projectKey) return;
+      syncUpgradedProjectRef.current = projectKey;
+      const candidates = takes.filter((t) => t.syncSource === undefined);
+      if (candidates.length === 0) return;
+      let alive = true;
+      void (async () => {
+        for (const candidate of candidates) {
+          if (!alive) return;
+          await refineTakeSyncFromFile(candidate);
+        }
+      })();
+      return () => {
+        alive = false;
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [refineTakeSyncFromFile, takes, track]),
   );
 
   // iOS camera-session interruptions (call, Siri, Control Centre, app
@@ -532,6 +691,22 @@ export default function CameraScreen() {
           trackOffsetSeconds: regionStartSeconds,
           ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
           ...(syncDriftSeconds !== undefined ? { syncDriftSeconds } : {}),
+          // Provenance for the offset above: it is the player-sample
+          // ESTIMATE until the file-based refinement below replaces
+          // it with a measured value ('fileCorrelation').
+          ...(songStartSeconds !== null ? { syncSource: 'playerSample' as const } : {}),
+        });
+        // FILE-BASED SYNC REFINEMENT — fire-and-forget (see
+        // refineTakeSyncFromFile): re-measure this take's capture
+        // offset from the recorded file itself and upgrade the
+        // estimate in place when the correlation is confident. Runs
+        // whether or not the JS sample survived the sanity bound —
+        // the expectation just falls back to the region start.
+        void refineTakeSyncFromFile({
+          id: saved.id,
+          uri: saved.uri,
+          trackOffsetSeconds: regionStartSeconds,
+          ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
         });
         // Cache the sampled section energies for the shuffle engine.
         if (energyAccRef.current && energyAccRef.current.sampledSectionCount > 0) {
@@ -670,6 +845,19 @@ export default function CameraScreen() {
       .label;
 
   const regionEffForLabel = effectiveRegion(studio.trackRegion, track?.durationSeconds);
+
+  // Rail preview card: with a track loaded, the preview is
+  // SONG-REFERENCED (calibrationPreviewFor — the take plays against
+  // the master song exactly as the editor would cut it) so sync can
+  // be judged and nudged; without a track it stays the plain muted
+  // take-only preview and there is no Sync row.
+  const railCalibration = railPreviewTake && track ? calibrationPreviewFor(railPreviewTake, track.uri) : null;
+  const railAdjust = railPreviewTake?.syncAdjustFrames ?? 0;
+  const nudgeRailSync = (delta: number) => {
+    if (!railPreviewTake) return;
+    const next = Math.max(-90, Math.min(90, railAdjust + delta));
+    if (next !== railAdjust) studio.updateTake(railPreviewTake.id, { syncAdjustFrames: next });
+  };
 
   return (
     <View style={styles.root}>
@@ -827,19 +1015,23 @@ export default function CameraScreen() {
           <View style={styles.railPreviewCard}>
             {railPreviewTake.durationSeconds ? (
               <NativePreview
-                request={{
-                  clips: [
-                    {
-                      uri: railPreviewTake.uri,
-                      startSeconds: 0,
-                      durationSeconds: railPreviewTake.durationSeconds,
-                      muted: true,
-                      volume: 1,
-                    },
-                  ],
-                  audioUri: null,
-                }}
-                requestKey={railPreviewTake.id}
+                request={
+                  railCalibration
+                    ? railCalibration.request
+                    : {
+                        clips: [
+                          {
+                            uri: railPreviewTake.uri,
+                            startSeconds: 0,
+                            durationSeconds: railPreviewTake.durationSeconds,
+                            muted: true,
+                            volume: 1,
+                          },
+                        ],
+                        audioUri: null,
+                      }
+                }
+                requestKey={railCalibration ? railCalibration.requestKey : railPreviewTake.id}
                 paused={railPaused}
                 style={styles.railPreviewVideo}
               />
@@ -856,9 +1048,58 @@ export default function CameraScreen() {
               </Text>
               <Text style={styles.railPreviewSub}>
                 {formatTime(railPreviewTake.durationSeconds ?? 0)} ·{' '}
-                {railPreviewTake.facing === 'front' ? 'Front' : 'Back'} camera · {syncStatusText(railPreviewTake)}
+                {railPreviewTake.facing === 'front' ? 'Front' : 'Back'} camera
+                {railCalibration ? '' : ` · ${syncStatusText(railPreviewTake)}`}
               </Text>
             </View>
+            {/* Sync calibration — only with a track loaded (the
+                preview above is song-referenced then). Nudging shifts
+                the take's manual frame calibration inside the ONE
+                shared offset, so the preview rebuilds on every press
+                and the editor/export honour the same value. Sign, from
+                sourceFrameForTimelineFrame: a LARGER offset reads
+                footage EARLIER in the file for a given timeline frame,
+                so the performance appears LATER — "+" moves lips
+                later, "−" moves them earlier. Optional by design: the
+                card stays a preview first; nothing forces it open. */}
+            {railCalibration && railPreviewTake.durationSeconds ? (
+              <View style={styles.syncBlock}>
+                <View style={styles.syncHeader}>
+                  <Text style={styles.syncLabel}>Sync</Text>
+                  <Text style={styles.syncStatus} numberOfLines={2}>
+                    {syncStatusText(railPreviewTake)}
+                  </Text>
+                </View>
+                <View style={styles.syncStepperRow}>
+                  {([-5, -1, 1, 5] as const).map((delta) => {
+                    const atLimit = delta < 0 ? railAdjust <= -90 : railAdjust >= 90;
+                    return (
+                      <Pressable
+                        key={delta}
+                        disabled={atLimit}
+                        onPress={() => nudgeRailSync(delta)}
+                        style={[styles.syncStepButton, atLimit && styles.syncStepButtonDisabled]}
+                        accessibilityRole="button"
+                        accessibilityState={{ disabled: atLimit }}
+                        accessibilityLabel={`Move lips ${delta > 0 ? 'later' : 'earlier'} by ${
+                          Math.abs(delta) === 1 ? 'one frame' : 'five frames'
+                        }`}>
+                        <Text style={styles.syncStepText}>{delta > 0 ? `+${delta}f` : `−${Math.abs(delta)}f`}</Text>
+                      </Pressable>
+                    );
+                  })}
+                  {railAdjust !== 0 ? (
+                    <Pressable
+                      onPress={() => studio.updateTake(railPreviewTake.id, { syncAdjustFrames: undefined })}
+                      style={styles.syncResetButton}
+                      accessibilityRole="button"
+                      accessibilityLabel="Reset sync adjustment to zero">
+                      <Text style={styles.syncResetText}>Reset</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              </View>
+            ) : null}
             <View style={styles.railPreviewActions}>
               <Pressable
                 style={styles.railActionButton}
@@ -1272,6 +1513,23 @@ const styles = StyleSheet.create({
     height: 38,
   },
   railActionText: { ...typeScale.subhead, color: colors.label, fontWeight: '600' },
+  syncBlock: { gap: spacing.sm },
+  syncHeader: { flexDirection: 'row', alignItems: 'baseline', gap: spacing.sm },
+  syncLabel: { ...typeScale.subhead, color: colors.label, fontWeight: '700' },
+  syncStatus: { ...typeScale.footnote, color: colors.labelSecondary, flex: 1 },
+  syncStepperRow: { flexDirection: 'row', gap: spacing.sm, alignItems: 'center' },
+  syncStepButton: {
+    flex: 1,
+    height: 38,
+    borderRadius: radius.pill,
+    backgroundColor: colors.elevated,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  syncStepButtonDisabled: { opacity: 0.35 },
+  syncStepText: { ...typeScale.subhead, color: colors.label, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  syncResetButton: { height: 38, paddingHorizontal: spacing.sm, alignItems: 'center', justifyContent: 'center' },
+  syncResetText: { ...typeScale.subhead, color: colors.accent, fontWeight: '600' },
   sideButton: {
     alignItems: 'center',
     gap: 3,

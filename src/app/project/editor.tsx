@@ -33,6 +33,7 @@ import {
   layoutSegments,
   secondsToFrames,
   sourceFrameForTimelineFrame,
+  takeSyncOffsetSeconds,
   validateEdl,
   type AssetMeasure,
   type Edl,
@@ -232,9 +233,14 @@ function EditorWorkspace() {
       effectiveRegion(studio.trackRegion, track?.durationSeconds)?.startSeconds ?? studio.trackRegion.startSeconds,
     [studio.trackRegion, track],
   );
-  /** Where timeline frame 0 sits inside `take`, per the bridge's rule. */
+  /**
+   * Where timeline frame 0 sits inside `take` — delegates to the ONE
+   * shared offset (src/lib/edl.ts), the same function the shuffle
+   * bridge uses, so the anchor and the bridge can never diverge. It
+   * includes the take's manual frame calibration (syncAdjustFrames).
+   */
   const offsetForTake = useCallback(
-    (take: Take) => take.trackOffsetSeconds - regionStartSeconds + (take.syncOffsetSeconds ?? 0),
+    (take: Take) => takeSyncOffsetSeconds(take, regionStartSeconds, DEFAULT_FPS),
     [regionStartSeconds],
   );
 

@@ -89,6 +89,48 @@ struct AssetInfoRecord: Record {
 
   @Field
   var hasAudio: Bool
+
+  /// First video track's timeRange.start (seconds) — where the first
+  /// frame sits on the asset timeline. 0 when there is no video track.
+  @Field
+  var videoStartSeconds: Double = 0
+
+  /// First audio track's timeRange.start (seconds). 0 when no audio track.
+  @Field
+  var audioStartSeconds: Double = 0
+
+  /// First video track's timeRange.duration (seconds). 0 when none.
+  @Field
+  var videoDurationSeconds: Double = 0
+
+  /// First audio track's timeRange.duration (seconds). 0 when none.
+  @Field
+  var audioDurationSeconds: Double = 0
+}
+
+struct TakeSyncMeasurementRecord: Record {
+  /// 'measured' | 'noSongInMic' | 'lowConfidence' | 'outOfWindow' | 'error'
+  @Field
+  var status: String
+
+  /// Song position at the take's first VIDEO frame (seconds into the
+  /// master song). Only set when status == 'measured'.
+  @Field
+  var songPositionAtFirstFrameSeconds: Double? = nil
+
+  /// Intra-file A/V offset: audioTrack.timeRange.start −
+  /// videoTrack.timeRange.start (seconds). Set whenever both tracks
+  /// exist — a pure file fact, independent of the correlation outcome.
+  @Field
+  var intraFileAvOffsetSeconds: Double? = nil
+
+  /// Normalised correlation ρ ∈ [0, 1] at the refined peak.
+  @Field
+  var confidence: Double? = nil
+
+  /// Peak / second-peak ratio (second peak ≥ 50ms from the winner).
+  @Field
+  var peakRatio: Double? = nil
 }
 
 // MARK: - Errors
@@ -464,8 +506,510 @@ private enum MvmtCompositorEngine {
       info.height = Int(abs(display.height).rounded())
       let nominalFrameRate = try await videoTrack.load(.nominalFrameRate)
       info.frameRate = Double(nominalFrameRate)
+      // Per-track placement on the asset timeline — the first frame is
+      // NOT necessarily at t=0 (camera files carry small start offsets,
+      // and video/audio tracks need not start together).
+      let videoTimeRange = try await videoTrack.load(.timeRange)
+      let videoStart = CMTimeGetSeconds(videoTimeRange.start)
+      info.videoStartSeconds = videoStart.isFinite ? videoStart : 0
+      let videoDuration = CMTimeGetSeconds(videoTimeRange.duration)
+      info.videoDurationSeconds = videoDuration.isFinite ? videoDuration : 0
+    }
+    if let audioTrack = audioTracks.first {
+      let audioTimeRange = try await audioTrack.load(.timeRange)
+      let audioStart = CMTimeGetSeconds(audioTimeRange.start)
+      info.audioStartSeconds = audioStart.isFinite ? audioStart : 0
+      let audioDuration = CMTimeGetSeconds(audioTimeRange.duration)
+      info.audioDurationSeconds = audioDuration.isFinite ? audioDuration : 0
     }
     return info
+  }
+
+  // MARK: Take sync measurement (file-based ground truth)
+  //
+  // A take's stored sync offset used to be a JS estimate: the audio
+  // player's position sampled immediately BEFORE camera.recordAsync —
+  // blind to the camera's variable spin-up (~100–400ms, different per
+  // take), which is exactly the per-take lip-sync error. This measures
+  // the truth FROM THE RECORDED FILE instead:
+  //
+  //   1. The take's per-track timeRanges give the intra-file A/V
+  //      offset δ = audioStart − videoStart (where each track's first
+  //      sample actually sits on the asset timeline).
+  //   2. The take's mic audio captured the master song playing aloud,
+  //      so cross-correlating it against the song file gives P_A0 —
+  //      the song position at the take's audio-track start.
+  //   3. The first video frame sits at asset time videoStart, i.e.
+  //      (videoStart − audioStart) from the audio start, so the song
+  //      position at the first frame is S0 = P_A0 − δ.
+  //
+  // Correlation runs in two stages at 8kHz mono: a coarse pass over
+  // RMS envelopes (100Hz hops) spanning the whole search window, then
+  // a sample-accurate raw-PCM refinement within ±120ms of the coarse
+  // peak. Cost for a 3-minute take: ~7M envelope MACs (coarse) and
+  // ~150M MACs (refine — 1921 lags × ~10s slice) — the dominant cost,
+  // still ≲1s on device. Expected failure modes are reported in the
+  // record's status, never thrown.
+
+  /// Below this take-audio RMS the mic cannot contain the song
+  /// (earbuds, silence) — reported as 'noSongInMic'.
+  private static let syncSilenceRMSFloor: Double = 0.005
+  /// Confidence gates: below either floor the alignment is reported
+  /// ('lowConfidence') but never applied — S0 stays nil.
+  private static let syncConfidenceFloor: Double = 0.45
+  private static let syncPeakRatioFloor: Double = 1.8
+
+  private static let syncSampleRate: Double = 8000
+  /// Envelope resolution: 10ms hops, ~25ms RMS windows.
+  private static let syncEnvelopeHopSamples = 80
+  private static let syncEnvelopeWindowSamples = 200
+  /// Refine searches ±120ms around the coarse peak, sample by sample.
+  private static let syncRefineHalfWindowSamples = 960
+  /// Refine correlates the loudest contiguous ~10s of the take.
+  private static let syncRefineSliceSamples = 80_000
+  /// Second peak must sit at least this far from the winner:
+  /// 5 envelope steps = 50ms.
+  private static let syncPeakExclusionEnvelopeSteps = 5
+
+  private static func syncResult(
+    status: String,
+    songPositionAtFirstFrameSeconds: Double? = nil,
+    intraFileAvOffsetSeconds: Double? = nil,
+    confidence: Double? = nil,
+    peakRatio: Double? = nil
+  ) -> TakeSyncMeasurementRecord {
+    let record = TakeSyncMeasurementRecord()
+    record.status = status
+    record.songPositionAtFirstFrameSeconds = songPositionAtFirstFrameSeconds
+    record.intraFileAvOffsetSeconds = intraFileAvOffsetSeconds
+    record.confidence = confidence
+    record.peakRatio = peakRatio
+    return record
+  }
+
+  static func measureTakeSync(
+    takeUri: String,
+    songUri: String,
+    expectedSongPositionAtTakeStartSeconds: Double,
+    searchWindowSeconds: Double
+  ) async -> TakeSyncMeasurementRecord {
+    // Sanitise inputs — garbage in is an 'error', not a crash.
+    guard expectedSongPositionAtTakeStartSeconds.isFinite else {
+      return syncResult(status: "error")
+    }
+    let window: Double
+    if searchWindowSeconds.isFinite {
+      window = min(max(searchWindowSeconds, 0.25), 10)
+    } else {
+      window = 2
+    }
+    let expected = expectedSongPositionAtTakeStartSeconds
+
+    do {
+      // ---- 1. Track layout of the take file ----
+      let takeAsset = AVURLAsset(url: resolveURL(takeUri))
+      let takeVideoTracks = try await takeAsset.loadTracks(withMediaType: .video)
+      let takeAudioTracks = try await takeAsset.loadTracks(withMediaType: .audio)
+      guard let videoTrack = takeVideoTracks.first else {
+        return syncResult(status: "error") // a take without video is not a take
+      }
+      guard let audioTrack = takeAudioTracks.first else {
+        return syncResult(status: "noSongInMic")
+      }
+      let videoTimeRange = try await videoTrack.load(.timeRange)
+      let audioTimeRange = try await audioTrack.load(.timeRange)
+      let videoStart = CMTimeGetSeconds(videoTimeRange.start)
+      let audioStart = CMTimeGetSeconds(audioTimeRange.start)
+      let audioDuration = CMTimeGetSeconds(audioTimeRange.duration)
+      guard videoStart.isFinite, audioStart.isFinite, audioDuration.isFinite, audioDuration > 0 else {
+        return syncResult(status: "error")
+      }
+      let delta = audioStart - videoStart
+
+      // ---- 2. Decode the take's mic audio (mono 8kHz PCM) ----
+      // decodeStartSeconds is where sample 0 truly sits on the take's
+      // asset timeline (the first returned buffer's PTS — the reader
+      // may hand back samples slightly ahead of the requested range).
+      let takePCM = try decodeMonoPCM(asset: takeAsset, track: audioTrack, range: audioTimeRange)
+      guard takePCM.samples.count > 0 else {
+        return syncResult(status: "error", intraFileAvOffsetSeconds: delta)
+      }
+
+      // ---- 3. Energy gate: did the mic hear anything at all? ----
+      var takeSumSquares = 0.0
+      for sample in takePCM.samples {
+        takeSumSquares += Double(sample) * Double(sample)
+      }
+      let takeRMS = sqrt(takeSumSquares / Double(takePCM.samples.count))
+      guard takeRMS >= syncSilenceRMSFloor else {
+        return syncResult(status: "noSongInMic", intraFileAvOffsetSeconds: delta)
+      }
+      // Too little audio to correlate meaningfully — report, never apply.
+      guard audioDuration >= 0.5 else {
+        return syncResult(status: "lowConfidence", intraFileAvOffsetSeconds: delta)
+      }
+
+      // ---- 4. Decode the song region the search can touch ----
+      let songAsset = AVURLAsset(url: resolveURL(songUri))
+      let songAudioTracks = try await songAsset.loadTracks(withMediaType: .audio)
+      guard let songTrack = songAudioTracks.first else {
+        return syncResult(status: "error", intraFileAvOffsetSeconds: delta)
+      }
+      let songDuration = CMTimeGetSeconds(try await songAsset.load(.duration))
+      guard songDuration.isFinite, songDuration > 0 else {
+        return syncResult(status: "error", intraFileAvOffsetSeconds: delta)
+      }
+      // Candidate alignments put the take's audio start anywhere in
+      // [expected − window, expected + window], and the take then runs
+      // for its full duration — the decoded song range must cover all
+      // of it (plus slack for the refine stage at the edges).
+      let rangeStart = max(0, expected - window - 0.5)
+      let rangeEnd = min(songDuration, expected + window + audioDuration + 0.5)
+      guard rangeEnd > rangeStart else {
+        // The expected position is nowhere near the song's contents.
+        return syncResult(status: "outOfWindow", intraFileAvOffsetSeconds: delta)
+      }
+      let songRange = CMTimeRange(
+        start: CMTime(seconds: rangeStart, preferredTimescale: 600),
+        duration: CMTime(seconds: rangeEnd - rangeStart, preferredTimescale: 600)
+      )
+      let songPCM = try decodeMonoPCM(asset: songAsset, track: songTrack, range: songRange)
+      guard songPCM.samples.count > 0 else {
+        return syncResult(status: "error", intraFileAvOffsetSeconds: delta)
+      }
+
+      // ---- 5. Coarse stage: RMS-envelope correlation ----
+      // Envelope index ↔ seconds is exact: hop = 80 samples at 8kHz
+      // is precisely 10ms, so offset o (envelope steps) between the
+      // take envelope and the song envelope maps to song position
+      // songDecodeStart + o × 0.01.
+      let takeEnvelope = rmsEnvelope(takePCM.samples)
+      let songEnvelope = rmsEnvelope(songPCM.samples)
+      let hopSeconds = Double(syncEnvelopeHopSamples) / syncSampleRate
+      let minOffset = Int(((expected - window - songPCM.startSeconds) / hopSeconds).rounded())
+      let maxOffset = Int(((expected + window - songPCM.startSeconds) / hopSeconds).rounded())
+      // Clamp to offsets that can overlap the decoded song at all —
+      // a wild expected position must not turn the search into an
+      // unbounded loop over empty offsets.
+      let lowOffset = max(minOffset, 0)
+      let highOffset = min(maxOffset, songEnvelope.count - 1)
+      guard highOffset >= lowOffset else {
+        return syncResult(status: "outOfWindow", intraFileAvOffsetSeconds: delta)
+      }
+      let curve = envelopeCorrelationCurve(
+        needle: takeEnvelope,
+        haystack: songEnvelope,
+        offsets: lowOffset...highOffset
+      )
+      guard let coarseBest = curve.max(by: { $0.rho < $1.rho }), coarseBest.rho > 0 else {
+        return syncResult(status: "outOfWindow", intraFileAvOffsetSeconds: delta)
+      }
+      let coarsePosition = songPCM.startSeconds + Double(coarseBest.offset) * hopSeconds
+
+      // Peak uniqueness across the WHOLE search window (from the
+      // coarse curve): the winner vs the best competitor at least
+      // 50ms (5 envelope steps) away. A repeating beat inside the
+      // window shows up here even when the local match is strong.
+      var secondPeak = 0.0
+      for point in curve where abs(point.offset - coarseBest.offset) >= syncPeakExclusionEnvelopeSteps {
+        secondPeak = max(secondPeak, point.rho)
+      }
+      let peakRatio: Double
+      if secondPeak <= 0 {
+        peakRatio = coarseBest.rho > 0 ? 100 : 0
+      } else {
+        peakRatio = min(100, coarseBest.rho / secondPeak)
+      }
+
+      // ---- 6. Refine stage: raw-PCM correlation, ±120ms ----
+      // The loudest contiguous ~10s slice of the take carries the most
+      // alignment signal per MAC.
+      let sliceLength = min(syncRefineSliceSamples, takePCM.samples.count)
+      let sliceStart = loudestSliceStart(takePCM.samples, length: sliceLength)
+      let slice = Array(takePCM.samples[sliceStart..<(sliceStart + sliceLength)])
+      var sliceSum = 0.0
+      var sliceSumSquares = 0.0
+      for sample in slice {
+        sliceSum += Double(sample)
+        sliceSumSquares += Double(sample) * Double(sample)
+      }
+      let sliceMean = sliceSum / Double(sliceLength)
+      let sliceVariance = sliceSumSquares - Double(sliceLength) * sliceMean * sliceMean
+      guard sliceVariance > 0 else {
+        return syncResult(
+          status: "lowConfidence",
+          intraFileAvOffsetSeconds: delta,
+          confidence: 0,
+          peakRatio: peakRatio
+        )
+      }
+
+      // Lag ℓ = the song sample index aligning with take sample 0.
+      // The coarse peak gives it directly; refine searches ±120ms.
+      let coarseLag = Int(((coarsePosition - songPCM.startSeconds) * syncSampleRate).rounded())
+      let lagMin = max(-sliceStart, coarseLag - syncRefineHalfWindowSamples)
+      let lagMax = min(
+        songPCM.samples.count - sliceStart - sliceLength,
+        coarseLag + syncRefineHalfWindowSamples
+      )
+      guard lagMax >= lagMin else {
+        return syncResult(status: "error", intraFileAvOffsetSeconds: delta)
+      }
+
+      // Prefix sums over just the song region the refine can touch,
+      // so each lag's song mean/variance is O(1) and only Σxy costs
+      // O(sliceLength) per lag.
+      let regionStart = lagMin + sliceStart
+      let regionCount = (lagMax + sliceStart + sliceLength) - regionStart
+      var prefixSum = [Double](repeating: 0, count: regionCount + 1)
+      var prefixSumSquares = [Double](repeating: 0, count: regionCount + 1)
+      for i in 0..<regionCount {
+        let value = Double(songPCM.samples[regionStart + i])
+        prefixSum[i + 1] = prefixSum[i] + value
+        prefixSumSquares[i + 1] = prefixSumSquares[i] + value * value
+      }
+
+      var bestLag = coarseLag
+      var bestRho = -1.0
+      let count = Double(sliceLength)
+      for lag in lagMin...lagMax {
+        let segmentStart = lag + sliceStart - regionStart
+        let songSum = prefixSum[segmentStart + sliceLength] - prefixSum[segmentStart]
+        let songSumSquares = prefixSumSquares[segmentStart + sliceLength] - prefixSumSquares[segmentStart]
+        let songMean = songSum / count
+        let songVariance = songSumSquares - count * songMean * songMean
+        guard songVariance > 0 else { continue }
+        var sumXY = 0.0
+        let songBase = lag + sliceStart
+        for j in 0..<sliceLength {
+          sumXY += Double(slice[j]) * Double(songPCM.samples[songBase + j])
+        }
+        let numerator = sumXY - count * sliceMean * songMean
+        let rho = numerator / sqrt(sliceVariance * songVariance)
+        if rho > bestRho {
+          bestRho = rho
+          bestLag = lag
+        }
+      }
+      guard bestRho >= 0 else {
+        return syncResult(
+          status: "lowConfidence",
+          intraFileAvOffsetSeconds: delta,
+          confidence: 0,
+          peakRatio: peakRatio
+        )
+      }
+
+      // Song position at take sample 0 — i.e. at asset time
+      // takePCM.startSeconds — then shifted to the first VIDEO frame:
+      // S0 = P_A0 + (videoStart − takeDecodeStart). In the normal case
+      // takeDecodeStart == audioStart and this is exactly P_A0 − δ.
+      let positionAtTakeStart = songPCM.startSeconds + Double(bestLag) / syncSampleRate
+      let songPositionAtFirstFrame =
+        positionAtTakeStart + (videoStart - takePCM.startSeconds)
+
+      // ---- 7. Gates ----
+      if positionAtTakeStart < expected - window || positionAtTakeStart > expected + window {
+        return syncResult(
+          status: "outOfWindow",
+          intraFileAvOffsetSeconds: delta,
+          confidence: bestRho,
+          peakRatio: peakRatio
+        )
+      }
+      if bestRho < syncConfidenceFloor || peakRatio < syncPeakRatioFloor {
+        return syncResult(
+          status: "lowConfidence",
+          intraFileAvOffsetSeconds: delta,
+          confidence: bestRho,
+          peakRatio: peakRatio
+        )
+      }
+      return syncResult(
+        status: "measured",
+        songPositionAtFirstFrameSeconds: songPositionAtFirstFrame,
+        intraFileAvOffsetSeconds: delta,
+        confidence: bestRho,
+        peakRatio: peakRatio
+      )
+    } catch {
+      return syncResult(status: "error")
+    }
+  }
+
+  /// A decoded mono PCM buffer plus where its first sample sits on the
+  /// source asset's timeline (the first returned buffer's PTS).
+  private struct DecodedPCM {
+    let samples: [Float]
+    let startSeconds: Double
+  }
+
+  /// Decode one audio track to mono Float32 PCM at 8kHz via
+  /// AVAssetReader (16-bit LinearPCM out, Int16 → Float conversion).
+  private static func decodeMonoPCM(
+    asset: AVAsset,
+    track: AVAssetTrack,
+    range: CMTimeRange
+  ) throws -> DecodedPCM {
+    let reader = try AVAssetReader(asset: asset)
+    reader.timeRange = range
+    let outputSettings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatLinearPCM,
+      AVLinearPCMBitDepthKey: 16,
+      AVLinearPCMIsBigEndianKey: false,
+      AVLinearPCMIsFloatKey: false,
+      AVLinearPCMIsNonInterleaved: false,
+      AVSampleRateKey: Int(syncSampleRate),
+      AVNumberOfChannelsKey: 1,
+    ]
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else {
+      throw compositorError("Could not add the audio reader output for sync measurement.")
+    }
+    reader.add(output)
+    guard reader.startReading() else {
+      throw compositorError(
+        "Could not start reading audio for sync measurement: \(reader.error?.localizedDescription ?? "unknown error")"
+      )
+    }
+
+    var samples: [Float] = []
+    let estimatedSamples = Int(CMTimeGetSeconds(range.duration) * syncSampleRate) + 1
+    if estimatedSamples > 0 {
+      samples.reserveCapacity(estimatedSamples)
+    }
+    var startSeconds = CMTimeGetSeconds(range.start)
+    var sawFirstBuffer = false
+
+    while let sampleBuffer = output.copyNextSampleBuffer() {
+      if !sawFirstBuffer {
+        sawFirstBuffer = true
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        if pts.isFinite {
+          startSeconds = pts
+        }
+      }
+      guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+      let byteLength = CMBlockBufferGetDataLength(blockBuffer)
+      let sampleCount = byteLength / 2 // 16-bit mono
+      guard sampleCount > 0 else { continue }
+      var int16Samples = [Int16](repeating: 0, count: sampleCount)
+      let copyStatus = int16Samples.withUnsafeMutableBytes { pointer -> OSStatus in
+        guard let baseAddress = pointer.baseAddress else { return OSStatus(-1) }
+        return CMBlockBufferCopyDataBytes(
+          blockBuffer,
+          atOffset: 0,
+          dataLength: sampleCount * 2,
+          destination: baseAddress
+        )
+      }
+      guard copyStatus == noErr else {
+        throw compositorError("Could not copy decoded audio samples for sync measurement.")
+      }
+      for value in int16Samples {
+        samples.append(Float(value) / 32768.0)
+      }
+    }
+    if reader.status == .failed {
+      throw compositorError(
+        "Audio decoding failed during sync measurement: \(reader.error?.localizedDescription ?? "unknown error")"
+      )
+    }
+    return DecodedPCM(samples: samples, startSeconds: startSeconds)
+  }
+
+  /// RMS envelope at 100Hz hops (80 samples at 8kHz), ~25ms windows.
+  private static func rmsEnvelope(_ samples: [Float]) -> [Float] {
+    guard !samples.isEmpty else { return [] }
+    let count = (samples.count - 1) / syncEnvelopeHopSamples + 1
+    var envelope = [Float]()
+    envelope.reserveCapacity(count)
+    for index in 0..<count {
+      let start = index * syncEnvelopeHopSamples
+      let end = min(samples.count, start + syncEnvelopeWindowSamples)
+      var sumSquares = 0.0
+      for j in start..<end {
+        sumSquares += Double(samples[j]) * Double(samples[j])
+      }
+      envelope.append(Float(sqrt(sumSquares / Double(max(1, end - start)))))
+    }
+    return envelope
+  }
+
+  /// Zero-mean normalised cross-correlation of `needle` against
+  /// `haystack` for each integer offset (needle[0] aligns with
+  /// haystack[offset]). The needle is truncated at the haystack's end;
+  /// offsets keeping less than 80% of the needle are skipped.
+  private static func envelopeCorrelationCurve(
+    needle: [Float],
+    haystack: [Float],
+    offsets: ClosedRange<Int>
+  ) -> [(offset: Int, rho: Double)] {
+    guard !needle.isEmpty, !haystack.isEmpty else { return [] }
+    var curve: [(offset: Int, rho: Double)] = []
+    for offset in offsets {
+      let available = haystack.count - offset
+      guard offset >= 0, available > 0 else { continue }
+      let length = min(needle.count, available)
+      guard Double(length) >= 0.8 * Double(needle.count) else { continue }
+      // One pass per offset gathers both sides' stats plus Σxy — the
+      // needle may be truncated at the haystack's end, so its stats
+      // are computed over the same `length` samples it contributes.
+      var nSum = 0.0
+      var nSumSquares = 0.0
+      var hSum = 0.0
+      var hSumSquares = 0.0
+      var sumXY = 0.0
+      for j in 0..<length {
+        let n = Double(needle[j])
+        let h = Double(haystack[offset + j])
+        nSum += n
+        nSumSquares += n * n
+        hSum += h
+        hSumSquares += h * h
+        sumXY += n * h
+      }
+      let count = Double(length)
+      let nMean = nSum / count
+      let hMean = hSum / count
+      let nVariance = nSumSquares - count * nMean * nMean
+      let hVariance = hSumSquares - count * hMean * hMean
+      guard nVariance > 0, hVariance > 0 else { continue }
+      let rho = (sumXY - count * nMean * hMean) / sqrt(nVariance * hVariance)
+      if rho.isFinite {
+        curve.append((offset: offset, rho: rho))
+      }
+    }
+    return curve
+  }
+
+  /// Start index of the highest-energy contiguous `length`-sample
+  /// window (evaluated at envelope-hop steps — 10ms precision is
+  /// plenty for choosing WHERE to refine, never for the result).
+  private static func loudestSliceStart(_ samples: [Float], length: Int) -> Int {
+    guard samples.count > length, length > 0 else { return 0 }
+    var windowSum = 0.0
+    for j in 0..<length {
+      windowSum += Double(samples[j]) * Double(samples[j])
+    }
+    var bestStart = 0
+    var bestSum = windowSum
+    var start = syncEnvelopeHopSamples
+    while start + length <= samples.count {
+      for j in (start - syncEnvelopeHopSamples)..<start {
+        windowSum -= Double(samples[j]) * Double(samples[j])
+      }
+      for j in (start + length - syncEnvelopeHopSamples)..<(start + length) {
+        windowSum += Double(samples[j]) * Double(samples[j])
+      }
+      if windowSum > bestSum {
+        bestSum = windowSum
+        bestStart = start
+      }
+      start += syncEnvelopeHopSamples
+    }
+    return bestStart
   }
 }
 
@@ -816,6 +1360,15 @@ public class MvmtCompositorModule: Module {
 
     AsyncFunction("inspectAsset") { (uri: String) -> AssetInfoRecord in
       try await MvmtCompositorEngine.inspect(uri)
+    }
+
+    AsyncFunction("measureTakeSync") { (takeUri: String, songUri: String, expectedSongPositionAtTakeStartSeconds: Double, searchWindowSeconds: Double) -> TakeSyncMeasurementRecord in
+      await MvmtCompositorEngine.measureTakeSync(
+        takeUri: takeUri,
+        songUri: songUri,
+        expectedSongPositionAtTakeStartSeconds: expectedSongPositionAtTakeStartSeconds,
+        searchWindowSeconds: searchWindowSeconds
+      )
     }
 
     AsyncFunction("createPreview") { (request: CompositeRequestRecord) -> String in

@@ -97,6 +97,41 @@ export function sourceFrameForTimelineFrame(
   return timelineFrame - secondsToFrames(syncOffsetSeconds, fps);
 }
 
+/**
+ * THE one shared per-take sync offset, in seconds:
+ *
+ *   takeSyncOffsetSeconds
+ *     = take.trackOffsetSeconds − regionStartSeconds
+ *       + (take.syncOffsetSeconds ?? 0)
+ *       + framesToSeconds(take.syncAdjustFrames ?? 0, fps)
+ *
+ * i.e. where the take's recording window sat relative to the region
+ * start, corrected by the take's MEASURED capture error
+ * (syncOffsetSeconds — player-sampled or file-correlated) and by
+ * Jaizon's manual frame calibration (syncAdjustFrames). Positive =
+ * capture started late, so the footage for a given timeline frame
+ * lives earlier inside the file (see sourceFrameForTimelineFrame).
+ *
+ * The shuffle→EDL bridge, the editor's sync anchor and the calibration
+ * UI all read THIS function; record.tsx is the write side only (it
+ * produces the measured fields, it never maps with them). Nobody else
+ * does this math. `syncDriftSeconds` deliberately never enters here:
+ * it is a diagnostic dominated by capture-start latency, not clock
+ * drift (2026-11-09 audit).
+ */
+export function takeSyncOffsetSeconds(
+  take: { trackOffsetSeconds: number; syncOffsetSeconds?: number; syncAdjustFrames?: number },
+  regionStartSeconds: number,
+  fps: number,
+): number {
+  return (
+    take.trackOffsetSeconds -
+    regionStartSeconds +
+    (take.syncOffsetSeconds ?? 0) +
+    framesToSeconds(take.syncAdjustFrames ?? 0, fps)
+  );
+}
+
 /** Lay out segments back-to-back from frame 0, assigning timeline starts. */
 export function layoutSegments(
   partials: { id: string; takeId: string; sourceStartFrame: number; durationFrames: number }[],
