@@ -855,3 +855,279 @@ are removed; the Record screen's gear navigates here instead (§3.3).
   and per-screen sheet wiring are removed (§6).
 
 ---
+
+## 4. Interaction & motion principles
+
+Motion budget (hard rules):
+
+- Durations: micro-feedback 100–150ms; panel/segment changes
+  200–250ms; screen transitions = the native stack/tab defaults
+  (do not customise durations). Nothing animated exceeds 350ms
+  except the shuffle sweep (~800ms, below).
+- All animations run on the native driver / Reanimated worklets
+  (Reanimated is already in the project). No JS-thread layout
+  animation during media playback. If an animation and playback
+  contend, the animation loses: cancel it.
+- Animations are state explanations only: things slide because they
+  came from somewhere, fade because they appeared. No idle motion,
+  no looping decoration, no parallax.
+- `prefers-reduced-motion` (AccessibilityInfo): disable the shuffle
+  sweep and pill expand/collapse animations; keep instant state
+  changes and the recording-dot pulse (reduced to a static dot).
+
+Per-interaction specs:
+
+- **Buttons**: pressed state = `colors.cardPressed` (cards/rows) or
+  0.92 scale + slight dim (primary/pills over camera). Feedback is
+  immediate (<100ms). No ripples (Android pattern), no shadows added
+  on press.
+- **Segmented controls**: selection slides (150ms) or crossfades;
+  caption text swaps instantly with the selection.
+- **Pills over camera** (zoom/timers): expand/collapse = 200ms
+  height/opacity on the native driver; the camera picture never
+  moves. Opening one pill collapses the other instantly.
+- **Sheets**: iOS page-sheet slide + dim (existing `Sheet`
+  behaviour). Blur backdrop is capped at the sheet's own surface
+  (`BlurView` dark) — not a global glass theme.
+- **Recording feedback**: on record start — haptic (medium impact)
+  + go-tone + elapsed pill appears (150ms fade). The recording dot
+  pulses opacity 1↔0.35 at 1s period while recording. On stop —
+  haptic (light) + notice "Take {n} saved".
+- **Count-in/timer**: numerals swap instantly per beat/second (no
+  scale animations — the beeps/clicks carry the rhythm; a bouncing
+  numeral fights it).
+- **Shuffle sweep**: when a new cut lands, a `colors.iridescent`
+  gradient layer sweeps diagonally across the preview frame once
+  (~800ms, ease-out) at ≤45% opacity, then the preview auto-plays.
+  This replaces the old violet/pink shimmer + "✦" glyph (§6). It is
+  the only decorative animation in the product, and it marks a real
+  event (a new edit exists). If preview preparation outlasts the
+  sweep, the `loading` state (§3.5) takes over — never loop the sweep.
+- **Timeline gestures**: horizontal scroll = native momentum;
+  playhead auto-follows during playback (scroll only when the
+  playhead would leave the viewport, current behaviour); trim drags
+  = direct manipulation (the segment edge tracks the finger 1:1);
+  no gesture may trigger a composition rebuild mid-drag — rebuilds
+  happen on release (§3.5).
+- **Loading / preparation states** (one pattern everywhere): black or
+  `colors.card` surface + centred spinner in `colors.label` + ONE
+  `type.footnote` caption naming the real activity ("Preparing your
+  cut…", "Rendering your video…", "Loading your song…"). Skeleton
+  screens are not used — media apps show the media or a spinner.
+- **Haptics** (`expo-haptics` — NOT currently a dependency; adding it
+  is a lead-approved install, flagged in Appendix A): record
+  start/stop (above), successful export render (success
+  notification), delete confirmation is the alert itself (no
+  haptic). No haptics on ordinary navigation or list taps.
+- **Errors**: inline, in place, with the recovery action beside the
+  message (§3.6 pattern). `Alert` is reserved for destructive
+  confirmations and permission dead-ends only.
+
+## 5. Component inventory
+
+Build/reuse exactly these shared components. Each lists its token
+surface — a component that needs a colour not listed here is a spec
+violation; flag it instead of adding a literal.
+
+| Component | Status | Used on | Spec |
+| --- | --- | --- | --- |
+| `PrimaryButton` | NEW (extract from the three near-identical white buttons in takes/shuffle/export) | All action bands, Studio, creation | Full-width (in its band), `colors.accent` bg, `colors.onAccent` text `type.headline` 600, `radius.md`, vertical padding 14, optional leading icon 18pt `colors.onAccent`. Disabled: `colors.elevated` bg, `colors.labelTertiary` text. Loading: spinner `colors.onAccent` + label swap. |
+| `SecondaryButton` | NEW | Export (Share), preview error retry | `colors.card` bg, `colors.label` text, `radius.md`, same metrics as Primary. |
+| `IconButton` | EXISTS — keep | Camera top bar, transport, headers | 44×44 target, `colors.material` circular fill over media / transparent on plain screens, icon 22–24 `colors.label`, `active` state icon `colors.accent`, disabled 40% opacity. |
+| `Header` (workspace) | NEW (formalise the repeated pattern) | All workspace stages | Back chevron + label (`colors.accent`, 17pt), `type.largeTitle` title, optional `type.subhead` subtitle `colors.labelSecondary`, optional trailing actions (Editor undo/redo). Padding `spacing.xl` sides, `insets.top + spacing.md` top. |
+| `ActionBand` | NEW (formalise nextBar/exportBar) | Takes, Editor, Export, creation steps | Hairline top `colors.separator`, `colors.groupedBackground`, padding `spacing.xl` / top `spacing.md` / bottom `max(insets.bottom, spacing.md)`. Holds one `PrimaryButton` + ≤1 caption. |
+| `SegmentedControl` | EXISTS — keep, re-skin check | Pace, timer, count-in, quality, fps, modes | Track `colors.elevated`, thumb `colors.cardPressed` with hairline `colors.separator`, selected text `colors.label`, unselected `colors.labelSecondary`. Editor mode switch uses the same component. |
+| `Sheet` | EXISTS — keep | Track sheet, take preview | iOS page sheet, `radius.sheet`, `colors.elevated`/blur-dark surface, grab handle, title `type.headline`, Done in `colors.accent`. |
+| `SettingsSheet` / `SettingsSheetConnected` | REMOVE (§6) | — | Replaced by the Settings tab (§3.7) built from `SettingsRow` primitives. |
+| `SettingsRow` + `SwitchRow` | NEW (from SettingsSheet internals) | Settings tab | Row: label `type.body` `colors.label`, control trailing (segmented full-width variant for multi-choice = label above control). Group card `colors.card` `radius.lg`, hairlines `colors.separator`, group titles = `type.caption` uppercase `colors.labelSecondary` letter-spaced. |
+| `ProjectCard` | NEW | Studio (Continue/Recent), Projects | Variants: hero (Continue, horizontal, 64px thumb) and list (72px thumb). `colors.card` bg, `radius.lg`, pressed `colors.cardPressed`. Title `type.headline` 1 line, subtitle `type.footnote` `colors.labelSecondary` 1–2 lines, chevron or overflow trailing. |
+| `TakeRow` | NEW (replaces takes.tsx inline rows) | Takes | §3.4 anatomy: 54×72 thumb `radius.sm`, duration badge (`colors.material`, `type.caption`), title/subtitle/sync line, in-cut badge (`colors.accentDim`/`colors.accent`), overflow button. |
+| `RecordButton` | EXISTS — keep, verify tokens | Record | 76pt, `colors.iridescent` ring (only sanctioned gradient #1), white inner ring, `colors.danger` centre (circle idle / rounded square recording), press scale 0.94, disabled 40%. |
+| `CameraPill` (zoom / timers) | EXISTS as inline JSX — extract | Record right column | `colors.material` fill, `colors.materialBorder` hairline, `radius.pill`; collapsed = icon + summary; expanded panel = `radius.lg` material card with chip rows; chip selected = light fill/dark text (match across both pills). |
+| `LengthChips` | EXISTS inline — extract | Record bottom-centre, creation (inside region picker) | Container `colors.material` `radius.pill` padding 4; chip min-width 38, height 30, selected = light fill + dark text (same selected language as camera pills — NOT the accent, these sit on camera where the accent is reserved for record-adjacent signals). |
+| `TrackSheet` + `AudioRegionPicker` | EXIST — keep, honesty fix §3.2 | Record (via track pill), creation Step 2 | Unchanged mechanics; neutral bar rendering until real peaks exist. |
+| `Timeline` (`TimelineStrip`) | EXISTS — re-skin + extend | Editor (both modes) | Keep: 30px/s, ruler (tick 1s, label 5s), filmstrip via `src/lib/thumbnails.ts`, playhead + auto-scroll, tap-to-select. Change: segment fills → `colors.cardPressed`/`colors.elevated` alternation (delete `SEGMENT_COLORS`); selected outline → 2pt `colors.accent`; playing underline already `colors.accent` (now lime — verify no hardcoded violet remains); label chip `colors.material`. Extend: trim handles + lock glyph + split affordances per §3.5. The component consumes EDL-derived view data (frames→seconds at the boundary), never `TimelineClip` creative fields. |
+| `NativePreview` | NEW (replaces `TimelinePreview`) | Editor, Export, Take preview (single-take variant) | Wraps the native v2 preview API: creates from a `CompositeRequest`, renders the native view 9:16 `radius.lg` on black, exposes play/pause/seek + status/progress events. Owns NO playback logic — position is display-only. States: loading/error/ready per §3.5. `TimelinePreview` (JS polling, dual players) is deleted, not wrapped (§6). |
+| `TransportRow` | NEW | Editor, Export | Play/pause `IconButton`, current time, slim progress track (`colors.elevated` track, `colors.label` fill), total time; tabular numerals. |
+| `ProgressBar` | NEW | Export render | Track `colors.elevated`, fill `colors.accent`, height 6, `radius.pill`, driven by real progress events only. |
+| `EmptyState` | EXISTS as repeated inline JSX — extract | Studio, Projects, Takes, Editor, Export-unavailable | Centred: icon 30pt `colors.labelSecondary`, title `type.headline` `colors.label`, body `type.subhead` `colors.labelSecondary` (centred, ≤3 lines), optional one `PrimaryButton`. On plain screens it sits in a `colors.card` `radius.lg` card (current pattern); in the Editor timeline area it renders without the card. |
+| `NoticePill` (toast) | EXISTS inline on camera — extract | Record (and only Record) | `colors.material` pill, `type` footnote text `colors.label`, auto-dismiss ~2.2s, `pointerEvents="none"`. Other screens use inline states, not toasts. |
+
+State ownership rule for implementers: components receive the EDL (or
+view data derived from it) and playback *display* state as props;
+they never own media state. The store owns projects/takes/EDL; the
+native engine owns playback/render state; components own only local
+UI state (open/closed, selection, drag positions).
+
+## 6. Feature cull list
+
+REMOVE or DEFER, with reasons. "Remove" = delete UI and, where the
+lead agrees, the code path; "Defer" = no UI now, data/engine hooks may
+remain untouched.
+
+| # | Item | Verdict | Reason (one line) |
+| --- | --- | --- | --- |
+| 1 | Per-clip **speed** (`TimelineClip.speed`) | DEFER | No preview/export support; a control that lies about the output violates §1.5. |
+| 2 | **Fades** (`fadeInSeconds/fadeOutSeconds`) | DEFER | Same — not rendered anywhere today. |
+| 3 | **Looks / colour filters** (`look`) | DEFER | Not implemented in the engine; would need the custom-compositing path the audit says is unnecessary for v1. |
+| 4 | **Text overlays** (`textOverlay/textPosition`) | DEFER | Not rendered; text belongs to a later creative wave with real preview support. |
+| 5 | **Transitions** (`transitionType/transitionDurationSeconds`, crossfade/dip) | DEFER | Hard cuts only in the composition engine; showing transition UI promises what export can't do. |
+| 6 | Per-clip **volume/mute UI** (take audio controls) | DEFER | Audio policy is song-only by default; the engine flag (`includeTakeAudio`) stays, the UI waits for a deliberate mixed-audio feature. |
+| 7 | `TimelinePreview` JS preview (200ms polling, dual players, per-clip replaceAsync) | REMOVE | The audit's #1 problem; replaced by `NativePreview` on the shared composition — two preview paths must not coexist. |
+| 8 | Rainbow timeline segment colours (`SEGMENT_COLORS`, violet/blue/pink/mint) | REMOVE | Competing accents retired with the iridescent scheme; thumbnails carry variety, graphite carries structure. |
+| 9 | Shuffle shimmer (violet/blue/pink `LinearGradient` + "✦") and "Your cut, remixed ✦" | REMOVE → replaced | Old palette + decorative glyph; replaced by the single lime sweep (§4) and plain "Your cut, remixed." |
+| 10 | Hardcoded `#FFFFFF` primary buttons / `#14141F` text (takes, shuffle, export, sheets) | REMOVE | Retired palette literals; `PrimaryButton` on `colors.accent`/`colors.onAccent` replaces all of them. |
+| 11 | `SettingsSheet` + `SettingsSheetConnected` + gear buttons on Takes/Editor/Export headers | REMOVE | Settings duplicated in every screen; one home (Settings tab) per §1.3. Record's gear becomes navigation, not a sheet. |
+| 12 | Settings sheet 2-column **tile grid** | REMOVE | Tiles mixed labels/values/controls inconsistently; standard grouped rows replace them. |
+| 13 | Per-take **Save/Share icon rows** on Takes | REMOVE → moved | Three competing icon buttons per row; both actions move into the take overflow menu / preview sheet (§3.4). |
+| 14 | Per-take **Save/Share list** on Export (`takes.slice(0,3)` rows) | REMOVE | Export is about the finished video; raw-take distribution belongs to Takes. |
+| 15 | Export screen's engine-availability essay + Expo Go fallback copy | REMOVE | One honest unavailable state (§3.6); the shipped build has the engine. |
+| 16 | Midpoint **split** (`splitTimelineClip` at trim midpoint) | REMOVE → replaced | Superseded by split-at-playhead (§3.5), which is where the user is actually looking. |
+| 17 | `swapTimelineClips` / `moveTimelineClip` as user features | DEFER (no UI) | Reordering cuts fights the sync model (cuts are positions in the song); no UI exposes them — take switching is the supported rearrangement. |
+| 18 | `addToTimeline` hand-built cut from Takes | REMOVE (UI) | Manual building lives in the Editor now; a second construction path in Takes duplicates the Editor. |
+| 19 | **Cover-frame picker** (`coverClipId` UI) | DEFER | Project thumbnails auto-derive (§3.1.1); a picker is polish without a user problem yet. (Store field may stay.) |
+| 20 | Fake waveform bars presented as the song's waveform | REMOVE (the claim) | Bars are a name-seeded pattern today; render neutrally (§3.2) until real peaks are decoded — honesty rule §1.5. |
+| 21 | Shuffle **score / "Best of N"** anything | REMOVE (already hidden — keep it gone) | Standing rule: shuffle is magic, not a report card. `ShuffleResultInfo` stays internal. |
+| 22 | "Device" info row in old Settings ("iPhone · 1179×2556") | REMOVE | Answers no user question; About keeps name + version only. |
+| 23 | `editor.tsx` legacy redirect as a *destination* | KEEP (redirect only) | It must land on the Editor (§3.5); it is not a screen and gets no design. |
+| 24 | Autosave **preference without persistence** | RESOLVE, don't ship dark | The current switch controls nothing (persistence is a noted TODO). The projects model (Wave 2) makes it real; if persistence slips, the switch is removed from Settings until it works (§1.5). |
+| 25 | Recording **frame-rate 60** presented as an editing rate | KEEP with corrected copy | It's a capture preference only; Settings copy now says edits/exports are 30 fps (§3.7) so the UI stops implying 60 fps exports. |
+| 26 | Energy/motion stats, file sizes, take "quality" data in UI | REMOVE (never ship) | `Take.energy` is an engine input, not user information; no screen displays it. |
+
+## 7. Accessibility & layout rules
+
+Layout:
+
+- **Safe areas everywhere**: screens inset content by
+  `insets.top + spacing.md` (headers) and action bands pad
+  `max(insets.bottom, spacing.md)` — the existing pattern, now
+  mandatory. Camera overlays additionally respect the top safe area
+  for the top bar and the bottom safe area for the bottom bar.
+- **Small iPhones** (≤667pt tall, e.g. SE): the Editor is the tight
+  screen — shrink order is fixed: (1) preview height, (2) mode-panel
+  vertical padding, (3) timeline strip height 58→48. The action band
+  and transport NEVER shrink or scroll away. Takes/Studio/Projects/
+  Settings scroll normally.
+- **Large iPhones** (≥852pt): preview caps at the width-driven 9:16
+  height or 460pt, whichever is smaller (existing cap pattern);
+  leftover space goes to section spacing, not bigger controls.
+- **Landscape**: unsupported for workspace stages (portrait lock, as
+  today); tabs render but the product is portrait — takes recorded
+  landscape are normalised by the engine's canvas, displayed
+  cover-fit, never stretched.
+- **One-handed reach**: primary actions live in bottom action bands;
+  destructive actions live in overflow menus, never at the top.
+
+Touch & interaction:
+
+- **Minimum touch target 44×44pt** for every interactive element
+  (icon buttons may draw 22pt glyphs inside a 44pt hit area —
+  existing `hitSlop` patterns count toward the 44). Timeline trim
+  grab zones are 28pt wide × full segment height and are the single
+  documented exception (they sit between two larger tap targets and
+  have stepper alternatives, §3.5).
+- Segmented controls, chips and switches are all ≥32pt tall with
+  ≥44pt effective targets via padding/hitSlop.
+- No gesture-only critical actions: every drag (trim, region window,
+  scrub) has a button/stepper alternative.
+
+Vision & hearing:
+
+- **Contrast on graphite**: `colors.label` on `colors.base`/`card`
+  is the default text pairing (high contrast, ~13:1). 
+  `colors.labelSecondary` (≈68% warm white) is the floor for any
+  text a user must read. `colors.labelTertiary` (≈42%) is restricted
+  to captions, timestamps and disabled states — never body copy,
+  never interactive labels. `colors.accent` on graphite is for
+  large/bold text, icons and fills only; small accent text must be
+  `type.caption` semibold or larger. Text on accent is always
+  `colors.onAccent`. `colors.danger`/`colors.success` are always
+  paired with an icon or words (never colour-only meaning).
+- **Dynamic Type**: all text uses the `type` scale with system font;
+  rows must grow rather than truncate at large sizes — titles may
+  wrap to 2 lines; buttons never truncate (shorten the copy
+  instead). Test at the largest accessibility size: action bands
+  and the Editor layout must still fit (preview shrink order, §7).
+- **VoiceOver**: every icon-only control has an
+  `accessibilityLabel` (existing codebase habit — keep it, extend it
+  to the new components); selection states use
+  `accessibilityState.selected`; the timeline exposes each cut as a
+  button labelled "Take 2, cut 3 of 12, 0:02 long. Tap to switch its
+  take." (existing label pattern); progress bars expose value text
+  ("Rendering, 45 percent"); the recording state is announced via
+  the elapsed pill's label ("Recording, 0:07 of 0:15").
+- **Audio cues**: timer beeps, count-in clicks and the go tone are
+  product features, not decoration (§3.3) — they are never the ONLY
+  signal: numerals and the recording pill mirror them visually.
+- **Reduced motion**: see §4.
+
+---
+
+## Appendix A — Conflicts found, and how this spec resolved them
+
+1. **"Opens straight into the camera" (standing preference) vs the
+   directive's tab IA (Studio home first).** The directive and
+   `IMPLEMENTATION.md` win for the overhaul: the app opens on Studio.
+   Mitigation inside the spec: Continue is one tap from launch, and
+   New Project is three taps from the camera. Flagged for the lead —
+   if Jaizon vetoes, Studio can become a lightweight launcher while
+   keeping the tabs.
+2. **"No status narration" (Jaizon removed the stage indicator)
+   vs the directive's recording-screen requirements ("clear recording
+   state", "song playback indicator").** Resolved by kind: stage
+   *narration* stays banned (no step indicator, no "you are
+   shuffling" text — §1.7, §2.3). Recording *state* (elapsed pill,
+   pulsing dot, song pill) is functional information a performer
+   needs mid-take and is specified (§3.3).
+3. **Iridescent identity (previous MEMORY) vs graphite/lime tokens.**
+   The overhaul supersedes it; `theme.ts` already renamed the ramp
+   to lime values under the `iridescent` token name. This spec uses
+   the token name as-is and culls the remaining violet/pink/blue
+   literals in components (§6 #8–#10). No new palette invented.
+4. **Directive asks for an "intensity" control; the engine exposes
+   only frequency.** Spec defers intensity rather than shipping a
+   dead control (§3.5), with the exact panel pattern to add it later.
+5. **Directive's project-creation format step vs the engine's single
+   canvas (1080×1920).** Format is shown as information, not a
+   choice (§3.2). Same resolution applied to Export's fps row (§3.6).
+6. **Directive: "Lock preferred moments"; engine pinning unconfirmed.**
+   Spec'd fully but engine-gated: absent UI beats broken UI (§3.5).
+7. **Projects don't exist in code yet** (single in-memory project;
+   autosave is a preference without persistence). Studio/Projects
+   specs (§3.1) therefore define the data the UI needs (title, song
+   name, take count, cover thumbnail source, last-stage, updated
+   time, exported flag) for the lead's Wave-2 projects store — the
+   design is ahead of the store by one wave, deliberately, and §6 #24
+   forbids shipping the autosave switch dark.
+8. **Haptics are specified but `expo-haptics` is not installed.**
+   Spec keeps haptics minimal (3 moments, §4) so the dependency is
+   trivial to add; the lead owns the install decision.
+9. **Settings as a sheet (current product) vs Settings as a tab
+   (directive IA).** Tab wins; the sheet components are culled
+   (§6 #11) and Record's gear becomes a navigation shortcut so the
+   muscle memory from the camera still works.
+10. **Takes screen "selection state" (directive)**: the current Takes
+    screen has no selection concept. Spec interprets it as the
+    *in-cut badge* (§3.4) — the only selection that means something
+    for a take — rather than inventing multi-select checkboxes with
+    no bulk action to serve.
+
+## Appendix B — Data the UI requires (for store/engine implementers)
+
+- **Project**: id, title (default = song name), song {name, uri,
+  duration}, region (existing `AudioRegion`), takes[], EDL
+  (existing `src/lib/edl.ts`), lastStage ('record'|'takes'|'editor'|
+  'export'), updatedAt, exported flag, cover source (cover clip →
+  take + frame). Persistence: autosave on change (Wave 2).
+- **Take**: existing fields + display name (rename, nullable) +
+  measured sync status enum (`synced | adjusted | unmeasured`) +
+  measured duration (already the plan in `IMPLEMENTATION.md`).
+  Chronological numbering is derived from `createdAt` order and is
+  stable across deletions.
+- **Editor**: EDL + undo AND redo stacks (redo is new), selected
+  segment id, mode (auto/manual, per project), pace (existing
+  `shuffleFrequency`), pinned segment ids (iff engine supports
+  locking).
+- **Export**: per-render state machine (idle → rendering(progress) →
+  done(measured result) | failed(error)), keyed to the EDL identity
+  so edits invalidate stale results (§3.6).

@@ -4,10 +4,10 @@ import { useMemo, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { SettingsSheetConnected } from '../components/SettingsSheetConnected';
-import { saveToPhotoLibrary, shareFile } from '../lib/media';
-import { useStudio } from '../store/StudioContext';
-import { colors, formatTime, radius, spacing, type as typeScale } from '../theme';
+import { SettingsSheetConnected } from '../../components/SettingsSheetConnected';
+import { saveToPhotoLibrary, shareFile } from '../../lib/media';
+import { useStudio } from '../../store/StudioContext';
+import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
 /**
  * Stage 2 — Takes review.
@@ -147,7 +147,7 @@ export default function TakesScreen() {
         <View style={[styles.nextBar, { paddingBottom: Math.max(insets.bottom, spacing.md) }]}>
           <Pressable
             style={styles.nextButton}
-            onPress={() => router.push('/shuffle')}
+            onPress={() => router.push('/project/editor')}
             accessibilityRole="button"
             accessibilityLabel="Continue to Shuffle">
             <Ionicons name="shuffle-outline" size={18} color="#14141F" />
@@ -162,16 +162,16 @@ export default function TakesScreen() {
         onClose={() => setSettingsOpen(false)}
         onPickTrack={() => {
           setSettingsOpen(false);
-          router.replace('/');
+          router.replace('/project/record');
         }}
         onOpenRegion={() => {
           setSettingsOpen(false);
-          router.replace('/');
+          router.replace('/project/record');
         }}
         onExportAction={() => {
           setSettingsOpen(false);
-          if (timeline.length > 0) router.push('/export');
-          else router.push('/shuffle');
+          if (timeline.length > 0) router.push('/project/export');
+          else router.push('/project/editor');
         }}
       />
     </View>

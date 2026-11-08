@@ -5,15 +5,15 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { SegmentedControl } from '../components/SegmentedControl';
-import { SettingsSheetConnected } from '../components/SettingsSheetConnected';
-import { TimelinePreview, type PreviewClip } from '../components/TimelinePreview';
-import { TimelineStrip } from '../components/TimelineStrip';
-import { buildSections, effectiveRegion, estimateTakeEnergies, subdivideSections } from '../lib/analysis';
-import { generateShuffle } from '../lib/shuffle';
-import { useStudio } from '../store/StudioContext';
-import { SHUFFLE_FREQUENCY_LENGTHS, type ShuffleFrequency } from '../types';
-import { colors, radius, spacing, type as typeScale } from '../theme';
+import { SegmentedControl } from '../../components/SegmentedControl';
+import { SettingsSheetConnected } from '../../components/SettingsSheetConnected';
+import { TimelinePreview, type PreviewClip } from '../../components/TimelinePreview';
+import { TimelineStrip } from '../../components/TimelineStrip';
+import { buildSections, effectiveRegion, estimateTakeEnergies, subdivideSections } from '../../lib/analysis';
+import { generateShuffle } from '../../lib/shuffle';
+import { useStudio } from '../../store/StudioContext';
+import { SHUFFLE_FREQUENCY_LENGTHS, type ShuffleFrequency } from '../../types';
+import { colors, radius, spacing, type as typeScale } from '../../theme';
 
 /**
  * Shuffle stage — the heart of the app, and the only way a cut is
@@ -211,7 +211,7 @@ export default function ShuffleScreen() {
               Shuffle works on your takes, and there aren&apos;t any yet. Record at least one take — two or more to
               shuffle — and this step unlocks.
             </Text>
-            <Pressable style={styles.primaryButton} onPress={() => router.replace('/')} accessibilityRole="button">
+            <Pressable style={styles.primaryButton} onPress={() => router.replace('/project/record')} accessibilityRole="button">
               <Ionicons name="videocam-outline" size={18} color="#14141F" />
               <Text style={styles.primaryButtonText}>Back to Record</Text>
             </Pressable>
@@ -356,7 +356,7 @@ export default function ShuffleScreen() {
         <View style={[styles.exportBar, { paddingBottom: Math.max(insets.bottom, spacing.md) }]}>
           <Pressable
             style={[styles.exportButton, !hasCut && styles.exportButtonDisabled]}
-            onPress={() => hasCut && router.push('/export')}
+            onPress={() => hasCut && router.push('/project/export')}
             disabled={!hasCut}
             accessibilityRole="button"
             accessibilityLabel={hasCut ? 'Export your video' : 'Export, locked until your cut has a clip'}>
@@ -376,15 +376,15 @@ export default function ShuffleScreen() {
         onClose={() => setSettingsOpen(false)}
         onPickTrack={() => {
           setSettingsOpen(false);
-          router.replace('/');
+          router.replace('/project/record');
         }}
         onOpenRegion={() => {
           setSettingsOpen(false);
-          router.replace('/');
+          router.replace('/project/record');
         }}
         onExportAction={() => {
           setSettingsOpen(false);
-          if (timeline.length > 0) router.push('/export');
+          if (timeline.length > 0) router.push('/project/export');
         }}
       />
     </View>

@@ -4,12 +4,12 @@ import { useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { TimelinePreview, type PreviewClip } from '../components/TimelinePreview';
-import { effectiveRegion } from '../lib/analysis';
-import { isCompositorAvailable, renderVideo, type CompositeResult } from '../lib/compositor';
-import { saveToPhotoLibrary, shareFile } from '../lib/media';
-import { useStudio } from '../store/StudioContext';
-import { colors, radius, spacing, type as typeScale } from '../theme';
+import { TimelinePreview, type PreviewClip } from '../../components/TimelinePreview';
+import { effectiveRegion } from '../../lib/analysis';
+import { isCompositorAvailable, renderVideo, type CompositeResult } from '../../lib/compositor';
+import { saveToPhotoLibrary, shareFile } from '../../lib/media';
+import { useStudio } from '../../store/StudioContext';
+import { colors, radius, spacing, type as typeScale } from '../../theme';
 
 /**
  * Export — the end of the flow (Record → Takes → Shuffle → Export).
@@ -126,7 +126,7 @@ export default function ExportScreen() {
           </Text>
           <Pressable
             style={styles.primaryButton}
-            onPress={() => (noTakes ? router.replace('/') : router.replace('/shuffle'))}
+            onPress={() => (noTakes ? router.replace('/project/record') : router.replace('/project/editor'))}
             accessibilityRole="button">
             <Ionicons name={noTakes ? 'videocam-outline' : 'git-branch-outline'} size={18} color="#14141F" />
             <Text style={styles.primaryButtonText}>{noTakes ? 'Back to Record' : 'Go to Shuffle'}</Text>

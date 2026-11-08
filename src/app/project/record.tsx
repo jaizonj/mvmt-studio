@@ -14,14 +14,14 @@ import {
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { IconButton } from '../components/IconButton';
-import { RecordButton } from '../components/RecordButton';
-import { SettingsSheet } from '../components/SettingsSheet';
-import { DEFAULT_BPM, effectiveRegion, rmsOfFrames, SectionEnergyAccumulator } from '../lib/analysis';
-import { TrackSheet } from '../components/TrackSheet';
-import { persistTake, pickAudioTrack, probeVideoDurationSeconds, saveToPhotoLibrary } from '../lib/media';
-import { useStudio } from '../store/StudioContext';
-import { colors, formatTime, radius, spacing, type as typeScale } from '../theme';
+import { IconButton } from '../../components/IconButton';
+import { RecordButton } from '../../components/RecordButton';
+import { SettingsSheet } from '../../components/SettingsSheet';
+import { DEFAULT_BPM, effectiveRegion, rmsOfFrames, SectionEnergyAccumulator } from '../../lib/analysis';
+import { TrackSheet } from '../../components/TrackSheet';
+import { persistTake, pickAudioTrack, probeVideoDurationSeconds, saveToPhotoLibrary } from '../../lib/media';
+import { useStudio } from '../../store/StudioContext';
+import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
 const ZOOM_PRESETS = [
   { label: '1×', value: 0 },
@@ -230,7 +230,7 @@ export default function CameraScreen() {
   // explains itself, rather than silently doing nothing.
   const goToTakes = useCallback(() => {
     if (takes.length === 0) return flashNotice('Record a take first');
-    router.push('/takes');
+    router.push('/project/takes');
   }, [flashNotice, takes.length]);
 
   // Settings' "Export video" action: a finished cut goes straight to
@@ -238,8 +238,8 @@ export default function CameraScreen() {
   // all stays locked with the message.
   const goToExportAction = useCallback(() => {
     if (takes.length === 0) return flashNotice('Record a take first');
-    if (studio.timeline.length > 0) return router.push('/export');
-    router.push('/shuffle');
+    if (studio.timeline.length > 0) return router.push('/project/export');
+    router.push('/project/editor');
   }, [flashNotice, takes.length, studio.timeline.length]);
 
   const handlePickTrack = useCallback(async () => {
