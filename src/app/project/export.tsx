@@ -240,11 +240,19 @@ export default function ExportScreen() {
     ? projectName
     : `${projectName} · ${cutCount} cut${cutCount === 1 ? '' : 's'} · ${formatTime(totalSeconds)}`;
 
+  // Ready = the finished cut can be previewed and rendered. Only then
+  // does the screen switch to the near-fullscreen stage layout — the
+  // locked/unavailable states keep the padded, header-led layout.
+  const readyState = !locked && engineAvailable && request !== null;
+
   return (
     <View style={styles.root}>
       <ScrollView
         style={{ flex: 1 }}
-        contentContainerStyle={{ paddingTop: insets.top + spacing.md, paddingBottom: spacing.xxl }}>
+        contentContainerStyle={
+          readyState ? { flexGrow: 1 } : { paddingTop: insets.top + spacing.md, paddingBottom: spacing.xxl }
+        }>
+        {!readyState ? (
         <View style={styles.header}>
           <Pressable
             onPress={() => router.back()}
@@ -258,6 +266,7 @@ export default function ExportScreen() {
           <Text style={styles.largeTitle}>Export</Text>
           <Text style={styles.headerSubtitle}>{subtitle}</Text>
         </View>
+        ) : null}
 
         {noTakes ? (
           <View style={[styles.section, styles.emptyCard]}>
@@ -313,34 +322,53 @@ export default function ExportScreen() {
             </Pressable>
           </View>
         ) : (
-          <>
-            {/* Final preview — the same request the render will use. */}
-            <View style={styles.section}>
-              <View style={styles.previewFrame}>
-                <NativePreview
-                  request={request}
-                  requestKey={`${requestKey}#${previewNonce}`}
-                  paused={paused}
-                  onProgress={(pos) => setPosition(pos)}
-                  onStatus={setPreviewStatus}
-                  style={styles.preview}
-                />
-                {previewStatus === 'loading' ? (
-                  <View style={styles.previewLoading} pointerEvents="none">
-                    <ActivityIndicator color={colors.label} />
-                    <Text style={styles.previewLoadingText}>Preparing your cut…</Text>
-                  </View>
-                ) : null}
-              </View>
-              <View style={styles.transport}>
+          <View style={styles.readyWrap}>
+            {/* Near-fullscreen final preview — the same request the
+                render will use. The chrome floats on the video: a top
+                bar (back button + title pill) and the transport pill
+                along the stage's bottom edge. Buttons on the picture
+                is the point of this layout. */}
+            <View style={styles.stage}>
+              <NativePreview
+                request={request}
+                requestKey={`${requestKey}#${previewNonce}`}
+                paused={paused}
+                onProgress={(pos) => setPosition(pos)}
+                onStatus={setPreviewStatus}
+                style={styles.stagePreview}
+              />
+              {previewStatus === 'loading' ? (
+                <View style={styles.previewLoading} pointerEvents="none">
+                  <ActivityIndicator color={colors.label} />
+                  <Text style={styles.previewLoadingText}>Preparing your cut…</Text>
+                </View>
+              ) : null}
+              <View style={[styles.stageTopBar, { paddingTop: insets.top + spacing.sm }]}>
                 <Pressable
-                  style={styles.playButton}
+                  onPress={() => router.back()}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to Editor"
+                  style={styles.stageRoundButton}>
+                  <Ionicons name="chevron-back" size={24} color={colors.label} />
+                </Pressable>
+                <View style={styles.stageTitlePill}>
+                  <Text style={styles.stageTitle}>Export</Text>
+                  <Text style={styles.stageSubtitle} numberOfLines={1}>
+                    {subtitle}
+                  </Text>
+                </View>
+                <View style={styles.stageSpacer} />
+              </View>
+              <View style={styles.stageTransport}>
+                <Pressable
+                  style={styles.stagePlayButton}
                   onPress={() => setPaused((p) => !p)}
                   accessibilityRole="button"
                   accessibilityLabel={paused ? 'Play preview' : 'Pause preview'}>
-                  <Ionicons name={paused ? 'play' : 'pause'} size={20} color={colors.label} />
+                  <Ionicons name={paused ? 'play' : 'pause'} size={19} color={colors.label} />
                 </Pressable>
-                <Text style={styles.transportTime}>{formatTime(position)}</Text>
+                <Text style={styles.stageTime}>{formatTime(position)}</Text>
                 <View style={styles.transportTrack}>
                   <View
                     style={[
@@ -349,31 +377,32 @@ export default function ExportScreen() {
                     ]}
                   />
                 </View>
-                <Text style={styles.transportTime}>{formatTime(totalSeconds)}</Text>
+                <Text style={styles.stageTime}>{formatTime(totalSeconds)}</Text>
               </View>
-              {previewStatus === 'error' ? (
-                <View style={styles.inlineNote}>
-                  <Text style={styles.inlineNoteText}>The preview couldn&apos;t be prepared.</Text>
-                  <Pressable
-                    hitSlop={8}
-                    onPress={() => setPreviewNonce((n) => n + 1)}
-                    accessibilityRole="button"
-                    accessibilityLabel="Try preparing the preview again">
-                    <Text style={styles.inlineNoteAction}>Try again</Text>
-                  </Pressable>
-                </View>
-              ) : null}
-              {cut && cut.issues > 0 ? (
-                <Text style={styles.validationNote}>
-                  {cut.issues} {cut.issues === 1 ? 'cut was' : 'cuts were'} trimmed to fit their takes.
-                </Text>
-              ) : null}
             </View>
+
+            {previewStatus === 'error' ? (
+              <View style={[styles.noteSection, styles.inlineNote]}>
+                <Text style={styles.inlineNoteText}>The preview couldn&apos;t be prepared.</Text>
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => setPreviewNonce((n) => n + 1)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Try preparing the preview again">
+                  <Text style={styles.inlineNoteAction}>Try again</Text>
+                </Pressable>
+              </View>
+            ) : null}
+            {cut && cut.issues > 0 ? (
+              <Text style={[styles.noteSection, styles.validationNote]}>
+                {cut.issues} {cut.issues === 1 ? 'cut was' : 'cuts were'} trimmed to fit their takes.
+              </Text>
+            ) : null}
 
             {showCompletion && result ? (
               /* Completion — replaces the options area. The facts shown
                  are MEASURED from the written file, never requested. */
-              <View style={[styles.section, styles.card, styles.completionCard]}>
+              <View style={[styles.section, styles.belowStage, styles.card, styles.completionCard]}>
                 <Ionicons name="checkmark-circle" size={44} color={colors.success} />
                 <Text style={styles.completionTitle}>Your video is ready</Text>
                 <Text style={styles.completionFacts}>
@@ -409,7 +438,7 @@ export default function ExportScreen() {
                 </View>
               </View>
             ) : phase === 'error' ? (
-              <View style={[styles.section, styles.card, styles.failureCard]}>
+              <View style={[styles.section, styles.belowStage, styles.card, styles.failureCard]}>
                 <Ionicons name="alert-circle" size={30} color={colors.danger} />
                 <Text style={styles.failureTitle}>That didn&apos;t work</Text>
                 <Text style={styles.failureBody}>{errorMessage}</Text>
@@ -422,7 +451,7 @@ export default function ExportScreen() {
                 </Pressable>
               </View>
             ) : (
-              <View style={styles.section}>
+              <View style={[styles.section, styles.belowStage]}>
                 {phase === 'cancelled' ? (
                   <Text style={styles.cancelledNote}>Export cancelled — nothing was saved.</Text>
                 ) : null}
@@ -440,23 +469,14 @@ export default function ExportScreen() {
                       accessibilityLabel="Export quality"
                     />
                   </View>
-                  <View style={[styles.optionRow, styles.rowSeparator]}>
-                    <Text style={styles.optionLabel}>Size</Text>
-                    <Text style={styles.optionValue}>
-                      {request.canvasWidth} × {request.canvasHeight} · {cut?.edl.fps ?? 30} fps · Portrait
-                    </Text>
-                  </View>
-                  <View style={[styles.optionRow, styles.rowSeparator]}>
-                    <Text style={styles.optionLabel}>Sound</Text>
-                    <Text style={styles.optionValue}>Song only — your takes&apos; camera sound is off</Text>
-                  </View>
                 </View>
                 <Text style={styles.qualityCaption}>
-                  {request.canvasWidth} × {request.canvasHeight} · {QUALITY_CAPTIONS[exportQuality]}
+                  {request.canvasWidth} × {request.canvasHeight} · {cut?.edl.fps ?? 30} fps · Portrait · Song only —
+                  your takes&apos; camera sound is off · {QUALITY_CAPTIONS[exportQuality]}
                 </Text>
               </View>
             )}
-          </>
+          </View>
         )}
       </ScrollView>
 
@@ -533,8 +553,81 @@ const styles = StyleSheet.create({
   primaryButtonConfirmed: { backgroundColor: colors.elevated },
   confirmedButtonText: { color: colors.success },
 
-  previewFrame: { position: 'relative' },
-  preview: { width: '100%', aspectRatio: 9 / 16, maxHeight: 460 },
+  // ---- Near-fullscreen stage (ready state only) ----
+  readyWrap: { flex: 1 },
+  stage: { flex: 1, minHeight: 360, backgroundColor: '#000', position: 'relative' },
+  stagePreview: { flex: 1, borderRadius: 0 },
+  stageTopBar: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.md,
+  },
+  stageRoundButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: colors.material,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.materialBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stageSpacer: { width: 44, height: 44 },
+  stageTitlePill: {
+    flex: 1,
+    flexShrink: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.material,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.materialBorder,
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 10,
+    marginHorizontal: spacing.md,
+  },
+  stageTitle: { ...typeScale.headline, color: colors.label },
+  stageSubtitle: { ...typeScale.footnote, color: colors.labelSecondary, flexShrink: 1 },
+  stageTransport: {
+    position: 'absolute',
+    left: spacing.md,
+    right: spacing.md,
+    bottom: spacing.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: colors.material,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.materialBorder,
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  stagePlayButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: colors.materialBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stageTime: {
+    ...typeScale.caption,
+    color: colors.label,
+    fontVariant: ['tabular-nums'],
+    minWidth: 30,
+    textAlign: 'center',
+  },
+  noteSection: { paddingHorizontal: spacing.xl },
+  belowStage: { marginTop: spacing.lg },
+
   previewLoading: {
     position: 'absolute',
     top: 0,
@@ -546,27 +639,6 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   previewLoadingText: { ...typeScale.footnote, color: colors.labelSecondary },
-  transport: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.md,
-    marginTop: spacing.md,
-  },
-  playButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: colors.card,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  transportTime: {
-    ...typeScale.caption,
-    color: colors.labelSecondary,
-    fontVariant: ['tabular-nums'],
-    minWidth: 30,
-    textAlign: 'center',
-  },
   transportTrack: {
     flex: 1,
     height: 4,
@@ -592,16 +664,7 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
   },
   optionBlock: { paddingVertical: spacing.md, gap: spacing.sm },
-  optionRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: spacing.md,
-    paddingVertical: spacing.md,
-  },
   optionLabel: { ...typeScale.headline, color: colors.label },
-  optionValue: { ...typeScale.footnote, color: colors.labelSecondary, flexShrink: 1, textAlign: 'right' },
-  rowSeparator: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.separator },
   qualityCaption: {
     ...typeScale.footnote,
     color: colors.labelSecondary,
