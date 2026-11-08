@@ -1601,6 +1601,7 @@ private final class CaptureCoordinator: NSObject,
     queue.async { [weak self] in
       self?.previewLayer = layer
       self?.applyConnectionSettingsLocked()
+      self?.updateSessionRunningLocked()
     }
   }
 
@@ -1785,17 +1786,18 @@ private final class CaptureCoordinator: NSObject,
   }
 
   private func setPortraitRotation(on connection: AVCaptureConnection) {
-    if #available(iOS 17.0, *) {
-      if connection.isVideoRotationAngleSupported(90) {
-        connection.videoRotationAngle = 90
-      }
-    } else {
-      // Deprecated in iOS 17 (replaced by videoRotationAngle above)
-      // but the only rotation API on the iOS 15.5–16 range this
-      // module still supports.
-      if connection.isVideoOrientationSupported {
-        connection.videoOrientation = .portrait
-      }
+    // Portrait via the ORIENTATION API, which is camera-aware: the
+    // framework maps .portrait to the correct rotation angle for the
+    // active camera. A flat videoRotationAngle of 90 is only right
+    // for the back camera — the front sensor is mounted rotated the
+    // opposite way, and 90 left the front camera sideways (Jaizon's
+    // device report, 2026-11-09). videoOrientation is deprecated in
+    // iOS 17 in favour of videoRotationAngle, but it is still
+    // honoured and still the only camera-aware way to say "portrait".
+    if connection.isVideoOrientationSupported {
+      connection.videoOrientation = .portrait
+    } else if #available(iOS 17.0, *), connection.isVideoRotationAngleSupported(90) {
+      connection.videoRotationAngle = 90
     }
   }
 
@@ -2443,6 +2445,16 @@ public final class MvmtCaptureView: ExpoView {
   public override func layoutSubviews() {
     super.layoutSubviews()
     previewLayer.frame = bounds
+  }
+
+  public override func didMoveToWindow() {
+    super.didMoveToWindow()
+    // If the `active` prop landed before the view was in a window,
+    // re-assert it now so the session starts — the camera must be
+    // live the moment the Record screen is on screen.
+    if window != nil, active {
+      CaptureCoordinator.shared.setPreviewActive(true, viewID: ObjectIdentifier(self))
+    }
   }
 }
 

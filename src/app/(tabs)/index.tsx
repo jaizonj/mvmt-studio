@@ -1,4 +1,5 @@
 import { router } from 'expo-router';
+import { useEffect, useRef } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -19,6 +20,18 @@ export default function StudioHome() {
   const insets = useSafeAreaInsets();
   const studio = useStudio();
   const { activeProject, projects, hydrated } = studio;
+
+  // Open straight into the camera (Jaizon, 2026-11-09: "the app
+  // doesn't open with the camera running"). With an active project,
+  // a cold launch lands in its Record screen — camera live,
+  // Snapchat-style. Once per mount: backing out to Studio to look
+  // at projects must not bounce straight back in.
+  const launchedRef = useRef(false);
+  useEffect(() => {
+    if (!hydrated || !activeProject || launchedRef.current) return;
+    launchedRef.current = true;
+    router.push('/project/record');
+  }, [hydrated, activeProject]);
 
   const startNewProject = () => {
     studio.createProject();

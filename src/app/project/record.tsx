@@ -45,7 +45,6 @@ import {
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import type { Take } from '../../types';
 import { measureTakeDurationSeconds, persistTake, pickAudioTrack } from '../../lib/media';
-import { loadTrackPeaks, samplePeaks, standinPeaks } from '../../lib/waveform';
 import { useStudio } from '../../store/StudioContext';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
@@ -243,6 +242,9 @@ export default function CameraScreen() {
   // preview card below.
   const [railPreviewId, setRailPreviewId] = useState<string | null>(null);
   const [railPaused, setRailPaused] = useState(false);
+  // The takes rail starts COLLAPSED (Jaizon, 2026-11-09) — a slim
+  // pull-tab on the left edge; tap to expand, chevron to collapse.
+  const [railOpen, setRailOpen] = useState(false);
   const [, setRailThumbTick] = useState(0);
   useEffect(() => {
     let alive = true;
@@ -256,31 +258,22 @@ export default function CameraScreen() {
     };
   }, [takes]);
 
-  // Track-strip waveform peaks: REAL decoded peaks (lib/waveform),
-  // stored tagged with the uri they belong to; the strip reads the
-  // ones matching the CURRENT track and renders the stand-in until
-  // they land, so it is never empty and a new track never shows the
-  // previous track's waveform.
-  const [loadedPeaks, setLoadedPeaks] = useState<{ uri: string; peaks: number[] } | null>(null);
-  const trackUri = track?.uri;
-  const trackName = track?.name;
-  useEffect(() => {
-    if (!trackUri || !trackName) return;
-    let alive = true;
-    void loadTrackPeaks({ uri: trackUri, name: trackName }).then((peaks) => {
-      if (alive) setLoadedPeaks({ uri: trackUri, peaks });
-    });
-    return () => {
-      alive = false;
-    };
-  }, [trackUri, trackName]);
-  const trackPeaks = loadedPeaks && loadedPeaks.uri === trackUri ? loadedPeaks.peaks : null;
-
   const railPreviewTake = railPreviewId ? (takes.find((t) => t.id === railPreviewId) ?? null) : null;
   const edlTakeIds = useMemo(() => new Set((studio.edl?.segments ?? []).map((seg) => seg.takeId)), [studio.edl]);
   const [appActive, setAppActive] = useState(true);
   const [isFocused, setIsFocused] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+
+  // No track display on the camera (Jaizon, 2026-11-09): with no
+  // track set, entering Record opens the song/part picker ONCE —
+  // pick the song and the part, then the camera just knows. The
+  // musical-notes button in the top bar reopens it any time.
+  const autoOpenedTrackRef = useRef(false);
+  useEffect(() => {
+    if (!studio.hydrated || !isFocused || track || autoOpenedTrackRef.current) return;
+    autoOpenedTrackRef.current = true;
+    setTrackOpen(true);
+  }, [studio.hydrated, isFocused, track]);
 
   const cameraRef = useRef<CameraView>(null);
   const recordPromiseRef = useRef<Promise<{ uri: string } | undefined> | null>(null);
@@ -887,6 +880,7 @@ export default function CameraScreen() {
       }
     }, 100);
     setRecording(true);
+    setRailOpen(false);
 
     if (useNativeCapture) {
       // NATIVE CAPTURE start — the module starts the song (at the
@@ -1106,23 +1100,6 @@ export default function CameraScreen() {
 
   const regionEffForLabel = effectiveRegion(studio.trackRegion, track?.durationSeconds);
 
-  // Track-strip bars: STRIP_BAR_COUNT across the strip, resampled
-  // (max) from the loaded peaks — or from the stand-in until the
-  // decode lands. A bar is "in region" when its CENTRE falls inside
-  // the effective region (regionEffForLabel — the same region source
-  // the record flow and the length row use).
-  const STRIP_BAR_COUNT = 72;
-  const stripSourcePeaks = track ? (trackPeaks ?? standinPeaks(track.name, 120)) : [];
-  const stripBars = samplePeaks(stripSourcePeaks, STRIP_BAR_COUNT).map((peak, i) => {
-    const duration = track?.durationSeconds ?? 0;
-    const centreSeconds = duration > 0 ? ((i + 0.5) / STRIP_BAR_COUNT) * duration : 0;
-    const inRegion =
-      regionEffForLabel !== null &&
-      centreSeconds >= regionEffForLabel.startSeconds &&
-      centreSeconds <= regionEffForLabel.endSeconds;
-    return { key: i, height: Math.max(3, peak * 24), inRegion };
-  });
-
   // Rail preview card: with a track loaded, the preview is
   // SONG-REFERENCED (calibrationPreviewFor — the take plays against
   // the master song exactly as the editor would cut it) so sync can
@@ -1190,12 +1167,19 @@ export default function CameraScreen() {
         </View>
       ) : null}
 
-      {/* Top bar — Settings gear left, flash/flip right. The track
-          itself lives in the transparent waveform strip below (the
-          green track pill is gone — Jaizon, 2026-11-09). */}
+      {/* Top bar — Settings gear left; song, flash and flip right.
+          No track display on the camera (Jaizon, 2026-11-09): the
+          song/part picker is the musical-notes button, and with no
+          track set the picker opens by itself on entry. */}
       <View style={[styles.topBar, { top: insets.top + spacing.sm }]}>
         <IconButton icon="settings-outline" accessibilityLabel="Settings" onPress={() => router.push('/settings')} />
         <View style={styles.topRight}>
+          <IconButton
+            icon="musical-notes"
+            accessibilityLabel="Choose the song and which part to use"
+            active={!!track}
+            onPress={() => setTrackOpen(true)}
+          />
           <IconButton
             icon={torch ? 'flash' : 'flash-outline'}
             accessibilityLabel="Toggle torch"
@@ -1210,54 +1194,6 @@ export default function CameraScreen() {
           />
         </View>
       </View>
-
-      {/* Track strip — TRANSPARENT (no background, no border), full
-          width under the top bar. No track: a quiet centred "Add a
-          song" row. Track loaded: the song's waveform with the
-          selected part lit in the accent, name left / duration right
-          beneath the bars. The whole strip opens the track sheet
-          either way. Placement: top +56 with height 44 ends at +100,
-          clearing the recording pill (+112) and notice pill (+154).
-          Disabled + dimmed while recording, like the other controls. */}
-      <Pressable
-        style={[styles.trackStrip, { top: insets.top + 56 }, recording && styles.trackStripDisabled]}
-        disabled={recording}
-        onPress={() => setTrackOpen(true)}
-        accessibilityRole="button"
-        accessibilityState={{ disabled: recording }}
-        accessibilityLabel={
-          track ? `Track: ${track.name}. Change the track or choose which part to use` : 'Add a song'
-        }>
-        {track ? (
-          <>
-            <View style={styles.trackStripBars} pointerEvents="none">
-              {stripBars.map((bar) => (
-                <View
-                  key={bar.key}
-                  style={[
-                    styles.trackStripBar,
-                    { height: bar.height },
-                    bar.inRegion ? styles.trackStripBarInRegion : styles.trackStripBarOutRegion,
-                  ]}
-                />
-              ))}
-            </View>
-            <View style={styles.trackStripLabels} pointerEvents="none">
-              <Text style={styles.trackStripName} numberOfLines={1}>
-                {track.name}
-              </Text>
-              {track.durationSeconds ? (
-                <Text style={styles.trackStripDuration}>{formatTime(track.durationSeconds)}</Text>
-              ) : null}
-            </View>
-          </>
-        ) : (
-          <View style={styles.trackStripEmpty} pointerEvents="none">
-            <Ionicons name="musical-notes" size={15} color="rgba(244,241,233,0.65)" />
-            <Text style={styles.trackStripEmptyText}>Add a song</Text>
-          </View>
-        )}
-      </Pressable>
 
       {/* Countdown / recording status — centred, system style. */}
       {countingDown !== null ? (
@@ -1302,14 +1238,24 @@ export default function CameraScreen() {
         </Pressable>
       </View>
 
-      {/* Takes rail — takes stack up on the LEFT as they're recorded,
-          each with a real preview frame (this replaces the separate
-          Takes screen). Tap a tile for the preview card. */}
+      {/* Takes rail — COLLAPSED by default (Jaizon, 2026-11-09):
+          a slim pull-tab on the left edge (film icon + count). Tap
+          it and the rail slides in: takes stacked on the LEFT, each
+          with a real preview frame. Tap a tile for the preview card;
+          the chevron at the top of the rail collapses it again. */}
       {takes.length > 0 ? (
+        railOpen && !recording ? (
         <ScrollView
-          style={[styles.takeRail, { top: insets.top + 118, bottom: insets.bottom + 208 }]}
+          style={[styles.takeRail, { top: insets.top + 64, bottom: insets.bottom + 208 }]}
           contentContainerStyle={styles.takeRailContent}
           showsVerticalScrollIndicator={false}>
+          <Pressable
+            style={styles.railCollapse}
+            onPress={() => setRailOpen(false)}
+            accessibilityRole="button"
+            accessibilityLabel="Hide takes">
+            <Ionicons name="chevron-back" size={15} color={colors.label} />
+          </Pressable>
           {takes.map((take) => {
             const thumb = getCachedThumbnail(take.uri, railSampleSeconds(take));
             const inCut = edlTakeIds.has(take.id);
@@ -1336,6 +1282,18 @@ export default function CameraScreen() {
             );
           })}
         </ScrollView>
+        ) : (
+          <Pressable
+            style={[styles.railTab, { top: insets.top + 64 }]}
+            onPress={() => setRailOpen(true)}
+            disabled={recording}
+            accessibilityRole="button"
+            accessibilityLabel={`Show your ${takes.length} takes`}>
+            <Ionicons name="film-outline" size={16} color={colors.label} />
+            <Text style={styles.railTabCount}>{takes.length}</Text>
+            <Ionicons name="chevron-forward" size={12} color={colors.labelSecondary} />
+          </Pressable>
+        )
       ) : null}
 
       {/* Take preview card — the rail tile's detail view: native
@@ -1641,48 +1599,6 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   topRight: { gap: spacing.sm },
-  // Transparent track strip (Jaizon, 2026-11-09 — replaces the green
-  // track pill): deliberately NO backgroundColor/border — the waveform
-  // floats directly over the camera. `top` is set inline
-  // (insets.top + 56); height 44 ends at insets.top + 100, above the
-  // recording pill (+112) and notice pill (+154).
-  trackStrip: {
-    position: 'absolute',
-    left: spacing.lg,
-    right: spacing.lg,
-    height: 44,
-    justifyContent: 'center',
-  },
-  trackStripDisabled: { opacity: 0.35 },
-  trackStripBars: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 2,
-    height: 26,
-  },
-  trackStripBar: { flex: 1, borderRadius: 1.5 },
-  // In-region bars: the accent at full opacity. Out-of-region: warm
-  // white (theme label #F4F1E9) at ~40%.
-  trackStripBarInRegion: { backgroundColor: colors.accent, opacity: 1 },
-  trackStripBarOutRegion: { backgroundColor: colors.label, opacity: 0.4 },
-  trackStripLabels: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: spacing.sm,
-    marginTop: 3,
-  },
-  // Micro-labels: warm white at 75% (label is #F4F1E9).
-  trackStripName: { color: 'rgba(244,241,233,0.75)', fontSize: 11, flexShrink: 1 },
-  trackStripDuration: { color: 'rgba(244,241,233,0.75)', fontSize: 11, fontVariant: ['tabular-nums'] },
-  trackStripEmpty: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 6,
-  },
-  // Warm white at ~65%.
-  trackStripEmptyText: { color: 'rgba(244,241,233,0.65)', fontSize: 13, fontWeight: '500' },
   centerOverlay: {
     position: 'absolute',
     top: 0,
@@ -1805,6 +1721,31 @@ const styles = StyleSheet.create({
   sideButtonSpacer: { width: 64 },
   takeRail: { position: 'absolute', left: spacing.md, width: 60 },
   takeRailContent: { gap: spacing.md, alignItems: 'center', paddingVertical: spacing.xs },
+  // Collapsed takes rail: a slim pull-tab hugging the left edge —
+  // film icon + take count + chevron. Translucent graphite so it
+  // reads as a control, not content.
+  railTab: {
+    position: 'absolute',
+    left: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    backgroundColor: 'rgba(16,17,20,0.55)',
+    paddingVertical: 9,
+    paddingLeft: 7,
+    paddingRight: 8,
+    borderTopRightRadius: radius.md,
+    borderBottomRightRadius: radius.md,
+  },
+  railTabCount: { color: colors.label, fontSize: 12, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  railCollapse: {
+    width: 44,
+    height: 26,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(16,17,20,0.55)',
+  },
   railTile: { width: 60, alignItems: 'center' },
   railThumb: { width: 56, height: 74, borderRadius: radius.sm, backgroundColor: colors.card },
   railThumbPlaceholder: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.elevated },
