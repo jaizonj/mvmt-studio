@@ -1,4 +1,6 @@
-import { requireOptionalNativeModule } from 'expo';
+import { requireNativeView, requireOptionalNativeModule } from 'expo';
+import { createElement, type ComponentType } from 'react';
+import type { ViewStyle } from 'react-native';
 
 /**
  * MvmtCompositor — MVMT Studio's native media engine (iOS only).
@@ -131,6 +133,70 @@ export interface TakeSyncMeasurement {
   peakRatio: number | null;
 }
 
+/** Arguments for `startCapture` (the native song-synced recorder). */
+export interface CaptureStartArgs {
+  /**
+   * Master song file (`file://` URI or absolute path), or null to
+   * record without a song clock (video + mic only — the result's
+   * `firstFrameSongPositionSeconds` will be null).
+   */
+  songUri: string | null;
+  /** Where to start inside the master song, in seconds. */
+  songStartSeconds: number;
+  /**
+   * Native safety stop: the capture finishes itself at this duration
+   * so a hung JS side can never record forever. <= 0 = no limit.
+   */
+  maxDurationSeconds: number;
+}
+
+/** Result of `stopCapture` — measured from the written file. */
+export interface CaptureResult {
+  /** `file://` URI of the recorded mp4 (app caches directory). */
+  uri: string;
+  /** MEASURED duration of the written file, in seconds. */
+  durationSeconds: number;
+  /** Measured frame width of the written file (display size). */
+  width: number;
+  /** Measured frame height of the written file (display size). */
+  height: number;
+  /**
+   * The master song's position (seconds, same timeline as
+   * `CaptureStartArgs.songStartSeconds`) at the FIRST captured video
+   * frame — measured natively: the coordinator owns both clocks (an
+   * AVPlayer for the song and the capture session), and converts the
+   * first frame's host-clock presentation timestamp through the
+   * player item's host-time mapping. Null when no song was supplied
+   * or the player wasn't ready/playing when the first frame landed.
+   */
+  firstFrameSongPositionSeconds: number | null;
+  /**
+   * Intra-file A/V offset of the written file:
+   * audioTrack.start − videoTrack.start, in seconds. Null when the
+   * file has no audio track.
+   */
+  intraFileAvOffsetSeconds: number | null;
+}
+
+/** Props for the `CapturePreview` native view. */
+export interface CapturePreviewProps {
+  facing: 'front' | 'back';
+  torch: boolean;
+  /**
+   * Expo-style zoom 0..1 — mapped natively to a device zoom factor of
+   * 1 + zoom × 5, clamped to the device's maximum.
+   */
+  zoom: number;
+  /**
+   * Front-camera mirroring, applied consistently to the preview and
+   * the recorded file (matching expo-camera's mirror preference).
+   */
+  mirrored: boolean;
+  /** Keeps the capture session running (live preview) while true. */
+  active: boolean;
+  style?: ViewStyle;
+}
+
 export interface ExportProgressEvent {
   exportId: string;
   /** 0..1 */
@@ -167,6 +233,9 @@ interface NativeMvmtCompositorModule {
     expectedSongPositionAtTakeStartSeconds: number,
     searchWindowSeconds: number,
   ): Promise<TakeSyncMeasurement>;
+  isCaptureAvailable(): boolean;
+  startCapture(args: CaptureStartArgs): Promise<void>;
+  stopCapture(): Promise<CaptureResult>;
   createPreview(request: CompositeRequest): Promise<string>;
   setPreviewPaused(previewId: string, paused: boolean): Promise<void>;
   seekPreview(previewId: string, seconds: number): Promise<void>;
@@ -261,6 +330,97 @@ export async function measureTakeSync(
     expectedSongPositionAtTakeStartSeconds,
     searchWindowSeconds,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Native capture (song-synced recorder)
+//
+// The capture coordinator owns BOTH clocks during recording — an
+// AVPlayer playing the master song and the AVCaptureSession — so the
+// result reports the song position at the first captured frame as a
+// native measurement instead of a JS estimate. The preview surface is
+// the `CapturePreview` view below, bound to the same capture session:
+// configure it (facing/torch/zoom/mirrored) first, then startCapture
+// records with that configuration.
+// ---------------------------------------------------------------------------
+
+/**
+ * True when the native module is linked AND the capture stack is
+ * usable on this device. False in Expo Go, in older builds without
+ * the capture functions, and on devices with no camera.
+ */
+export function isCaptureAvailable(): boolean {
+  if (!nativeModule) return false;
+  return typeof nativeModule.isCaptureAvailable === 'function'
+    ? nativeModule.isCaptureAvailable()
+    : false;
+}
+
+/**
+ * Starts a native capture with the CURRENT `CapturePreview`
+ * configuration (facing/torch/zoom/mirrored). Seeks the internal song
+ * player to `songStartSeconds` with zero tolerances and plays it in
+ * step with capture start. Resolves once capture is actually rolling
+ * (the first video frame has been written). Rejects with a clear
+ * error on permission/session/writer failure so the caller can fall
+ * back to expo-camera.
+ */
+export async function startCapture(args: CaptureStartArgs): Promise<void> {
+  const mod = requireModule();
+  if (typeof mod.startCapture !== 'function') {
+    throw new Error(
+      'Native capture is not available in this build — it needs a newer development or sideload build of MVMT Studio.',
+    );
+  }
+  return mod.startCapture({
+    songUri: args.songUri ?? null,
+    songStartSeconds: args.songStartSeconds,
+    maxDurationSeconds: args.maxDurationSeconds,
+  });
+}
+
+/**
+ * Stops the running capture, finishes the file, and resolves with
+ * the measured result. If the capture already auto-finished (the
+ * native max-duration safety stop), resolves with that capture's
+ * stored result. Rejects when no capture is in progress or no usable
+ * file was written.
+ */
+export async function stopCapture(): Promise<CaptureResult> {
+  const mod = requireModule();
+  if (typeof mod.stopCapture !== 'function') {
+    throw new Error(
+      'Native capture is not available in this build — it needs a newer development or sideload build of MVMT Studio.',
+    );
+  }
+  return mod.stopCapture();
+}
+
+type NativeCaptureViewComponent = ComponentType<CapturePreviewProps>;
+let cachedCaptureView: NativeCaptureViewComponent | null | undefined;
+
+function captureViewComponent(): NativeCaptureViewComponent | null {
+  if (cachedCaptureView !== undefined) return cachedCaptureView;
+  try {
+    cachedCaptureView = nativeModule
+      ? (requireNativeView('MvmtCompositor', 'MvmtCaptureView') as NativeCaptureViewComponent)
+      : null;
+  } catch {
+    cachedCaptureView = null;
+  }
+  return cachedCaptureView;
+}
+
+/**
+ * Live camera preview for native capture, bound to the same capture
+ * session `startCapture` records from — what you see is exactly what
+ * records. Renders nothing when the native view is unavailable (gate
+ * rendering on `isCaptureAvailable()`).
+ */
+export function CapturePreview(props: CapturePreviewProps) {
+  const Component = captureViewComponent();
+  if (!Component) return null;
+  return createElement(Component, props);
 }
 
 /**

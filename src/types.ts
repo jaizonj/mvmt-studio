@@ -37,11 +37,12 @@ export interface Take {
   /**
    * MEASURED synchronization offset, seconds: where the song actually
    * was (relative to the intended region start) when this take's first
-   * frames were captured — derived from the audio player's position
-   * sampled at record start/stop, not assumed. Positive = the camera
-   * effectively started late. Consumed by the EDL bridge
-   * (src/lib/shuffleEdl.ts) via the single mapping in src/lib/edl.ts.
-   * Undefined = not measured (older takes).
+   * frames were captured — measured, not assumed (see `syncSource`
+   * for how: player sample, file correlation, or the native capture
+   * module's first-frame report). Positive = the camera effectively
+   * started late. Consumed by the EDL bridge (src/lib/shuffleEdl.ts)
+   * via the single mapping in src/lib/edl.ts. Undefined = not
+   * measured (older takes).
    */
   syncOffsetSeconds?: number;
   /**
@@ -61,9 +62,15 @@ export interface Take {
    * player's position sampled at record start/stop (the original
    * estimate); 'fileCorrelation' = measured after the fact from the
    * recorded file itself (native correlation of the take's mic audio
-   * against the master track). Undefined for older takes.
+   * against the master track); 'nativeCapture' = measured AT record
+   * time by the native capture module, which owned both the camera
+   * and the song player on one host clock and reported the song
+   * position at the first real frame. 'nativeCapture' is the
+   * highest-precedence measurement: automatic refinement
+   * (file correlation) must never overwrite it. Undefined for older
+   * takes.
    */
-  syncSource?: 'playerSample' | 'fileCorrelation';
+  syncSource?: 'playerSample' | 'fileCorrelation' | 'nativeCapture';
   /**
    * Confidence (0..1) of a 'fileCorrelation' measurement — peak
    * prominence of the correlation match. Only meaningful when

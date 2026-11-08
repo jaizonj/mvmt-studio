@@ -108,6 +108,54 @@ struct AssetInfoRecord: Record {
   var audioDurationSeconds: Double = 0
 }
 
+struct CaptureStartArgsRecord: Record {
+  /// Master song file (`file://` URI or path). Nil = record without a
+  /// song clock (video + mic only; no first-frame song position).
+  @Field
+  var songUri: String? = nil
+
+  /// Where to start inside the master song, in seconds — the internal
+  /// player seeks here (zero tolerances) before capture rolls.
+  @Field
+  var songStartSeconds: Double = 0
+
+  /// Native safety stop: capture finishes itself at this duration so
+  /// a hung JS side can never record forever. <= 0 = no limit.
+  @Field
+  var maxDurationSeconds: Double = 0
+}
+
+struct CaptureResultRecord: Record {
+  /// `file://` URI of the written mp4 (app caches directory).
+  @Field
+  var uri: String
+
+  /// MEASURED duration of the written file, in seconds.
+  @Field
+  var durationSeconds: Double
+
+  /// Measured display size of the written file (rotation applied).
+  @Field
+  var width: Int
+
+  @Field
+  var height: Int
+
+  /// The master song's position (seconds, same timeline as
+  /// `songStartSeconds`) at the FIRST captured video frame — measured
+  /// natively through the player item's host-time mapping, never
+  /// estimated. Nil when no song was supplied or the player wasn't
+  /// ready/playing when the first frame landed.
+  @Field
+  var firstFrameSongPositionSeconds: Double? = nil
+
+  /// Intra-file A/V offset of the written file:
+  /// audioTrack.timeRange.start − videoTrack.timeRange.start
+  /// (seconds). Nil when the file has no audio track.
+  @Field
+  var intraFileAvOffsetSeconds: Double? = nil
+}
+
 struct TakeSyncMeasurementRecord: Record {
   /// 'measured' | 'noSongInMic' | 'lowConfidence' | 'outOfWindow' | 'error'
   @Field
@@ -1326,6 +1374,975 @@ public final class MvmtPreviewView: ExpoView {
   }
 }
 
+// MARK: - Native capture (song-synced recorder)
+//
+// WHY THIS EXISTS: the JS-side sync offset for an expo-camera take is
+// a player position sampled BEFORE recordAsync is called — blind to
+// the camera's variable spin-up, which is the dominant per-take
+// lip-sync error. This coordinator removes the guesswork by owning
+// BOTH clocks during recording:
+//
+//   - an AVPlayer playing the master song (seeked with ZERO
+//     tolerances to the requested start before capture rolls), and
+//   - an AVCaptureSession whose video sample buffers carry
+//     presentation timestamps on the host clock.
+//
+// The first appended frame's PTS is converted to a song position
+// through the player item's own host-time mapping
+// (`time(forHostTime:)`), so the result is a MEASUREMENT, not an
+// estimate: `CaptureResult.firstFrameSongPositionSeconds`.
+//
+// The preview (`MvmtCaptureView`) binds an
+// AVCaptureVideoPreviewLayer to the SAME session, so what you see is
+// exactly what records. Written files are .mp4 (H.264 + AAC) in the
+// caches directory, portrait 1080×1920: the video connection's
+// rotation is set to portrait, so sample buffers ARRIVE portrait
+// (unlike expo-camera's movie-file output, which stores landscape
+// buffers plus a rotation matrix — both shapes are handled by the
+// compositor, which always applies the track's preferredTransform).
+//
+// The coordinator deliberately does NOT touch AVAudioSession's
+// category: record.tsx configures playAndRecord via expo-audio before
+// recording, and the capture session is told
+// `automaticallyConfiguresApplicationAudioSession = false` so it
+// cannot stomp that. The internal song player simply plays within
+// whatever session the app has configured.
+
+private struct CaptureConfiguration {
+  var facing: AVCaptureDevice.Position = .back
+  var torch: Bool = false
+  /// Expo-style zoom 0..1 (mapped to a device factor when applied).
+  var zoom: Double = 0
+  var mirrored: Bool = false
+}
+
+private final class CaptureCoordinator: NSObject,
+  AVCaptureVideoDataOutputSampleBufferDelegate,
+  AVCaptureAudioDataOutputSampleBufferDelegate
+{
+  static let shared = CaptureCoordinator()
+
+  /// The one capture session — created once, reconfigured in place.
+  /// The preview view binds its layer to this exact object.
+  let session = AVCaptureSession()
+
+  /// Serial queue for ALL session configuration, sample-buffer
+  /// handling and writer appends (delegate callbacks land here too),
+  /// so no capture state needs locks.
+  private let queue = DispatchQueue(label: "au.mvmtstudio.capture")
+
+  // MARK: Configuration (set via the preview view's props)
+
+  private var configuration = CaptureConfiguration()
+  private var outputsConfigured = false
+  private var sessionConfigured = false
+  private var configuredPosition: AVCaptureDevice.Position?
+  private var videoDevice: AVCaptureDevice?
+  private var videoInput: AVCaptureDeviceInput?
+  private var audioInput: AVCaptureDeviceInput?
+  private let videoOutput = AVCaptureVideoDataOutput()
+  private let audioOutput = AVCaptureAudioDataOutput()
+  private weak var previewLayer: AVCaptureVideoPreviewLayer?
+  private var activePreviewViews: Set<ObjectIdentifier> = []
+
+  // MARK: Recording state (queue-owned)
+
+  private enum State {
+    case idle
+    case preparing // startCapture in flight; song seek pending — buffers dropped
+    case recording // armed: samples are being appended
+    case finishing
+    case finished
+  }
+
+  private var state: State = .idle
+  private var writer: AVAssetWriter?
+  private var videoWriterInput: AVAssetWriterInput?
+  private var audioWriterInput: AVAssetWriterInput?
+  private var writerStarted = false
+  private var firstVideoPTS: CMTime?
+  private var firstFrameSongPosition: Double?
+  private var outputURL: URL?
+  private var songPlayer: AVPlayer?
+  private var songItem: AVPlayerItem?
+  /// Format description of the latest pre-roll audio buffer, kept so
+  /// the audio writer input can be created the moment the writer
+  /// starts (audio samples themselves before the first frame drop).
+  private var pendingAudioFormat: CMFormatDescription?
+  private var maxDurationSeconds: Double = 0
+  private var startContinuation: CheckedContinuation<Void, Error>?
+  private var stopContinuations: [CheckedContinuation<CaptureResultRecord, Error>] = []
+  private var finishedResult: CaptureResultRecord?
+  private var finishedError: Error?
+  private var startTimeoutItem: DispatchWorkItem?
+  private var seekArmItem: DispatchWorkItem?
+
+  // MARK: Availability
+
+  var isAvailable: Bool {
+    AVCaptureDevice.default(for: .video) != nil
+  }
+
+  // MARK: View registration + prop entry points (called on main)
+
+  func registerPreviewLayer(_ layer: AVCaptureVideoPreviewLayer) {
+    queue.async { [weak self] in
+      self?.previewLayer = layer
+      self?.applyConnectionSettingsLocked()
+    }
+  }
+
+  func unregisterPreviewLayer(_ layer: AVCaptureVideoPreviewLayer) {
+    queue.async { [weak self] in
+      if self?.previewLayer === layer {
+        self?.previewLayer = nil
+      }
+    }
+  }
+
+  func setPreviewActive(_ active: Bool, viewID: ObjectIdentifier) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      if active {
+        self.activePreviewViews.insert(viewID)
+      } else {
+        self.activePreviewViews.remove(viewID)
+      }
+      self.updateSessionRunningLocked()
+    }
+  }
+
+  func setFacing(_ position: AVCaptureDevice.Position) {
+    queue.async { [weak self] in
+      guard let self, self.configuration.facing != position else { return }
+      self.configuration.facing = position
+      // Swapping the camera mid-capture would break the writer's
+      // timeline; it applies from the next capture. (The record UI
+      // doesn't offer a flip while recording anyway.)
+      if self.state != .recording, self.state != .preparing {
+        try? self.configureSessionLocked()
+        self.updateSessionRunningLocked()
+      }
+    }
+  }
+
+  func setMirrored(_ mirrored: Bool) {
+    queue.async { [weak self] in
+      guard let self, self.configuration.mirrored != mirrored else { return }
+      self.configuration.mirrored = mirrored
+      if self.state != .recording, self.state != .preparing {
+        self.applyConnectionSettingsLocked()
+      }
+    }
+  }
+
+  func setTorch(_ torch: Bool) {
+    queue.async { [weak self] in
+      guard let self, self.configuration.torch != torch else { return }
+      self.configuration.torch = torch
+      self.applyDeviceSettingsLocked()
+    }
+  }
+
+  func setZoom(_ zoom: Double) {
+    queue.async { [weak self] in
+      guard let self, self.configuration.zoom != zoom else { return }
+      self.configuration.zoom = zoom
+      self.applyDeviceSettingsLocked()
+    }
+  }
+
+  // MARK: Session configuration (queue only)
+
+  private func captureDevice(for position: AVCaptureDevice.Position) -> AVCaptureDevice? {
+    if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) {
+      return device
+    }
+    return AVCaptureDevice.default(for: .video)
+  }
+
+  /// (Re)builds inputs/outputs to match `configuration`. Idempotent;
+  /// safe to call whenever the session is stopped or running (but not
+  /// mid-capture — callers guard that).
+  private func configureSessionLocked() throws {
+    if !outputsConfigured {
+      videoOutput.videoSettings = [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+      ]
+      // Real-time recorder: process every frame the sensor delivers
+      // rather than silently discarding late ones (a dropped frame is
+      // a timing hole in the take).
+      videoOutput.alwaysDiscardsLateVideoFrames = false
+      videoOutput.setSampleBufferDelegate(self, queue: queue)
+      audioOutput.setSampleBufferDelegate(self, queue: queue)
+      outputsConfigured = true
+    }
+
+    session.beginConfiguration()
+    // The app (expo-audio) owns the audio session category.
+    session.automaticallyConfiguresApplicationAudioSession = false
+    if session.canSetSessionPreset(.hd1920x1080) {
+      session.sessionPreset = .hd1920x1080
+    } else if session.canSetSessionPreset(.high) {
+      session.sessionPreset = .high
+    }
+
+    if configuredPosition != configuration.facing || videoInput == nil {
+      if let oldInput = videoInput {
+        session.removeInput(oldInput)
+        videoInput = nil
+        videoDevice = nil
+        configuredPosition = nil
+      }
+      // Collected, not thrown inside the configuration block, so
+      // commitConfiguration runs exactly once below.
+      var deviceError: Error?
+      if let device = captureDevice(for: configuration.facing) {
+        do {
+          let input = try AVCaptureDeviceInput(device: device)
+          if session.canAddInput(input) {
+            session.addInput(input)
+            videoInput = input
+            videoDevice = device
+            configuredPosition = configuration.facing
+          } else {
+            deviceError = compositorError("The capture session rejected the camera input.")
+          }
+        } catch {
+          deviceError = compositorError(
+            "Could not open the camera: \(error.localizedDescription)"
+          )
+        }
+      } else {
+        deviceError = compositorError(
+          "No \(configuration.facing == .front ? "front" : "back") camera is available for native capture."
+        )
+      }
+      if let deviceError {
+        session.commitConfiguration()
+        throw deviceError
+      }
+    }
+
+    if audioInput == nil, let audioDevice = AVCaptureDevice.default(for: .audio) {
+      if let input = try? AVCaptureDeviceInput(device: audioDevice), session.canAddInput(input) {
+        session.addInput(input)
+        audioInput = input
+      }
+    }
+
+    if session.outputs.first(where: { $0 === videoOutput }) == nil, session.canAddOutput(videoOutput) {
+      session.addOutput(videoOutput)
+    }
+    if session.outputs.first(where: { $0 === audioOutput }) == nil, session.canAddOutput(audioOutput) {
+      session.addOutput(audioOutput)
+    }
+    session.commitConfiguration()
+    sessionConfigured = true
+
+    applyConnectionSettingsLocked()
+    applyDeviceSettingsLocked()
+  }
+
+  /// Portrait rotation + mirroring on the writer (data output)
+  /// connection and, identically, on the preview layer's connection —
+  /// what you see is what records. Mirroring follows the `mirrored`
+  /// prop exactly (auto-mirroring is disabled so the prop is the
+  /// single source of truth, for preview AND the written file).
+  private func applyConnectionSettingsLocked() {
+    let mirrored = configuration.facing == .front && configuration.mirrored
+    if let connection = videoOutput.connection(with: .video) {
+      setPortraitRotation(on: connection)
+      if connection.isVideoMirroringSupported {
+        connection.automaticallyAdjustsVideoMirroring = false
+        connection.isVideoMirrored = mirrored
+      }
+    }
+    if let layer = previewLayer {
+      let layerConnection = layer.connection
+      DispatchQueue.main.async {
+        if let layerConnection {
+          self.setPortraitRotation(on: layerConnection)
+          if layerConnection.isVideoMirroringSupported {
+            layerConnection.automaticallyAdjustsVideoMirroring = false
+            layerConnection.isVideoMirrored = mirrored
+          }
+        }
+      }
+    }
+  }
+
+  private func setPortraitRotation(on connection: AVCaptureConnection) {
+    if #available(iOS 17.0, *) {
+      if connection.isVideoRotationAngleSupported(90) {
+        connection.videoRotationAngle = 90
+      }
+    } else {
+      // Deprecated in iOS 17 (replaced by videoRotationAngle above)
+      // but the only rotation API on the iOS 15.5–16 range this
+      // module still supports.
+      if connection.isVideoOrientationSupported {
+        connection.videoOrientation = .portrait
+      }
+    }
+  }
+
+  /// Torch + zoom are device properties — safe to apply live, even
+  /// mid-capture, unlike input swaps.
+  private func applyDeviceSettingsLocked() {
+    guard let device = videoDevice else { return }
+    do {
+      try device.lockForConfiguration()
+    } catch {
+      return
+    }
+    if device.hasTorch {
+      let wantTorch = configuration.torch && configuration.facing == .back
+      let mode: AVCaptureDevice.TorchMode = wantTorch ? .on : .off
+      if device.torchMode != mode {
+        device.torchMode = mode
+      }
+    }
+    // Expo-style zoom 0..1 → factor 1..6, clamped to the device.
+    let requested = 1.0 + max(0, min(1, configuration.zoom)) * 5.0
+    let factor = min(requested, Double(device.activeFormat.videoMaxZoomFactor))
+    if abs(Double(device.videoZoomFactor) - factor) > 0.01 {
+      device.videoZoomFactor = CGFloat(factor)
+    }
+    device.unlockForConfiguration()
+  }
+
+  private func updateSessionRunningLocked() {
+    let shouldRun =
+      !activePreviewViews.isEmpty || state == .preparing || state == .recording
+    if shouldRun {
+      if !sessionConfigured {
+        try? configureSessionLocked()
+      }
+      if !session.isRunning {
+        session.startRunning()
+      }
+    } else if session.isRunning {
+      session.stopRunning()
+    }
+  }
+
+  // MARK: Capture lifecycle
+
+  func start(_ args: CaptureStartArgsRecord) async throws {
+    try await ensurePermission(for: .video)
+    try await ensurePermission(for: .audio)
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<Void, Error>) in
+      queue.async { [weak self] in
+        guard let self else {
+          continuation.resume(throwing: compositorError("The capture engine is gone."))
+          return
+        }
+        guard self.state == .idle || self.state == .finished else {
+          continuation.resume(
+            throwing: compositorError("A capture is already in progress.")
+          )
+          return
+        }
+        self.beginCaptureLocked(args: args, continuation: continuation)
+      }
+    }
+  }
+
+  func stop() async throws -> CaptureResultRecord {
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<CaptureResultRecord, Error>) in
+      queue.async { [weak self] in
+        guard let self else {
+          continuation.resume(throwing: compositorError("The capture engine is gone."))
+          return
+        }
+        switch self.state {
+        case .finished:
+          if let result = self.finishedResult {
+            continuation.resume(returning: result)
+          } else {
+            continuation.resume(
+              throwing: self.finishedError
+                ?? compositorError("The capture failed.")
+            )
+          }
+        case .recording, .preparing:
+          self.stopContinuations.append(continuation)
+          self.beginFinishLocked()
+        case .finishing:
+          self.stopContinuations.append(continuation)
+        case .idle:
+          continuation.resume(
+            throwing: compositorError("No capture is in progress.")
+          )
+        }
+      }
+    }
+  }
+
+  private func ensurePermission(for mediaType: AVMediaType) async throws {
+    let kind = mediaType == .video ? "Camera" : "Microphone"
+    switch AVCaptureDevice.authorizationStatus(for: mediaType) {
+    case .authorized:
+      return
+    case .notDetermined:
+      let granted = await AVCaptureDevice.requestAccess(for: mediaType)
+      if !granted {
+        throw compositorError("\(kind) permission was not granted — native capture unavailable.")
+      }
+    default:
+      throw compositorError("\(kind) permission is denied — native capture unavailable.")
+    }
+  }
+
+  private func beginCaptureLocked(
+    args: CaptureStartArgsRecord,
+    continuation: CheckedContinuation<Void, Error>
+  ) {
+    // Reset per-capture state.
+    finishedResult = nil
+    finishedError = nil
+    firstFrameSongPosition = nil
+    firstVideoPTS = nil
+    writerStarted = false
+    videoWriterInput = nil
+    audioWriterInput = nil
+    pendingAudioFormat = nil
+    maxDurationSeconds = args.maxDurationSeconds.isFinite ? args.maxDurationSeconds : 0
+
+    do {
+      try configureSessionLocked()
+    } catch {
+      state = .idle
+      continuation.resume(throwing: error)
+      return
+    }
+
+    guard
+      let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    else {
+      state = .idle
+      continuation.resume(throwing: compositorError("Could not locate the caches directory."))
+      return
+    }
+    let url = cachesDirectory.appendingPathComponent("mvmt-capture-\(UUID().uuidString).mp4")
+    if FileManager.default.fileExists(atPath: url.path) {
+      try? FileManager.default.removeItem(at: url)
+    }
+    outputURL = url
+    do {
+      writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    } catch {
+      state = .idle
+      continuation.resume(throwing: error)
+      return
+    }
+
+    state = .preparing
+    startContinuation = continuation
+    if !session.isRunning {
+      session.startRunning()
+    }
+    preparePlayerLocked(songUri: args.songUri, songStartSeconds: args.songStartSeconds)
+
+    // Safety net: if the capture never arms or never delivers a
+    // frame, fail the start so the JS side can fall back instead of
+    // hanging on a black preview.
+    let timeout = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      if self.state == .preparing || (self.state == .recording && !self.writerStarted) {
+        self.abortCaptureLocked(
+          error: compositorError("The camera did not start delivering frames.")
+        )
+      }
+    }
+    startTimeoutItem = timeout
+    queue.asyncAfter(deadline: .now() + 10, execute: timeout)
+  }
+
+  /// Sets up the internal song player and seeks it (ZERO tolerances —
+  /// the seek must land on the exact requested position; this player
+  /// is the song clock for the whole capture). Capture "arms"
+  /// (transitions to .recording, samples start appending) only once
+  /// the seek has completed and playback has started, or immediately
+  /// when there is no song. A failed song never blocks the recording
+  /// itself — the take is still captured, its first-frame song
+  /// position just stays nil (the file-based measurement remains as
+  /// the safety net, exactly as before).
+  private func preparePlayerLocked(songUri: String?, songStartSeconds: Double) {
+    songPlayer = nil
+    songItem = nil
+    guard let songUri, !songUri.isEmpty else {
+      // No song clock to wait for — arm immediately.
+      state = .recording
+      return
+    }
+    let item = AVPlayerItem(url: MvmtCompositorEngine.resolveURL(songUri))
+    let player = AVPlayer(playerItem: item)
+    songItem = item
+    songPlayer = player
+
+    let target = CMTime(seconds: max(0, songStartSeconds), preferredTimescale: 600)
+    item.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+      guard let self else { return }
+      self.queue.async {
+        guard self.state == .preparing else { return }
+        self.seekArmItem?.cancel()
+        self.seekArmItem = nil
+        // Play even if the precise seek reports failure (e.g. it was
+        // superseded): the first-frame conversion measures wherever
+        // the song actually is. Only a FAILED item stays silent.
+        if item.status != .failed {
+          player.play()
+        }
+        self.state = .recording
+      }
+    }
+    // If the seek never lands, arm anyway (measurement stays nil)
+    // rather than hanging the recording.
+    let armTimeout = DispatchWorkItem { [weak self] in
+      guard let self, self.state == .preparing else { return }
+      self.state = .recording
+    }
+    seekArmItem = armTimeout
+    queue.asyncAfter(deadline: .now() + 5, execute: armTimeout)
+  }
+
+  /// THE measurement: convert the first appended frame's host-clock
+  /// PTS into a song position.
+  ///
+  /// Preferred path — the player item's own host-time mapping
+  /// (`time(forHostTime:)`), which tracks the item's real playback
+  /// (including any drift between the item clock and the host clock).
+  ///
+  /// Fallback — an anchor pair sampled in this same callback: the
+  /// item's current position and host-now; the frame's song position
+  /// is the item position shifted by (framePTS − hostNow). Only used
+  /// when the item is actually playing (rate ≠ 0); a paused/failed
+  /// player yields nil — the position is never fabricated.
+  private func measureFirstFrameLocked(pts: CMTime) {
+    guard let item = songItem else {
+      firstFrameSongPosition = nil
+      return
+    }
+    let mapped = item.time(forHostTime: pts)
+    if mapped.isValid, mapped.isNumeric {
+      let seconds = CMTimeGetSeconds(mapped)
+      if seconds.isFinite {
+        firstFrameSongPosition = seconds
+        return
+      }
+    }
+    guard let player = songPlayer, player.rate != 0 else {
+      firstFrameSongPosition = nil
+      return
+    }
+    let itemNow = item.currentTime()
+    guard itemNow.isValid, itemNow.isNumeric else {
+      firstFrameSongPosition = nil
+      return
+    }
+    let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+    let delta = CMTimeGetSeconds(CMTimeSubtract(pts, hostNow))
+    let itemSeconds = CMTimeGetSeconds(itemNow)
+    if delta.isFinite, itemSeconds.isFinite {
+      firstFrameSongPosition = itemSeconds + delta
+    } else {
+      firstFrameSongPosition = nil
+    }
+  }
+
+  // MARK: Writer plumbing (queue only, driven by the delegates)
+
+  /// Creates the writer inputs from the first video buffer's own
+  /// format description (post-rotation dimensions — ground truth,
+  /// not a guess from the device format), starts the writer session
+  /// at that frame's PTS (the file timeline begins at the first
+  /// frame), measures the first frame, and resolves startCapture:
+  /// capture is now actually rolling.
+  private func startWriterLocked(firstVideoBuffer: CMSampleBuffer, pts: CMTime) -> Bool {
+    guard
+      let writer,
+      let formatDescription = CMSampleBufferGetFormatDescription(firstVideoBuffer)
+    else {
+      abortCaptureLocked(error: compositorError("The video stream had no format description."))
+      return false
+    }
+    let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+    let videoSettings: [String: Any] = [
+      AVVideoCodecKey: AVVideoCodecType.h264,
+      AVVideoWidthKey: Int(dimensions.width),
+      AVVideoHeightKey: Int(dimensions.height),
+      AVVideoCompressionPropertiesKey: [
+        AVVideoAverageBitRateKey: 10_000_000,
+        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+      ],
+    ]
+    let videoInput = AVAssetWriterInput(
+      mediaType: .video,
+      outputSettings: videoSettings,
+      sourceFormatHint: formatDescription
+    )
+    videoInput.expectsMediaDataInRealTime = true
+    guard writer.canAdd(videoInput) else {
+      abortCaptureLocked(error: compositorError("The writer rejected the video input."))
+      return false
+    }
+    writer.add(videoInput)
+    videoWriterInput = videoInput
+
+    if let audioFormat = pendingAudioFormat {
+      addAudioInputLocked(formatDescription: audioFormat)
+    }
+
+    guard writer.startWriting() else {
+      abortCaptureLocked(
+        error: writer.error
+          ?? compositorError("The writer could not start.")
+      )
+      return false
+    }
+    writer.startSession(atSourceTime: pts)
+    writerStarted = true
+    firstVideoPTS = pts
+    measureFirstFrameLocked(pts: pts)
+
+    startTimeoutItem?.cancel()
+    startTimeoutItem = nil
+    startContinuation?.resume()
+    startContinuation = nil
+    return true
+  }
+
+  private func addAudioInputLocked(formatDescription: CMFormatDescription) {
+    guard audioWriterInput == nil, let writer else { return }
+    var sampleRate = 44100.0
+    var channels = 1
+    if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) {
+      if asbd.pointee.mSampleRate > 0 {
+        sampleRate = asbd.pointee.mSampleRate
+      }
+      channels = max(1, Int(asbd.pointee.mChannelsPerFrame))
+    }
+    let settings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatMPEG4AAC,
+      AVSampleRateKey: sampleRate,
+      AVNumberOfChannelsKey: channels,
+      AVEncoderBitRateKey: 128_000,
+    ]
+    let input = AVAssetWriterInput(
+      mediaType: .audio,
+      outputSettings: settings,
+      sourceFormatHint: formatDescription
+    )
+    input.expectsMediaDataInRealTime = true
+    if writer.canAdd(input) {
+      writer.add(input)
+      audioWriterInput = input
+    }
+    // If the writer refuses the input the take is video-only; the
+    // file-based sync fallback then reports noSongInMic, honestly.
+  }
+
+  private func handleVideoBuffer(_ sampleBuffer: CMSampleBuffer) {
+    guard state == .recording else { return }
+    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    if !writerStarted {
+      guard startWriterLocked(firstVideoBuffer: sampleBuffer, pts: pts) else { return }
+    }
+    // Native max-duration safety stop.
+    if let first = firstVideoPTS, maxDurationSeconds > 0 {
+      let elapsed = CMTimeGetSeconds(CMTimeSubtract(pts, first))
+      if elapsed.isFinite, elapsed >= maxDurationSeconds {
+        beginFinishLocked()
+        return
+      }
+    }
+    guard let input = videoWriterInput, input.isReadyForMoreMediaData else { return }
+    if !input.append(sampleBuffer) {
+      // A failed append mid-recording: finish now and keep the
+      // partial file rather than losing the take.
+      beginFinishLocked()
+    }
+  }
+
+  private func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer) {
+    guard state == .recording else { return }
+    if !writerStarted {
+      // Remember the format so the audio input can be created when
+      // the writer starts; the samples themselves precede the first
+      // frame and are dropped by design.
+      if let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
+        pendingAudioFormat = format
+      }
+      return
+    }
+    guard let first = firstVideoPTS else { return }
+    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    guard CMTimeCompare(pts, first) >= 0 else { return }
+    if audioWriterInput == nil,
+      let format = CMSampleBufferGetFormatDescription(sampleBuffer)
+    {
+      addAudioInputLocked(formatDescription: format)
+    }
+    guard let input = audioWriterInput, input.isReadyForMoreMediaData else { return }
+    input.append(sampleBuffer)
+  }
+
+  // MARK: Sample buffer delegates (callbacks arrive on `queue`)
+
+  func captureOutput(
+    _ output: AVCaptureOutput,
+    didOutput sampleBuffer: CMSampleBuffer,
+    from connection: AVCaptureConnection
+  ) {
+    if output === videoOutput {
+      handleVideoBuffer(sampleBuffer)
+    } else if output === audioOutput {
+      handleAudioBuffer(sampleBuffer)
+    }
+  }
+
+  func captureOutput(
+    _ output: AVCaptureOutput,
+    didDrop sampleBuffer: CMSampleBuffer,
+    from connection: AVCaptureConnection
+  ) {
+    // Dropped frames are the system's call under load; nothing to do.
+  }
+
+  // MARK: Finishing
+
+  private func beginFinishLocked() {
+    guard state == .recording || state == .preparing else { return }
+    state = .finishing
+    startTimeoutItem?.cancel()
+    startTimeoutItem = nil
+    seekArmItem?.cancel()
+    seekArmItem = nil
+    songPlayer?.pause()
+    if session.isRunning {
+      session.stopRunning()
+    }
+
+    guard let writer, let url = outputURL, writerStarted else {
+      // Stopped (or auto-stopped) before the first frame: nothing
+      // usable exists. Reject a still-pending start promise too.
+      if let continuation = startContinuation {
+        startContinuation = nil
+        continuation.resume(
+          throwing: compositorError("The capture was stopped before recording started.")
+        )
+      }
+      writer?.cancelWriting()
+      if let url = outputURL {
+        try? FileManager.default.removeItem(at: url)
+      }
+      completeFinishLocked(
+        result: nil,
+        error: compositorError("No frames were captured.")
+      )
+      return
+    }
+
+    let firstFrameSnapshot = firstFrameSongPosition
+    videoWriterInput?.markAsFinished()
+    audioWriterInput?.markAsFinished()
+    writer.finishWriting { [weak self] in
+      guard let self else { return }
+      Task {
+        let outcome = await self.measureCaptureOutcome(
+          url: url,
+          firstFrameSongPosition: firstFrameSnapshot
+        )
+        self.queue.async {
+          if let record = outcome.record {
+            self.completeFinishLocked(result: record, error: nil)
+          } else {
+            self.completeFinishLocked(
+              result: nil,
+              error: outcome.error
+                ?? compositorError("The recorded file could not be read.")
+            )
+          }
+        }
+      }
+    }
+  }
+
+  private func abortCaptureLocked(error: Error) {
+    startTimeoutItem?.cancel()
+    startTimeoutItem = nil
+    seekArmItem?.cancel()
+    seekArmItem = nil
+    if let continuation = startContinuation {
+      startContinuation = nil
+      continuation.resume(throwing: error)
+    }
+    songPlayer?.pause()
+    if session.isRunning {
+      session.stopRunning()
+    }
+    writer?.cancelWriting()
+    if let url = outputURL {
+      try? FileManager.default.removeItem(at: url)
+    }
+    state = .finished
+    finishedResult = nil
+    finishedError = error
+    let waiters = stopContinuations
+    stopContinuations = []
+    for waiter in waiters {
+      waiter.resume(throwing: error)
+    }
+    cleanupCaptureLocked()
+  }
+
+  private func completeFinishLocked(result: CaptureResultRecord?, error: Error?) {
+    state = .finished
+    finishedResult = result
+    finishedError = error
+    let waiters = stopContinuations
+    stopContinuations = []
+    for waiter in waiters {
+      if let result {
+        waiter.resume(returning: result)
+      } else {
+        waiter.resume(
+          throwing: error ?? compositorError("The capture failed.")
+        )
+      }
+    }
+    cleanupCaptureLocked()
+  }
+
+  private func cleanupCaptureLocked() {
+    songPlayer?.pause()
+    songPlayer = nil
+    songItem = nil
+    writer = nil
+    videoWriterInput = nil
+    audioWriterInput = nil
+    writerStarted = false
+    firstVideoPTS = nil
+    pendingAudioFormat = nil
+    outputURL = nil
+    updateSessionRunningLocked()
+  }
+
+  /// Measures the finished file (duration, display size, intra-file
+  /// A/V offset) — the same facts `inspect` reports, read back from
+  /// the written asset so a partially-written file that is still a
+  /// valid movie resolves with real values instead of failing.
+  private func measureCaptureOutcome(
+    url: URL,
+    firstFrameSongPosition: Double?
+  ) async -> (record: CaptureResultRecord?, error: Error?) {
+    let asset = AVURLAsset(url: url)
+    do {
+      let duration = try await asset.load(.duration)
+      let durationSeconds = CMTimeGetSeconds(duration)
+      guard durationSeconds.isFinite, durationSeconds > 0 else {
+        return (nil, compositorError("The recorded file is empty."))
+      }
+      let videoTracks = try await asset.loadTracks(withMediaType: .video)
+      guard let videoTrack = videoTracks.first else {
+        return (nil, compositorError("The recorded file has no video track."))
+      }
+      let naturalSize = try await videoTrack.load(.naturalSize)
+      let preferredTransform = try await videoTrack.load(.preferredTransform)
+      let display = naturalSize.applying(preferredTransform)
+      let videoTimeRange = try await videoTrack.load(.timeRange)
+
+      var delta: Double?
+      let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+      if let audioTrack = audioTracks.first {
+        let audioTimeRange = try await audioTrack.load(.timeRange)
+        let value =
+          CMTimeGetSeconds(audioTimeRange.start) - CMTimeGetSeconds(videoTimeRange.start)
+        if value.isFinite {
+          delta = value
+        }
+      }
+
+      let record = CaptureResultRecord()
+      record.uri = url.absoluteString
+      record.durationSeconds = durationSeconds
+      record.width = Int(abs(display.width).rounded())
+      record.height = Int(abs(display.height).rounded())
+      record.firstFrameSongPositionSeconds = firstFrameSongPosition
+      record.intraFileAvOffsetSeconds = delta
+      return (record, nil)
+    } catch {
+      return (nil, error)
+    }
+  }
+}
+
+// MARK: - Capture view (AVCaptureVideoPreviewLayer host)
+//
+// Binds to CaptureCoordinator's ONE session: the preview IS the
+// recording surface. Props are the current capture configuration —
+// startCapture uses whatever the view most recently set.
+
+public final class MvmtCaptureView: ExpoView {
+  private let previewLayer = AVCaptureVideoPreviewLayer()
+
+  var facing: String = "back" {
+    didSet {
+      CaptureCoordinator.shared.setFacing(facing == "front" ? .front : .back)
+    }
+  }
+
+  var torch: Bool = false {
+    didSet {
+      CaptureCoordinator.shared.setTorch(torch)
+    }
+  }
+
+  /// Expo-style zoom 0..1 (the coordinator maps it to a device factor).
+  var zoom: Double = 0 {
+    didSet {
+      CaptureCoordinator.shared.setZoom(zoom)
+    }
+  }
+
+  var mirrored: Bool = false {
+    didSet {
+      CaptureCoordinator.shared.setMirrored(mirrored)
+    }
+  }
+
+  /// Keeps the capture session running (preview live) while true.
+  var active: Bool = false {
+    didSet {
+      CaptureCoordinator.shared.setPreviewActive(active, viewID: ObjectIdentifier(self))
+    }
+  }
+
+  public required init(appContext: AppContext? = nil) {
+    super.init(appContext: appContext)
+    backgroundColor = UIColor.black
+    clipsToBounds = true
+    previewLayer.session = CaptureCoordinator.shared.session
+    previewLayer.videoGravity = AVLayerVideoGravity.resizeAspectFill
+    layer.addSublayer(previewLayer)
+    CaptureCoordinator.shared.registerPreviewLayer(previewLayer)
+  }
+
+  deinit {
+    CaptureCoordinator.shared.setPreviewActive(false, viewID: ObjectIdentifier(self))
+    CaptureCoordinator.shared.unregisterPreviewLayer(previewLayer)
+  }
+
+  public override func layoutSubviews() {
+    super.layoutSubviews()
+    previewLayer.frame = bounds
+  }
+}
+
 // MARK: - Module definition
 
 public class MvmtCompositorModule: Module {
@@ -1371,6 +2388,18 @@ public class MvmtCompositorModule: Module {
       )
     }
 
+    Function("isCaptureAvailable") { () -> Bool in
+      CaptureCoordinator.shared.isAvailable
+    }
+
+    AsyncFunction("startCapture") { (args: CaptureStartArgsRecord) in
+      try await CaptureCoordinator.shared.start(args)
+    }
+
+    AsyncFunction("stopCapture") { () -> CaptureResultRecord in
+      try await CaptureCoordinator.shared.stop()
+    }
+
     AsyncFunction("createPreview") { (request: CompositeRequestRecord) -> String in
       try await PreviewStore.shared.create(request: request)
     }
@@ -1397,6 +2426,25 @@ public class MvmtCompositorModule: Module {
       ViewName("MvmtPreviewView")
       Prop("previewId") { (view: MvmtPreviewView, previewId: String?) in
         view.previewId = previewId
+      }
+    }
+
+    View(MvmtCaptureView.self) {
+      ViewName("MvmtCaptureView")
+      Prop("facing") { (view: MvmtCaptureView, facing: String?) in
+        view.facing = facing ?? "back"
+      }
+      Prop("torch") { (view: MvmtCaptureView, torch: Bool?) in
+        view.torch = torch ?? false
+      }
+      Prop("zoom") { (view: MvmtCaptureView, zoom: Double?) in
+        view.zoom = zoom ?? 0
+      }
+      Prop("mirrored") { (view: MvmtCaptureView, mirrored: Bool?) in
+        view.mirrored = mirrored ?? false
+      }
+      Prop("active") { (view: MvmtCaptureView, active: Bool?) in
+        view.active = active ?? false
       }
     }
   }

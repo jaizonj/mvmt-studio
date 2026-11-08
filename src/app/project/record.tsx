@@ -24,8 +24,12 @@ import { Image } from 'expo-image';
 
 import { NativePreview } from '../../components/NativePreview';
 import {
+  CapturePreview,
+  isCaptureAvailable,
   isCompositorAvailable,
   measureTakeSync,
+  startCapture,
+  stopCapture,
   type CompositeRequest,
   type TakeSyncMeasurement,
 } from '../../lib/compositor';
@@ -50,6 +54,14 @@ const ZOOM_PRESETS = [
   { label: '3×', value: 0.28 },
   { label: '5×', value: 0.55 },
 ];
+
+/**
+ * What the native capture module hands back when a take stops — the
+ * recorded file plus its MEASURED facts. Derived from the contract
+ * function's own return type so this screen tracks the module's
+ * index.ts exactly.
+ */
+type StopCaptureResult = Awaited<ReturnType<typeof stopCapture>>;
 
 /**
  * Sanity bound for measured-sync samples, seconds. A real capture-start
@@ -100,7 +112,12 @@ function syncStatusText(take: Take): string {
   const adjustSuffix = adjust !== 0 ? ` · adjusted ${adjust > 0 ? '+' : '−'}${Math.abs(adjust)}f` : '';
   const offset = take.syncOffsetSeconds;
   if (offset === undefined) return `Sync unmeasured${adjustSuffix}`;
-  const provenance = take.syncSource === 'fileCorrelation' ? ' · measured from file' : ' · sync estimated';
+  const provenance =
+    take.syncSource === 'fileCorrelation'
+      ? ' · measured from file'
+      : take.syncSource === 'nativeCapture'
+        ? ' · measured at capture'
+        : ' · sync estimated';
   const magnitude = Math.abs(offset);
   if (magnitude <= 0.04) return `In sync${provenance}${adjustSuffix}`;
   if (magnitude <= 0.1) return `In sync · slight offset${provenance}${adjustSuffix}`;
@@ -261,6 +278,13 @@ export default function CameraScreen() {
   const energyAccRef = useRef<SectionEnergyAccumulator | null>(null);
   const zoomAtPinchStartRef = useRef(0);
 
+  // NATIVE CAPTURE availability: when the compositor module's
+  // capture engine is linked, it owns the preview AND the recording
+  // (AVCaptureSession + the song player on one host clock, reporting
+  // the song position at the first real frame). When it isn't (Expo
+  // Go), the expo-camera path below runs exactly as before.
+  const useNativeCapture = isCaptureAvailable();
+
   // Track playback — the sync master clock for takes.
   const player = useAudioPlayer(track?.uri ?? null);
   const playerStatus = useAudioPlayerStatus(player);
@@ -282,6 +306,26 @@ export default function CameraScreen() {
   }, [beepPlayer, clickPlayer, goPlayer]);
   const timerWasUsedRef = useRef(false);
   const stopRequestedRef = useRef(false);
+  /**
+   * Landing context for the CURRENT recording session: the region
+   * start / length are locals of beginRecording, but the take lands
+   * asynchronously and its stop can be triggered from outside that
+   * closure (the record button) — so the values the shared landing
+   * pipeline needs ride here, along with which capture path the
+   * session is on.
+   */
+  const recordContextRef = useRef<{
+    session: number;
+    regionStartSeconds: number;
+    lengthSeconds: number | null;
+    native: boolean;
+  } | null>(null);
+  /**
+   * Sessions for which stopCapture has already been invoked — the
+   * deadline and a manual tap can race, and the module must be
+   * stopped exactly once per take.
+   */
+  const nativeStopSessionRef = useRef(0);
 
   useFocusEffect(
     useCallback(() => {
@@ -327,7 +371,18 @@ export default function CameraScreen() {
    * the file's timeline already embodies the acoustic path.
    */
   const refineTakeSyncFromFile = useCallback(
-    async (candidate: { id: string; uri: string; trackOffsetSeconds: number; syncOffsetSeconds?: number }) => {
+    async (candidate: {
+      id: string;
+      uri: string;
+      trackOffsetSeconds: number;
+      syncOffsetSeconds?: number;
+      syncSource?: Take['syncSource'];
+    }) => {
+      // PRECEDENCE: a 'nativeCapture' measurement is authoritative —
+      // the module owned both clocks at record time — so correlation
+      // must NEVER overwrite it. This one guard covers both callers
+      // (the take-landing refinement and the legacy upgrade pass).
+      if (candidate.syncSource === 'nativeCapture') return;
       if (!track || !isCompositorAvailable()) return;
       let result: TakeSyncMeasurement;
       try {
@@ -521,8 +576,207 @@ export default function CameraScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flashNotice]);
 
+  /**
+   * THE take-landing pipeline — shared by BOTH capture paths, so a
+   * take is measured, persisted and stored identically whichever
+   * camera produced it. The session guard freezes duration at STOP
+   * time, the persisted file's MEASURED duration replaces the
+   * wall-clock value, and the sync fields follow the path's
+   * measurement (see the sync branches below).
+   */
+  const landRecordedTake = useCallback(
+    async (args: {
+      session: number;
+      /** The recorded file as the camera wrote it (cache URI); undefined = the recording failed. */
+      rawUri: string | undefined;
+      regionStartSeconds: number;
+      lengthSeconds: number | null;
+      /** JS player samples — expo-camera path only; null on the native path. */
+      songStartSeconds: number | null;
+      songEndSeconds: number | null;
+      /** Native-capture first-frame measurement — null on the expo path. */
+      nativeFirstFrameSongPositionSeconds: number | null;
+      /** stopCapture's file-measured duration — null on the expo path (measured via probe instead). */
+      nativeMeasuredDurationSeconds: number | null;
+    }) => {
+      const { session } = args;
+      const mine = recordSessionRef.current === session;
+      if (mine && elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+      if (mine) setRecording(false);
+      player.pause();
+      if (recordContextRef.current?.session === session) recordContextRef.current = null;
+      if (!args.rawUri) return;
+      // Duration = stop time minus start time (both frozen above),
+      // never the promise-resolution time. Then prefer the FILE's own
+      // MEASURED duration when it can be read — stopCapture's value
+      // on the native path, else native inspectAsset / the JS probe
+      // (see measureTakeDurationSeconds) — it's the ground truth for
+      // what actually got recorded, and it replaces the wall-clock
+      // value.
+      const stopAt = stopAtRef.current ?? Date.now();
+      let durationSeconds = Math.max(0.1, (stopAt - recordStartRef.current) / 1000);
+      if (args.lengthSeconds !== null) durationSeconds = Math.min(durationSeconds, args.lengthSeconds);
+      const saved = await persistTake(args.rawUri);
+      let measuredDurationSeconds = args.nativeMeasuredDurationSeconds;
+      if (measuredDurationSeconds === null) {
+        measuredDurationSeconds = await measureTakeDurationSeconds(saved.uri);
+      }
+      if (measuredDurationSeconds !== null) {
+        durationSeconds =
+          args.lengthSeconds !== null ? Math.min(measuredDurationSeconds, args.lengthSeconds) : measuredDurationSeconds;
+      }
+      // MEASURED SYNC fields — the session's samples arrive as args,
+      // so a late-finishing take can only ever attach its OWN
+      // measurements to its OWN Take. Either figure outside the
+      // sanity bound means the measurement was untrustworthy — the
+      // field is then left undefined (honestly unmeasured) rather
+      // than stored.
+      let syncOffsetSeconds: number | undefined;
+      let syncDriftSeconds: number | undefined;
+      let syncSource: Take['syncSource'];
+      if (args.nativeFirstFrameSongPositionSeconds !== null) {
+        // NATIVE CAPTURE — the module owned the camera AND the song
+        // player on ONE host clock, so this is the item-clock song
+        // position at the first REAL frame: the value the JS sample
+        // below can only estimate (its spin-up error is exactly what
+        // this path eliminates). Stored under the SAME definition as
+        // the player-sample path —
+        //
+        //   syncOffsetSeconds = songPositionAtFirstFrame
+        //                       − audioOffset − regionStart
+        //
+        // (the Settings audio correction was added to the position
+        // startCapture was given, so it comes back out here) — so
+        // takeSyncOffsetSeconds consumes both paths identically.
+        const offset = args.nativeFirstFrameSongPositionSeconds - audioOffsetMs / 1000 - args.regionStartSeconds;
+        if (Math.abs(offset) <= SYNC_MEASUREMENT_SANITY_SECONDS) {
+          syncOffsetSeconds = offset;
+          syncSource = 'nativeCapture';
+        }
+        // No drift figure on this path: drift exists to cross-check
+        // TWO independent clocks (JS player vs camera) against each
+        // other. The module runs one clock, so the number would be
+        // meaningless — and drift is diagnostic-only everywhere.
+      } else if (args.songStartSeconds !== null) {
+        // PLAYER-SAMPLE path (expo-camera) —
+        //
+        //   syncOffsetSeconds = songStart − regionStart − audioOffset
+        //
+        // The seek targeted regionStart + audioOffsetMs/1000 (the
+        // Settings Bluetooth/output-latency correction, applied
+        // there on purpose) — subtracting that same correction here
+        // leaves only the UNINTENDED capture error, matching the EDL
+        // bridge's definition: positive = capture started late, so
+        // the footage for a timeline frame lives earlier inside the
+        // file.
+        //
+        //   syncDriftSeconds = (songEnd − songStart) − measuredDuration
+        //
+        // using the file's RAW measured duration (not the length-
+        // clamped value stored as durationSeconds): how much the
+        // song clock and the camera clock disagreed over this take.
+        syncSource = 'playerSample';
+        const offset = args.songStartSeconds - audioOffsetMs / 1000 - args.regionStartSeconds;
+        if (Math.abs(offset) <= SYNC_MEASUREMENT_SANITY_SECONDS) {
+          syncOffsetSeconds = offset;
+          if (args.songEndSeconds !== null && measuredDurationSeconds !== null) {
+            const drift = args.songEndSeconds - args.songStartSeconds - measuredDurationSeconds;
+            if (Math.abs(drift) <= SYNC_MEASUREMENT_SANITY_SECONDS) {
+              syncDriftSeconds = drift;
+            }
+          }
+        }
+      }
+      studio.addTake({
+        id: saved.id,
+        uri: saved.uri,
+        createdAt: Date.now(),
+        facing,
+        durationSeconds,
+        fileSizeBytes: saved.fileSizeBytes,
+        // The take starts at the region's start in the track.
+        trackOffsetSeconds: args.regionStartSeconds,
+        ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
+        ...(syncDriftSeconds !== undefined ? { syncDriftSeconds } : {}),
+        // Provenance for the offset above: 'nativeCapture' (module
+        // measured it at record time), 'playerSample' (the JS
+        // estimate, until the file-based refinement replaces it with
+        // 'fileCorrelation'), or absent when nothing was measurable.
+        ...(syncSource !== undefined ? { syncSource } : {}),
+      });
+      // FILE-BASED SYNC REFINEMENT — fire-and-forget (see
+      // refineTakeSyncFromFile): re-measure this take's capture
+      // offset from the recorded file itself and upgrade the
+      // estimate in place when the correlation is confident. It can
+      // NEVER touch a 'nativeCapture' take (guarded inside the
+      // refinement) — correlation is the fallback for expo-path and
+      // legacy takes only. Runs whether or not the JS sample
+      // survived the sanity bound — the expectation just falls back
+      // to the region start.
+      void refineTakeSyncFromFile({
+        id: saved.id,
+        uri: saved.uri,
+        trackOffsetSeconds: args.regionStartSeconds,
+        ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
+        ...(syncSource !== undefined ? { syncSource } : {}),
+      });
+      // Cache the sampled section energies for the shuffle engine.
+      // (Native-path takes contribute none — the JS player never
+      // played — so previously cached sections simply stay.)
+      if (energyAccRef.current && energyAccRef.current.sampledSectionCount > 0) {
+        studio.setTrackSections(energyAccRef.current.finish());
+      }
+      flashNotice('Take saved — find it in Takes');
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [audioOffsetMs, facing, flashNotice, player, refineTakeSyncFromFile],
+  );
+
+  /**
+   * Stop the native capture for `session` and land the take via the
+   * shared pipeline. Invoked by BOTH the deadline interval and the
+   * record button — the once-per-session guard makes their race
+   * harmless (the module must be stopped exactly once per take). A
+   * failed stopCapture mirrors recordAsync's rejection: the session
+   * state is torn down and no take is saved.
+   */
+  const stopNativeTake = useCallback(
+    (session: number) => {
+      if (nativeStopSessionRef.current === session) return;
+      nativeStopSessionRef.current = session;
+      void (async () => {
+        let result: StopCaptureResult | null = null;
+        try {
+          result = await stopCapture();
+        } catch {
+          result = null;
+        }
+        const ctx = recordContextRef.current;
+        if (!result?.uri || !ctx || ctx.session !== session) {
+          if (recordSessionRef.current === session) {
+            if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+            setRecording(false);
+          }
+          if (recordContextRef.current?.session === session) recordContextRef.current = null;
+          return;
+        }
+        await landRecordedTake({
+          session,
+          rawUri: result.uri,
+          regionStartSeconds: ctx.regionStartSeconds,
+          lengthSeconds: ctx.lengthSeconds,
+          songStartSeconds: null,
+          songEndSeconds: null,
+          nativeFirstFrameSongPositionSeconds: result.firstFrameSongPositionSeconds,
+          nativeMeasuredDurationSeconds: result.durationSeconds > 0 ? result.durationSeconds : null,
+        });
+      })();
+    },
+    [landRecordedTake],
+  );
+
   const beginRecording = useCallback(async () => {
-    if (!cameraRef.current) return;
+    if (!useNativeCapture && !cameraRef.current) return;
     if (recordSessionRef.current > 0 && recording) return;
     const session = recordSessionRef.current + 1;
     recordSessionRef.current = session;
@@ -549,7 +803,15 @@ export default function CameraScreen() {
     // RESIDUAL error this leaves (seek/play/camera-start latency) is no
     // longer assumed to be zero — it is measured per take (songStart
     // sample below, stored as Take.syncOffsetSeconds).
-    if (track) {
+    if (useNativeCapture) {
+      // The native module owns the song during capture — it plays the
+      // track itself, on the same host clock as the camera — so the
+      // JS player must stay silent: a second playback would double
+      // the song and invalidate the first-frame measurement. The
+      // module itself is started further below, after the shared
+      // session setup, so the deadline and UI state are already live
+      // if it fails.
+    } else if (track) {
       await player.seekTo(Math.max(0, (regionEff?.startSeconds ?? 0) + audioOffsetMs / 1000));
       player.play();
     }
@@ -574,6 +836,12 @@ export default function CameraScreen() {
     // by the camera's own maxDuration (set a touch LONGER, purely as a
     // safety net, so the app's stop always wins the race cleanly).
     const lengthSeconds = regionEff?.lengthSeconds ?? studio.trackRegion.durationSeconds ?? track?.durationSeconds ?? null;
+    // Landing context for this session: the region/length are locals
+    // here, but the take lands asynchronously (recordAsync promise on
+    // the expo path, stopCapture on the native path) and the stop can
+    // be triggered from outside this closure (the record button) — so
+    // the values the landing pipeline needs ride in a ref.
+    recordContextRef.current = { session, regionStartSeconds, lengthSeconds, native: useNativeCapture };
     recordStartRef.current = Date.now();
     stopAtRef.current = null;
     stopRequestedRef.current = false;
@@ -587,11 +855,48 @@ export default function CameraScreen() {
       if (deadlineMs !== null && Date.now() >= deadlineMs) {
         stopRequestedRef.current = true;
         stopAtRef.current = Date.now();
-        player.pause();
-        cameraRef.current?.stopRecording();
+        if (useNativeCapture) {
+          // stopCapture() resolves with the take and lands it.
+          stopNativeTake(session);
+        } else {
+          player.pause();
+          cameraRef.current?.stopRecording();
+        }
       }
     }, 100);
     setRecording(true);
+
+    if (useNativeCapture) {
+      // NATIVE CAPTURE start — the module starts the song (at the
+      // seek target the expo path would have used: region start + the
+      // Settings audio correction) and the camera together, and will
+      // report the item-clock song position at the first real frame
+      // when the take stops. If it cannot start, there is NO seamless
+      // fallback to expo-camera: that CameraView is not mounted on
+      // this path, and mounting it now would begin the take seconds
+      // late and unsynchronised. Abort the attempt cleanly instead —
+      // the session unwinds exactly like a recordAsync rejection —
+      // and let the user tap record again.
+      try {
+        await startCapture({
+          songUri: track?.uri ?? null,
+          songStartSeconds: regionStartSeconds + audioOffsetMs / 1000,
+          // The same safety-net cap as recordAsync below (the app
+          // deadline + 1s). With no known length, a generous ceiling
+          // stands in for maxDuration: undefined — the app's manual
+          // stop / deadline still ends the take.
+          maxDurationSeconds: lengthSeconds !== null ? Math.max(1, lengthSeconds + 1) : 3600,
+        });
+      } catch {
+        if (recordSessionRef.current === session) {
+          if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+          setRecording(false);
+        }
+        if (recordContextRef.current?.session === session) recordContextRef.current = null;
+        flashNotice('Camera problem: could not start recording — tap record to try again');
+      }
+      return;
+    }
 
     // MEASURED SYNC — songStart sample (Overhaul Wave 2; the audit's
     // core complaint was that sync was ASSUMED, never measured).
@@ -613,7 +918,9 @@ export default function CameraScreen() {
     // where offset's measured part is (this sample − the seek target).
     const songStartSeconds = track ? player.currentTime : null;
 
-    recordPromiseRef.current = cameraRef.current.recordAsync({
+    const camera = cameraRef.current;
+    if (!camera) return;
+    recordPromiseRef.current = camera.recordAsync({
       // Safety net only: our own deadline stops the take first.
       maxDuration: lengthSeconds !== null ? Math.max(1, lengthSeconds + 1) : undefined,
     });
@@ -625,102 +932,25 @@ export default function CameraScreen() {
         // deadline both pause it), so this reads the song position at
         // stop time — the other end of the drift measurement.
         const songEndSeconds = track ? player.currentTime : null;
-        const mine = recordSessionRef.current === session;
-        if (mine && elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
-        if (mine) setRecording(false);
-        player.pause();
-        if (!result?.uri) return;
-        // Duration = stop time minus start time (both frozen above),
-        // never the promise-resolution time. Then prefer the FILE's own
-        // MEASURED duration when it can be read — native inspectAsset
-        // when the engine is linked, else the JS probe (see
-        // measureTakeDurationSeconds) — it's the ground truth for what
-        // actually got recorded, and it replaces the wall-clock value.
-        const stopAt = stopAtRef.current ?? Date.now();
-        let durationSeconds = Math.max(0.1, (stopAt - recordStartRef.current) / 1000);
-        if (lengthSeconds !== null) durationSeconds = Math.min(durationSeconds, lengthSeconds);
-        const saved = await persistTake(result.uri);
-        const measuredDurationSeconds = await measureTakeDurationSeconds(saved.uri);
-        if (measuredDurationSeconds !== null) {
-          durationSeconds = lengthSeconds !== null ? Math.min(measuredDurationSeconds, lengthSeconds) : measuredDurationSeconds;
-        }
-        // MEASURED SYNC fields — this session's samples are locals of
-        // this beginRecording invocation, so a late-finishing take can
-        // only ever attach its OWN measurements to its OWN Take.
-        //
-        //   syncOffsetSeconds = songStart − regionStart − audioOffset
-        //
-        // The seek above targeted regionStart + audioOffsetMs/1000
-        // (the Settings Bluetooth/output-latency correction, applied
-        // there on purpose) — subtracting that same correction here
-        // leaves only the UNINTENDED capture error, matching the EDL
-        // bridge's definition: positive = capture started late, so the
-        // footage for a timeline frame lives earlier inside the file.
-        //
-        //   syncDriftSeconds = (songEnd − songStart) − measuredDuration
-        //
-        // using the file's RAW measured duration (not the length-
-        // clamped value stored as durationSeconds): how much the song
-        // clock and the camera clock disagreed over this take.
-        //
-        // Either figure outside the sanity bound means a sample was
-        // untrustworthy (stale player position) — the field is then
-        // left undefined (honestly unmeasured) rather than stored.
-        let syncOffsetSeconds: number | undefined;
-        let syncDriftSeconds: number | undefined;
-        if (songStartSeconds !== null) {
-          const offset = songStartSeconds - audioOffsetMs / 1000 - regionStartSeconds;
-          if (Math.abs(offset) <= SYNC_MEASUREMENT_SANITY_SECONDS) {
-            syncOffsetSeconds = offset;
-            if (songEndSeconds !== null && measuredDurationSeconds !== null) {
-              const drift = songEndSeconds - songStartSeconds - measuredDurationSeconds;
-              if (Math.abs(drift) <= SYNC_MEASUREMENT_SANITY_SECONDS) {
-                syncDriftSeconds = drift;
-              }
-            }
-          }
-        }
-        studio.addTake({
-          id: saved.id,
-          uri: saved.uri,
-          createdAt: Date.now(),
-          facing,
-          durationSeconds,
-          fileSizeBytes: saved.fileSizeBytes,
-          // The take starts at the region's start in the track.
-          trackOffsetSeconds: regionStartSeconds,
-          ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
-          ...(syncDriftSeconds !== undefined ? { syncDriftSeconds } : {}),
-          // Provenance for the offset above: it is the player-sample
-          // ESTIMATE until the file-based refinement below replaces
-          // it with a measured value ('fileCorrelation').
-          ...(songStartSeconds !== null ? { syncSource: 'playerSample' as const } : {}),
+        await landRecordedTake({
+          session,
+          rawUri: result?.uri,
+          regionStartSeconds,
+          lengthSeconds,
+          songStartSeconds,
+          songEndSeconds,
+          nativeFirstFrameSongPositionSeconds: null,
+          nativeMeasuredDurationSeconds: null,
         });
-        // FILE-BASED SYNC REFINEMENT — fire-and-forget (see
-        // refineTakeSyncFromFile): re-measure this take's capture
-        // offset from the recorded file itself and upgrade the
-        // estimate in place when the correlation is confident. Runs
-        // whether or not the JS sample survived the sanity bound —
-        // the expectation just falls back to the region start.
-        void refineTakeSyncFromFile({
-          id: saved.id,
-          uri: saved.uri,
-          trackOffsetSeconds: regionStartSeconds,
-          ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
-        });
-        // Cache the sampled section energies for the shuffle engine.
-        if (energyAccRef.current && energyAccRef.current.sampledSectionCount > 0) {
-          studio.setTrackSections(energyAccRef.current.finish());
-        }
-        flashNotice('Take saved — find it in Takes');
       })
       .catch(() => {
         if (recordSessionRef.current !== session) return;
         if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+        if (recordContextRef.current?.session === session) recordContextRef.current = null;
         setRecording(false);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audioOffsetMs, facing, flashNotice, player, playerStatus.duration, playCue, recording, track]);
+  }, [audioOffsetMs, facing, flashNotice, landRecordedTake, player, playerStatus.duration, playCue, recording, stopNativeTake, track, useNativeCapture]);
 
   // Count-in (Settings → Audio): musical beats clicked/flashed at
   // 120 BPM before the take starts — a SEPARATE, optional feature from
@@ -785,9 +1015,17 @@ export default function CameraScreen() {
       stopRequestedRef.current = true;
       stopAtRef.current = Date.now();
     }
+    const ctx = recordContextRef.current;
+    if (ctx?.native) {
+      // Native path: stopCapture() resolves with the take and lands
+      // it via the shared pipeline. The JS player was never started
+      // on this path, so there is nothing to pause.
+      stopNativeTake(ctx.session);
+      return;
+    }
     player.pause();
     cameraRef.current?.stopRecording();
-  }, [player]);
+  }, [player, stopNativeTake]);
 
   const handleRecordPress = useCallback(() => {
     if (recording) return stopRecording();
@@ -862,20 +1100,38 @@ export default function CameraScreen() {
   return (
     <View style={styles.root}>
       <GestureDetector gesture={pinch}>
-        <CameraView
-          ref={cameraRef}
-          style={StyleSheet.absoluteFill}
-          facing={facing}
-          enableTorch={torch}
-          zoom={zoom}
-          mirror={mirror}
-          mode="video"
-          mute={false}
-          autofocus="on"
-          videoQuality={resolution}
-          active={isFocused && appActive}
-          onMountError={(e) => flashNotice(`Camera problem: ${e.message} — tap the camera to retry`)}
-        />
+        {useNativeCapture ? (
+          // Native capture preview — the module's own AVCaptureSession
+          // view. It is driven by the SAME facing/torch/zoom/mirror
+          // state as CameraView below (torch no-ops on the front
+          // camera natively; the screen-flash overlay handles that
+          // case), and `active` follows focus/AppState exactly like
+          // CameraView's, so iOS interruptions pause/resume it the
+          // same way. All overlays below layer over either preview.
+          <CapturePreview
+            style={StyleSheet.absoluteFill}
+            facing={facing}
+            torch={torch}
+            zoom={zoom}
+            mirrored={mirror}
+            active={isFocused && appActive}
+          />
+        ) : (
+          <CameraView
+            ref={cameraRef}
+            style={StyleSheet.absoluteFill}
+            facing={facing}
+            enableTorch={torch}
+            zoom={zoom}
+            mirror={mirror}
+            mode="video"
+            mute={false}
+            autofocus="on"
+            videoQuality={resolution}
+            active={isFocused && appActive}
+            onMountError={(e) => flashNotice(`Camera problem: ${e.message} — tap the camera to retry`)}
+          />
+        )}
       </GestureDetector>
 
       {/* Framing guides from Settings — thirds grid and/or centre level line. */}
@@ -896,10 +1152,10 @@ export default function CameraScreen() {
       ) : null}
 
       {/* Top bar — track pill centred, Settings gear to the side. All material/blur. */}
-      <View style={[styles.topBar, { top: insets.top + 52 }]}>
+      <View style={[styles.topBar, { top: insets.top + spacing.sm }]}>
         <IconButton icon="settings-outline" accessibilityLabel="Settings" onPress={() => router.push('/settings')} />
         <Pressable style={styles.trackPill} onPress={() => setTrackOpen(true)} accessibilityRole="button">
-          <Ionicons name={track ? 'musical-notes' : 'add'} size={16} color="#FFFFFF" />
+          <Ionicons name={track ? 'musical-notes' : 'add'} size={16} color={colors.onAccent} />
           <Text style={styles.trackPillText} numberOfLines={1}>
             {track ? track.name : 'Add a track'}
           </Text>
@@ -936,7 +1192,7 @@ export default function CameraScreen() {
         </View>
       ) : null}
       {recording ? (
-        <View style={[styles.recordingPill, { top: insets.top + 156 }]} pointerEvents="none">
+        <View style={[styles.recordingPill, { top: insets.top + 112 }]} pointerEvents="none">
           <View style={styles.recordingDot} />
           <Text style={styles.recordingText}>
             {formatTime(elapsed)}
@@ -946,7 +1202,7 @@ export default function CameraScreen() {
         </View>
       ) : null}
       {notice ? (
-        <View style={[styles.noticePill, { top: insets.top + 198 }]} pointerEvents="none">
+        <View style={[styles.noticePill, { top: insets.top + 154 }]} pointerEvents="none">
           <Text style={styles.noticeText}>{notice}</Text>
         </View>
       ) : null}
