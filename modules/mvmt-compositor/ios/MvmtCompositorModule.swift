@@ -242,7 +242,7 @@ private enum MvmtCompositorEngine {
       transform = transform.concatenating(CGAffineTransform(scaleX: fillScale, y: fillScale))
       let centreX = (canvasSize.width - displaySize.width * fillScale) / 2
       let centreY = (canvasSize.height - displaySize.height * fillScale) / 2
-      transform = transform.concatenating(CGAffineTransform(translationX: centreX, translationY: centreY))
+      transform = transform.concatenating(CGAffineTransform(translationX: centreX, y: centreY))
       segmentRanges.append(CMTimeRange(start: cursor, duration: range.duration))
       segmentTransforms.append(transform)
 
