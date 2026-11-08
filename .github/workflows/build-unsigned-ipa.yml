@@ -34,6 +34,15 @@ jobs:
       - name: Generate the native iOS project (Expo prebuild + pods)
         run: npx expo prebuild --platform ios
 
+      # Some Expo SDK 58 Swift packages declare Swift tools 6.2, which
+      # needs the newest Xcode on the image (the default 16.4 / Swift
+      # 6.1 fails with "package 'apple' is using Swift tools version
+      # 6.2.0 but the installed version is 6.1.0").
+      - name: Select the newest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
       - name: Build the app archive with signing OFF
         run: |
           cd ios
