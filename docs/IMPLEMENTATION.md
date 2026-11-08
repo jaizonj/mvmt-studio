@@ -80,3 +80,38 @@ ownership, status, and each agent's report summary.
 ## Agent reports
 
 (Each wave's reports are appended here by the lead after review.)
+
+### Wave 1 (complete, lead summary)
+- Agent Swift: engine v2 implemented (shared composition builder, canvas
+  normalisation, measured export results, inspectAsset, preview registry +
+  view, progress/cancel). CI needed three fixes: type-checker timeout on a
+  chained transform (broke into steps), one CGAffineTransform label
+  (translationX:y:), and the CI gate's own clean-checkout test bug
+  (deterministic --rootDir). Gate steps (tests/tsc/lint) pass on the runner.
+- Agent EDL: shuffleEdl bridge + 11 tests; all 22 unit tests pass.
+- Agent Design: docs/DESIGN_SYSTEM.md (IA, per-screen specs, 26-item cull).
+- Agent QA: docs/QA_AUDIT.md + docs/TEST_MATRIX.md; top findings (no
+  persistence, doubled audio in the old build, placebo settings, CI without
+  gates) all acted on in Wave 2.
+
+### Wave 2 (in progress, lead summary)
+- Lead: projects store + disk persistence (src/lib/persistence.ts), tab IA +
+  project workspace routes, NativePreview component, CI quality gate, store
+  exportedAt stamp + stable take sequence numbers.
+- Agent Record: measured sync on every new take (player-position samples at
+  record start/stop, native-measured durations, drift, 2s sanity guard).
+- Agent Takes: filmstrip rows, sync status in words, rename + confirmed
+  delete, native single-take preview, shared ui/ components.
+- Agent Export: EDL-driven render with progress/cancel, measured results,
+  preview == export by construction (one shared request memo).
+- Agent UI: tab screens redesigned + src/components/ui/ primitives
+  (PrimaryButton, SectionHeader, ProjectCard, EmptyState, GroupCard).
+- Agent Editor: rebuilding the workspace on EDL + NativePreview (running).
+
+### Wave 3 cleanup inventory (lead, from live greps)
+- TimelinePreview.tsx: zero importers remain — delete the component.
+- SettingsSheet/SettingsSheetConnected: only record.tsx remains (gear →
+  Settings tab navigation replaces it) — then delete both.
+- Legacy seconds-based store timeline: only record.tsx nav-gating still
+  reads it (switch to EDL presence), then remove the legacy timeline state
+  + ops from the store and any orphaned TimelineClip helpers.

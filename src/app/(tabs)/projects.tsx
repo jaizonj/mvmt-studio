@@ -1,13 +1,14 @@
-import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { EmptyState } from '../../components/ui/EmptyState';
+import { ProjectCard } from '../../components/ui/ProjectCard';
 import { useStudio } from '../../store/StudioContext';
-import { colors, radius, spacing, type as typeScale } from '../../theme';
+import { colors, spacing, type as typeScale } from '../../theme';
 import type { Project } from '../../types';
 
-/** Projects — every project, open / rename / delete (Overhaul IA). */
+/** Projects — every project, open / rename / delete (Overhaul IA, §3.1.2). */
 export default function ProjectsScreen() {
   const insets = useSafeAreaInsets();
   const studio = useStudio();
@@ -15,6 +16,11 @@ export default function ProjectsScreen() {
 
   const open = (project: Project) => {
     studio.openProject(project.id);
+    router.push('/project/record');
+  };
+
+  const startNewProject = () => {
+    studio.createProject();
     router.push('/project/record');
   };
 
@@ -32,43 +38,39 @@ export default function ProjectsScreen() {
   return (
     <ScrollView
       style={styles.root}
-      contentContainerStyle={{ paddingTop: insets.top + spacing.lg, paddingBottom: spacing.xxl }}>
+      contentContainerStyle={{ paddingTop: insets.top + spacing.xl, paddingBottom: spacing.xxxl }}>
       <View style={styles.header}>
         <Text style={styles.largeTitle}>Projects</Text>
+        {hydrated && projects.length > 0 ? (
+          <Text style={styles.subtitle}>
+            {projects.length} project{projects.length === 1 ? '' : 's'}
+          </Text>
+        ) : null}
       </View>
 
       {!hydrated ? null : projects.length === 0 ? (
-        <View style={styles.empty}>
-          <Ionicons name="folder-open-outline" size={34} color={colors.labelSecondary} />
-          <Text style={styles.emptyTitle}>No projects yet</Text>
-          <Text style={styles.emptyBody}>Start one from the Studio tab — pick a song, record takes, and MVMT cuts them together.</Text>
+        <View style={styles.emptyWrap}>
+          <EmptyState
+            icon="folder-open-outline"
+            title="No projects yet"
+            body="Projects you create will live here."
+            actionLabel="New Project"
+            actionIcon="add"
+            onAction={startNewProject}
+          />
         </View>
       ) : (
         <View style={styles.list}>
-          {projects.map((project) => {
-            const isActive = project.id === activeProjectId;
-            return (
-              <View key={project.id} style={styles.row}>
-                <Pressable style={{ flex: 1 }} onPress={() => open(project)} accessibilityRole="button">
-                  <Text style={styles.name} numberOfLines={1}>
-                    {project.name}
-                    {isActive ? '  ·  current' : ''}
-                  </Text>
-                  <Text style={styles.meta} numberOfLines={1}>
-                    {project.track ? project.track.name : 'No song yet'}
-                    {project.takes.length ? ` · ${project.takes.length} takes` : ''}
-                    {project.edl ? ' · has an edit' : ''}
-                  </Text>
-                </Pressable>
-                <Pressable onPress={() => rename(project)} hitSlop={8} accessibilityRole="button" accessibilityLabel={`Rename ${project.name}`}>
-                  <Ionicons name="pencil-outline" size={19} color={colors.labelSecondary} />
-                </Pressable>
-                <Pressable onPress={() => remove(project)} hitSlop={8} accessibilityRole="button" accessibilityLabel={`Delete ${project.name}`}>
-                  <Ionicons name="trash-outline" size={19} color={colors.danger} />
-                </Pressable>
-              </View>
-            );
-          })}
+          {projects.map((project) => (
+            <ProjectCard
+              key={project.id}
+              project={project}
+              isActive={project.id === activeProjectId}
+              onPress={() => open(project)}
+              onRename={() => rename(project)}
+              onDelete={() => remove(project)}
+            />
+          ))}
         </View>
       )}
     </ScrollView>
@@ -77,21 +79,9 @@ export default function ProjectsScreen() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.base },
-  header: { paddingHorizontal: spacing.xl, marginBottom: spacing.lg },
+  header: { paddingHorizontal: spacing.xl, marginBottom: spacing.xl },
   largeTitle: { ...typeScale.largeTitle, color: colors.label },
-  list: { paddingHorizontal: spacing.xl },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.md,
-    backgroundColor: colors.card,
-    borderRadius: radius.lg,
-    padding: spacing.lg,
-    marginBottom: spacing.md,
-  },
-  name: { ...typeScale.headline, color: colors.label },
-  meta: { ...typeScale.footnote, color: colors.labelSecondary, marginTop: 2 },
-  empty: { alignItems: 'center', gap: spacing.sm, padding: spacing.xxl },
-  emptyTitle: { ...typeScale.headline, color: colors.label },
-  emptyBody: { ...typeScale.subhead, color: colors.labelSecondary, textAlign: 'center', lineHeight: 20 },
+  subtitle: { ...typeScale.subhead, color: colors.labelSecondary, marginTop: spacing.xs },
+  list: { paddingHorizontal: spacing.xl, gap: spacing.md },
+  emptyWrap: { paddingHorizontal: spacing.xl },
 });

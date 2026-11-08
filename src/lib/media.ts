@@ -4,6 +4,7 @@ import * as MediaLibrary from 'expo-media-library/legacy';
 import * as Sharing from 'expo-sharing';
 import { createVideoPlayer } from 'expo-video';
 
+import { inspectAsset, isCompositorAvailable } from './compositor';
 import type { AudioTrack } from '../types';
 
 function makeId(prefix: string): string {
@@ -105,6 +106,27 @@ export async function probeVideoDurationSeconds(uri: string, timeoutMs = 2500): 
       /* already released */
     }
   }
+}
+
+/**
+ * A take file's MEASURED duration (seconds) — the value the EDL and the
+ * sync maths trust. Prefers the native engine's `inspectAsset`
+ * (AVFoundation reads the file's own duration — the ground truth) when
+ * the compositor module is linked; otherwise falls back to the JS
+ * player probe above. Resolves null when neither can read the file, so
+ * callers keep their wall-clock fallback AND know the take's sync drift
+ * is unmeasurable rather than silently assuming a duration.
+ */
+export async function measureTakeDurationSeconds(uri: string): Promise<number | null> {
+  if (isCompositorAvailable()) {
+    try {
+      const info = await inspectAsset(uri);
+      if (info.durationSeconds > 0) return info.durationSeconds;
+    } catch {
+      // Native inspection failed — fall through to the JS probe.
+    }
+  }
+  return probeVideoDurationSeconds(uri);
 }
 
 /** Move a freshly recorded take out of the camera cache into documents. */

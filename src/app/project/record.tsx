@@ -16,10 +16,9 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { IconButton } from '../../components/IconButton';
 import { RecordButton } from '../../components/RecordButton';
-import { SettingsSheet } from '../../components/SettingsSheet';
 import { DEFAULT_BPM, effectiveRegion, rmsOfFrames, SectionEnergyAccumulator } from '../../lib/analysis';
 import { TrackSheet } from '../../components/TrackSheet';
-import { persistTake, pickAudioTrack, probeVideoDurationSeconds, saveToPhotoLibrary } from '../../lib/media';
+import { measureTakeDurationSeconds, persistTake, pickAudioTrack } from '../../lib/media';
 import { useStudio } from '../../store/StudioContext';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
@@ -29,6 +28,16 @@ const ZOOM_PRESETS = [
   { label: '3×', value: 0.28 },
   { label: '5×', value: 0.55 },
 ];
+
+/**
+ * Sanity bound for measured-sync samples, seconds. A real capture-start
+ * error is tens to a few hundred milliseconds; a sample further out than
+ * this means the player position itself was untrustworthy (e.g. stale
+ * from a previous screen), and an honestly UNMEASURED take (the EDL
+ * falls back to the assumed offset) beats a wrong measurement that
+ * would shift every cut. See the measured-sync block in beginRecording.
+ */
+const SYNC_MEASUREMENT_SANITY_SECONDS = 2;
 
 /** Video-length choices for the bottom-centre row (song-part lengths). */
 const LENGTH_PRESETS: { label: string; seconds: number | null }[] = [
@@ -64,29 +73,17 @@ export default function CameraScreen() {
     torch,
     setTorch,
     mirror,
-    setMirror,
     zoom,
     setZoom,
     countdown,
     setCountdown,
     resolution,
-    setResolution,
-    frameRate,
-    setFrameRate,
     gridOverlay,
-    setGridOverlay,
     levelGuide,
-    setLevelGuide,
     audioOffsetMs,
-    setAudioOffsetMs,
     countInBeats,
     setCountInBeats,
     metronome,
-    setMetronome,
-    autosave,
-    setAutosave,
-    exportQuality,
-    setExportQuality,
   } = studio;
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -97,7 +94,6 @@ export default function CameraScreen() {
   const [beatFlash, setBeatFlash] = useState(false);
   const [recording, setRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [trackOpen, setTrackOpen] = useState(false);
   const [zoomOpen, setZoomOpen] = useState(false);
   const [timersOpen, setTimersOpen] = useState(false);
@@ -130,9 +126,9 @@ export default function CameraScreen() {
   // Timer/count-in sounds (Jaizon asked for audible cues): a short beep
   // for each camera-timer second, a click for each count-in beat, and a
   // higher "go" tone the moment recording actually starts.
-  const beepPlayer = useAudioPlayer(require('../../assets/sounds/beep.wav'));
-  const clickPlayer = useAudioPlayer(require('../../assets/sounds/click.wav'));
-  const goPlayer = useAudioPlayer(require('../../assets/sounds/go.wav'));
+  const beepPlayer = useAudioPlayer(require('../../../assets/sounds/beep.wav'));
+  const clickPlayer = useAudioPlayer(require('../../../assets/sounds/click.wav'));
+  const goPlayer = useAudioPlayer(require('../../../assets/sounds/go.wav'));
   const playCue = useCallback((which: 'beep' | 'click' | 'go') => {
     const p = which === 'beep' ? beepPlayer : which === 'click' ? clickPlayer : goPlayer;
     try {
@@ -233,15 +229,6 @@ export default function CameraScreen() {
     router.push('/project/takes');
   }, [flashNotice, takes.length]);
 
-  // Settings' "Export video" action: a finished cut goes straight to
-  // Export; takes without a cut go to Shuffle to make one; no takes at
-  // all stays locked with the message.
-  const goToExportAction = useCallback(() => {
-    if (takes.length === 0) return flashNotice('Record a take first');
-    if (studio.timeline.length > 0) return router.push('/project/export');
-    router.push('/project/editor');
-  }, [flashNotice, takes.length, studio.timeline.length]);
-
   const handlePickTrack = useCallback(async () => {
     try {
       const picked = await pickAudioTrack();
@@ -264,6 +251,11 @@ export default function CameraScreen() {
 
     // The selected region is the single source of truth for what plays.
     const regionEff = effectiveRegion(studio.trackRegion, playerStatus.duration || track?.durationSeconds);
+    // The region start this take is recorded against: stored on the
+    // take as trackOffsetSeconds AND used as the reference for the
+    // measured sync offset below — one value, so the EDL bridge's
+    // mapping (trackOffset − regionStart + syncOffset) stays coherent.
+    const regionStartSeconds = regionEff?.startSeconds ?? studio.trackRegion.startSeconds ?? 0;
 
     // Fresh energy accumulation for this pass over the region.
     energyAccRef.current =
@@ -274,7 +266,10 @@ export default function CameraScreen() {
     // Sync at capture: the region restarts from its start at the same
     // moment the camera starts, so every take is time-aligned. The
     // Settings audio offset (Bluetooth/output-latency correction) shifts
-    // the seek, and previews apply the same offset, so sync holds.
+    // the seek, and previews apply the same offset, so sync holds. The
+    // RESIDUAL error this leaves (seek/play/camera-start latency) is no
+    // longer assumed to be zero — it is measured per take (songStart
+    // sample below, stored as Take.syncOffsetSeconds).
     if (track) {
       await player.seekTo(Math.max(0, (regionEff?.startSeconds ?? 0) + audioOffsetMs / 1000));
       player.play();
@@ -319,12 +314,38 @@ export default function CameraScreen() {
     }, 100);
     setRecording(true);
 
+    // MEASURED SYNC — songStart sample (Overhaul Wave 2; the audit's
+    // core complaint was that sync was ASSUMED, never measured).
+    //
+    // Sampled here — after the seek + play above, as close to the
+    // recordAsync call as JS allows — this is the song position the
+    // take's first frames were captured against, as best this stack
+    // can know it. HONEST LIMIT: expo-camera exposes NO first-frame
+    // timestamp, so this is a player-side ESTIMATE of capture start:
+    // recordAsync's own pipeline spin-up latency sits inside it and
+    // cannot be separated out without a custom capture module. The
+    // drift figure computed when the take lands (song elapsed between
+    // this sample and the stop sample, minus the file's measured
+    // duration) is the measurable cross-check on this estimate — a bad
+    // start sample or clock disagreement shows up there instead of
+    // hiding. Both values are stored on the Take and consumed by the
+    // EDL bridge (src/lib/shuffleEdl.ts) via src/lib/edl.ts's single
+    // mapping: sourceFrame = timelineFrame − round(offset · fps),
+    // where offset's measured part is (this sample − the seek target).
+    const songStartSeconds = track ? player.currentTime : null;
+
     recordPromiseRef.current = cameraRef.current.recordAsync({
       // Safety net only: our own deadline stops the take first.
       maxDuration: lengthSeconds !== null ? Math.max(1, lengthSeconds + 1) : undefined,
     });
     recordPromiseRef.current
       .then(async (result) => {
+        // MEASURED SYNC — songEnd sample, taken FIRST, before anything
+        // here pauses or seeks the player. The player was already
+        // paused at the moment recording stopped (stopRecording / the
+        // deadline both pause it), so this reads the song position at
+        // stop time — the other end of the drift measurement.
+        const songEndSeconds = track ? player.currentTime : null;
         const mine = recordSessionRef.current === session;
         if (mine && elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
         if (mine) setRecording(false);
@@ -332,15 +353,53 @@ export default function CameraScreen() {
         if (!result?.uri) return;
         // Duration = stop time minus start time (both frozen above),
         // never the promise-resolution time. Then prefer the FILE's own
-        // probed duration when it can be read — it's the ground truth
-        // for what actually got recorded.
+        // MEASURED duration when it can be read — native inspectAsset
+        // when the engine is linked, else the JS probe (see
+        // measureTakeDurationSeconds) — it's the ground truth for what
+        // actually got recorded, and it replaces the wall-clock value.
         const stopAt = stopAtRef.current ?? Date.now();
         let durationSeconds = Math.max(0.1, (stopAt - recordStartRef.current) / 1000);
         if (lengthSeconds !== null) durationSeconds = Math.min(durationSeconds, lengthSeconds);
         const saved = await persistTake(result.uri);
-        const probed = await probeVideoDurationSeconds(saved.uri);
-        if (probed !== null) {
-          durationSeconds = lengthSeconds !== null ? Math.min(probed, lengthSeconds) : probed;
+        const measuredDurationSeconds = await measureTakeDurationSeconds(saved.uri);
+        if (measuredDurationSeconds !== null) {
+          durationSeconds = lengthSeconds !== null ? Math.min(measuredDurationSeconds, lengthSeconds) : measuredDurationSeconds;
+        }
+        // MEASURED SYNC fields — this session's samples are locals of
+        // this beginRecording invocation, so a late-finishing take can
+        // only ever attach its OWN measurements to its OWN Take.
+        //
+        //   syncOffsetSeconds = songStart − regionStart − audioOffset
+        //
+        // The seek above targeted regionStart + audioOffsetMs/1000
+        // (the Settings Bluetooth/output-latency correction, applied
+        // there on purpose) — subtracting that same correction here
+        // leaves only the UNINTENDED capture error, matching the EDL
+        // bridge's definition: positive = capture started late, so the
+        // footage for a timeline frame lives earlier inside the file.
+        //
+        //   syncDriftSeconds = (songEnd − songStart) − measuredDuration
+        //
+        // using the file's RAW measured duration (not the length-
+        // clamped value stored as durationSeconds): how much the song
+        // clock and the camera clock disagreed over this take.
+        //
+        // Either figure outside the sanity bound means a sample was
+        // untrustworthy (stale player position) — the field is then
+        // left undefined (honestly unmeasured) rather than stored.
+        let syncOffsetSeconds: number | undefined;
+        let syncDriftSeconds: number | undefined;
+        if (songStartSeconds !== null) {
+          const offset = songStartSeconds - audioOffsetMs / 1000 - regionStartSeconds;
+          if (Math.abs(offset) <= SYNC_MEASUREMENT_SANITY_SECONDS) {
+            syncOffsetSeconds = offset;
+            if (songEndSeconds !== null && measuredDurationSeconds !== null) {
+              const drift = songEndSeconds - songStartSeconds - measuredDurationSeconds;
+              if (Math.abs(drift) <= SYNC_MEASUREMENT_SANITY_SECONDS) {
+                syncDriftSeconds = drift;
+              }
+            }
+          }
         }
         studio.addTake({
           id: saved.id,
@@ -350,7 +409,9 @@ export default function CameraScreen() {
           durationSeconds,
           fileSizeBytes: saved.fileSizeBytes,
           // The take starts at the region's start in the track.
-          trackOffsetSeconds: regionEff?.startSeconds ?? studio.trackRegion.startSeconds ?? 0,
+          trackOffsetSeconds: regionStartSeconds,
+          ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
+          ...(syncDriftSeconds !== undefined ? { syncDriftSeconds } : {}),
         });
         // Cache the sampled section energies for the shuffle engine.
         if (energyAccRef.current && energyAccRef.current.sampledSectionCount > 0) {
@@ -489,9 +550,6 @@ export default function CameraScreen() {
       .label;
 
   const regionEffForLabel = effectiveRegion(studio.trackRegion, track?.durationSeconds);
-  const regionLabelText = regionEffForLabel
-    ? `${formatTime(regionEffForLabel.startSeconds)}–${formatTime(regionEffForLabel.endSeconds)}`
-    : 'Full';
 
   return (
     <View style={styles.root}>
@@ -530,7 +588,7 @@ export default function CameraScreen() {
 
       {/* Top bar — track pill centred, Settings gear to the side. All material/blur. */}
       <View style={[styles.topBar, { top: insets.top + 52 }]}>
-        <IconButton icon="settings-outline" accessibilityLabel="Settings" onPress={() => setSettingsOpen(true)} />
+        <IconButton icon="settings-outline" accessibilityLabel="Settings" onPress={() => router.push('/settings')} />
         <Pressable style={styles.trackPill} onPress={() => setTrackOpen(true)} accessibilityRole="button">
           <Ionicons name={track ? 'musical-notes' : 'add'} size={16} color="#FFFFFF" />
           <Text style={styles.trackPillText} numberOfLines={1}>
@@ -560,18 +618,21 @@ export default function CameraScreen() {
       {countingDown !== null ? (
         <View style={styles.centerOverlay} pointerEvents="none">
           <Text style={styles.countdownNumber}>{countingDown}</Text>
-          <Text style={styles.countInLabel}>TIMER · GET READY</Text>
+          <Text style={styles.countInLabel}>GET READY</Text>
         </View>
       ) : countIn !== null ? (
         <View style={styles.centerOverlay} pointerEvents="none">
           <Text style={styles.countInNumber}>{countIn}</Text>
-          <Text style={styles.countInLabel}>COUNT-IN · BEAT</Text>
+          <Text style={styles.countInLabel}>COUNT-IN</Text>
         </View>
       ) : null}
       {recording ? (
         <View style={[styles.recordingPill, { top: insets.top + 156 }]} pointerEvents="none">
           <View style={styles.recordingDot} />
-          <Text style={styles.recordingText}>{formatTime(elapsed)}</Text>
+          <Text style={styles.recordingText}>
+            {formatTime(elapsed)}
+            {regionEffForLabel ? ` / ${formatTime(regionEffForLabel.lengthSeconds)}` : ''}
+          </Text>
           {metronome ? <View style={[styles.beatDot, beatFlash && styles.beatDotOn]} /> : null}
         </View>
       ) : null}
@@ -757,53 +818,6 @@ export default function CameraScreen() {
         </View>
       ) : null}
 
-      {/* ---- Settings sheet (configuration ONLY — creative tools are in Edit) ---- */}
-      <SettingsSheet
-        visible={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        countdown={countdown}
-        onCountdownChange={setCountdown}
-        resolution={resolution}
-        onResolutionChange={setResolution}
-        frameRate={frameRate}
-        onFrameRateChange={setFrameRate}
-        mirror={mirror}
-        onMirrorChange={setMirror}
-        gridOverlay={gridOverlay}
-        onGridOverlayChange={setGridOverlay}
-        levelGuide={levelGuide}
-        onLevelGuideChange={setLevelGuide}
-        trackName={track?.name ?? null}
-        regionLabel={regionLabelText}
-        onPickTrack={() => {
-          setSettingsOpen(false);
-          void handlePickTrack();
-        }}
-        onOpenRegion={() => {
-          setSettingsOpen(false);
-          setTrackOpen(true);
-        }}
-        audioOffsetMs={audioOffsetMs}
-        onAudioOffsetChange={setAudioOffsetMs}
-        countInBeats={countInBeats}
-        onCountInBeatsChange={setCountInBeats}
-        metronome={metronome}
-        onMetronomeChange={setMetronome}
-        autosave={autosave}
-        onAutosaveChange={setAutosave}
-        exportQuality={exportQuality}
-        onExportQualityChange={setExportQuality}
-        onSaveTake={async () => {
-          const latest = takes[0];
-          if (!latest) return flashNotice('Record a take first');
-          flashNotice((await saveToPhotoLibrary(latest.uri)) ? 'Latest take saved to Photos' : 'Photos permission needed');
-        }}
-        onExportAction={() => {
-          setSettingsOpen(false);
-          goToExportAction();
-        }}
-      />
-
       {/* ---- Track sheet (audio-part picker) ---- */}
       <TrackSheet
         visible={trackOpen}
@@ -855,7 +869,7 @@ const styles = StyleSheet.create({
   countdownNumber: {
     fontSize: 120,
     fontWeight: '700',
-    color: '#FFFFFF',
+    color: colors.label,
     textShadowColor: 'rgba(0,0,0,0.5)',
     textShadowRadius: 18,
   },
@@ -870,7 +884,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '700',
     letterSpacing: 3,
-    color: '#FFFFFF',
+    color: colors.label,
     textShadowColor: 'rgba(0,0,0,0.5)',
     textShadowRadius: 8,
   },

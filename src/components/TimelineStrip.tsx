@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View, type ScrollViewInstance } from 'react-native';
 
 import { getCachedThumbnail, loadThumbnails } from '../lib/thumbnails';
-import { colors, formatTime, radius, spacing } from '../theme';
+import { colors, formatTime, radius, spacing, type as typeScale } from '../theme';
 
 export interface TimelineStripClip {
   id: string;
@@ -17,13 +17,6 @@ export interface TimelineStripClip {
   /** Where this clip starts inside its source video, seconds. */
   sourceStartSeconds?: number;
 }
-
-const SEGMENT_COLORS = [
-  'rgba(185,167,255,0.85)', // violet
-  'rgba(148,233,255,0.85)', // ice blue
-  'rgba(255,183,233,0.85)', // pink
-  'rgba(162,255,209,0.85)', // mint
-];
 
 /** Timeline scale — CapCut-like: fixed pixels per second, scrollable. */
 const PX_PER_SEC = 30;
@@ -42,9 +35,14 @@ const TILE_WIDTH = 34;
  *   they land), so you can SEE each clip.
  * - A playhead tracks the preview playback and the strip auto-scrolls
  *   to follow it; the currently playing cut is underlined.
- * - Tap a cut to select it and switch which take it uses (the take
- *   picker renders below, in the Shuffle screen) — this timeline IS
- *   the editor; there is no separate Edit stage.
+ * - Tap a cut to select it; the Editor's cut action bar (take switch,
+ *   trim, split, delete) renders in the screen — this timeline IS the
+ *   editor surface.
+ *
+ * Skin (design system §5): graphite only — segment placeholder fills
+ * alternate cardPressed/elevated and the filmstrip frames carry the
+ * visual variety; selection is a 2pt accent outline; no rainbow
+ * segment colours (culled, §6 #8).
  */
 export function TimelineStrip({
   clips,
@@ -197,7 +195,7 @@ export function TimelineStrip({
                     key={clip.id}
                     style={[
                       styles.segment,
-                      { width, backgroundColor: SEGMENT_COLORS[i % SEGMENT_COLORS.length] },
+                      { width, backgroundColor: i % 2 === 0 ? colors.cardPressed : colors.elevated },
                       i > 0 && styles.segmentDivider,
                       active && styles.segmentActive,
                       selected && styles.segmentSelected,
@@ -254,13 +252,13 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: spacing.sm,
   },
-  title: { color: colors.label, fontSize: 15, fontWeight: '700' },
-  total: { color: colors.labelSecondary, fontSize: 13, fontWeight: '500', fontVariant: ['tabular-nums'] },
+  title: { ...typeScale.headline, color: colors.label },
+  total: { ...typeScale.footnote, color: colors.labelSecondary, fontVariant: ['tabular-nums'] },
   editor: {
-    backgroundColor: '#0C0C12',
+    backgroundColor: colors.card,
     borderRadius: radius.md,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
+    borderColor: colors.separator,
     overflow: 'hidden',
     paddingVertical: 6,
   },
@@ -270,9 +268,9 @@ const styles = StyleSheet.create({
     bottom: 0,
     width: 1,
     height: 4,
-    backgroundColor: 'rgba(255,255,255,0.25)',
+    backgroundColor: colors.separator,
   },
-  tickMajor: { height: 7, backgroundColor: 'rgba(255,255,255,0.45)' },
+  tickMajor: { height: 7, backgroundColor: colors.labelTertiary },
   rulerLabel: {
     position: 'absolute',
     top: 0,
@@ -290,27 +288,27 @@ const styles = StyleSheet.create({
   },
   // Inside the segment's width (not a margin) so cut boundaries stay
   // exactly on the ruler's time scale and the playhead lines up.
-  segmentDivider: { borderLeftWidth: 2, borderLeftColor: '#0C0C12' },
+  segmentDivider: { borderLeftWidth: 2, borderLeftColor: colors.base },
   segmentActive: { borderBottomWidth: 3, borderBottomColor: colors.accent },
-  segmentSelected: { borderWidth: 2, borderColor: '#FFFFFF' },
+  segmentSelected: { borderWidth: 2, borderColor: colors.accent },
   filmstrip: { flexDirection: 'row', position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   labelChip: {
     position: 'absolute',
     left: 3,
     bottom: 3,
-    backgroundColor: 'rgba(10,10,16,0.72)',
+    backgroundColor: colors.material,
     borderRadius: 4,
     paddingHorizontal: 5,
     paddingVertical: 2,
   },
-  labelChipText: { color: '#FFFFFF', fontSize: 9, fontWeight: '700' },
+  labelChipText: { color: colors.label, fontSize: 9, fontWeight: '700' },
   playhead: {
     position: 'absolute',
     top: 0,
     bottom: 0,
     width: 2,
     marginLeft: -1,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: colors.label,
     shadowColor: '#000',
     shadowOpacity: 0.5,
     shadowRadius: 2,
@@ -322,7 +320,7 @@ const styles = StyleSheet.create({
     width: 10,
     height: 10,
     borderRadius: 5,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: colors.label,
   },
-  hint: { color: colors.labelSecondary, fontSize: 12, fontWeight: '500', marginTop: spacing.sm },
+  hint: { ...typeScale.caption, color: colors.labelSecondary, marginTop: spacing.sm },
 });

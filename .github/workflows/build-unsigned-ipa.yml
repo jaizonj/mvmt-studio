@@ -47,6 +47,9 @@ jobs:
           npm run test:edl
           npx tsc --noEmit
           npx expo lint
+          # Bundle smoke test: catches unresolved require() asset paths
+          # that tsc cannot see (a route move broke one in Wave 3).
+          npx expo export --platform ios
 
       - name: Generate the native iOS project (Expo prebuild + pods)
         run: npx expo prebuild --platform ios

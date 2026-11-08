@@ -13,9 +13,7 @@ import type {
   MusicalSection,
   Project,
   ShuffleFrequency,
-  ShuffleResultInfo,
   Take,
-  TimelineClip,
 } from '../types';
 
 /**
@@ -27,12 +25,9 @@ import type {
  * this, everything was useState-only and a restart lost the whole
  * studio (QA audit F-2). Camera/settings preferences stay global.
  *
- * The flat accessors (track, takes, …) are preserved so existing
- * screens keep working during the redesign wave: they read/write the
- * active project. The legacy seconds-based `timeline` is TRANSITIONAL
- * (in-memory only, cleared on project switch) — the canonical edit is
- * `edl`; Wave 3 removes the legacy timeline once every screen consumes
- * the EDL.
+ * The flat accessors (track, takes, …) read/write the ACTIVE project.
+ * The canonical edit is the frame-based `edl` — the legacy seconds-based
+ * timeline was removed in Wave 3 once every screen consumed the EDL.
  */
 
 let idCounter = 0;
@@ -40,7 +35,6 @@ function nextId(prefix: string): string {
   idCounter += 1;
   return `${prefix}-${Date.now().toString(36)}-${idCounter}`;
 }
-const nextClipId = () => nextId('clip');
 const nextProjectId = () => nextId('project');
 
 export function createEmptyProject(name: string): Project {
@@ -70,6 +64,8 @@ interface StudioState {
   openProject: (id: string) => void;
   deleteProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
+  /** Stamp the active project as exported (called on a successful render). */
+  markProjectExported: () => void;
 
   // ---- Active project: creative state ----
   track: AudioTrack | null;
@@ -79,8 +75,6 @@ interface StudioState {
   setEdl: (edl: Edl | null) => void;
   /** Apply a freshly generated edit + record its take sequence (so the next shuffle differs). */
   applyEdl: (edl: Edl, shuffleSequence?: string[]) => void;
-  /** TRANSITIONAL legacy seconds-based timeline; removed in Wave 3. */
-  timeline: TimelineClip[];
 
   setTrack: (track: AudioTrack | null) => void;
   setTrackDuration: (seconds: number) => void;
@@ -94,34 +88,10 @@ interface StudioState {
   /** Patch a take in place (rename, measured sync/duration updates…). */
   updateTake: (takeId: string, patch: Partial<Take>) => void;
 
-  addToTimeline: (takeId: string) => void;
-  removeFromTimeline: (clipId: string) => void;
-  moveTimelineClip: (clipId: string, direction: -1 | 1) => void;
-  swapTimelineClips: (clipIdA: string, clipIdB: string) => void;
-  clearTimeline: () => void;
-
-  /** Resolve a timeline clip back to its take. */
-  takeForClip: (clip: TimelineClip) => Take | undefined;
-
   /** Cached phrase/energy analysis of the current track (see analysis.ts). */
   trackSections: MusicalSection[];
   setTrackSections: (sections: MusicalSection[]) => void;
 
-  assignClipTake: (clipId: string, takeId: string) => void;
-  applyTimeline: (
-    clips: { takeId: string; trimStartSeconds?: number; trimEndSeconds?: number }[],
-  ) => void;
-  undoTimeline: () => void;
-  canUndoTimeline: boolean;
-  updateClipTrim: (clipId: string, trimStartSeconds: number, trimEndSeconds?: number) => void;
-  updateClip: (clipId: string, patch: Partial<Omit<TimelineClip, 'id' | 'takeId'>>) => void;
-  duplicateTimelineClip: (clipId: string) => void;
-  splitTimelineClip: (clipId: string) => void;
-  coverClipId: string | null;
-  setCoverClipId: (clipId: string | null) => void;
-
-  lastShuffle: ShuffleResultInfo | null;
-  setLastShuffle: (info: ShuffleResultInfo | null) => void;
   shuffleFrequency: ShuffleFrequency;
   setShuffleFrequency: (v: ShuffleFrequency) => void;
 
@@ -163,12 +133,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
-  // Transient (never persisted): analysis cache, legacy timeline, undo.
+  // Transient (never persisted): the track analysis cache.
   const [trackSections, setTrackSections] = useState<MusicalSection[]>([]);
-  const [timeline, setTimeline] = useState<TimelineClip[]>([]);
-  const [undoStack, setUndoStack] = useState<TimelineClip[][]>([]);
-  const [lastShuffle, setLastShuffle] = useState<ShuffleResultInfo | null>(null);
-  const [coverClipId, setCoverClipId] = useState<string | null>(null);
 
   // Global preferences.
   const [facing, setFacing] = useState<CameraType>('back');
@@ -252,11 +218,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     const project = createEmptyProject(name?.trim() || 'Untitled project');
     setProjects((current) => [project, ...current]);
     setActiveProjectId(project.id);
-    setTimeline([]);
-    setUndoStack([]);
-    setLastShuffle(null);
     setTrackSections([]);
-    setCoverClipId(null);
     return project.id;
   }, []);
 
@@ -264,12 +226,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     (id: string) => {
       if (!projects.some((p) => p.id === id)) return;
       setActiveProjectId(id);
-      setTimeline([]);
-      setUndoStack([]);
-      setLastShuffle(null);
-      setTrackSections([]);
-      setCoverClipId(null);
-    },
+            setTrackSections([]);
+      },
     [projects],
   );
 
@@ -279,10 +237,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         const next = current.filter((p) => p.id !== id);
         if (activeProjectId === id) {
           setActiveProjectId(next[0]?.id ?? null);
-          setTimeline([]);
-          setUndoStack([]);
-          setLastShuffle(null);
-        }
+                          }
         return next;
       });
     },
@@ -294,6 +249,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     if (!trimmed) return;
     setProjects((current) => current.map((p) => (p.id === id ? { ...p, name: trimmed, updatedAt: Date.now() } : p)));
   }, []);
+
+  const markProjectExported = useCallback(() => {
+    patchActiveProject({ exportedAt: Date.now() });
+  }, [patchActiveProject]);
 
   // ---- Active-project creative state (legacy-compatible accessors) ----
   const track = activeProject?.track ?? null;
@@ -327,8 +286,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         lastShuffleSequence: null,
       });
       setTrackSections([]);
-      setLastShuffle(null);
-    },
+      },
     [patchActiveProject],
   );
 
@@ -365,7 +323,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     (take: Take) => {
       const current = activeProjectRef.current;
       if (!current) return;
-      patchActiveProject({ takes: [take, ...current.takes] });
+      // Stable "Take N" numbering: assign the next sequence number so
+      // deleting a take never renumbers the survivors.
+      const withSeq: Take =
+        take.seq !== undefined
+          ? take
+          : { ...take, seq: current.takes.reduce((max, t) => Math.max(max, t.seq ?? 0), 0) + 1 };
+      patchActiveProject({ takes: [withSeq, ...current.takes] });
     },
     [patchActiveProject],
   );
@@ -384,132 +348,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       const current = activeProjectRef.current;
       if (!current) return;
       patchActiveProject({ takes: current.takes.filter((t) => t.id !== takeId) });
-      setTimeline((tl) => tl.filter((c) => c.takeId !== takeId));
     },
     [patchActiveProject],
   );
 
-  // ---- Legacy timeline operations (transitional; see header note) ----
-  const pushUndo = useCallback((snapshot: TimelineClip[]) => {
-    setUndoStack((current) => [...current.slice(-9), snapshot]);
-  }, []);
-
-  const assignClipTake = useCallback(
-    (clipId: string, takeId: string) => {
-      setTimeline((current) =>
-        current.map((c) => {
-          if (c.id !== clipId) return c;
-          const take = takes.find((t) => t.id === takeId);
-          const end = c.trimEndSeconds;
-          return {
-            ...c,
-            takeId,
-            trimEndSeconds:
-              end !== undefined && take?.durationSeconds && end >= take.durationSeconds ? undefined : end,
-          };
-        }),
-      );
-    },
-    [takes],
-  );
-
-  const applyTimeline = useCallback(
-    (clips: { takeId: string; trimStartSeconds?: number; trimEndSeconds?: number }[]) => {
-      setTimeline((current) => {
-        pushUndo(current);
-        return clips.map((clip) => ({ id: nextClipId(), ...clip }));
-      });
-    },
-    [pushUndo],
-  );
-
-  const undoTimeline = useCallback(() => {
-    setUndoStack((current) => {
-      const previous = current[current.length - 1];
-      if (previous) setTimeline(previous);
-      return current.slice(0, -1);
-    });
-  }, []);
-
-  const updateClipTrim = useCallback((clipId: string, trimStartSeconds: number, trimEndSeconds?: number) => {
-    setTimeline((current) =>
-      current.map((c) => (c.id === clipId ? { ...c, trimStartSeconds, trimEndSeconds } : c)),
-    );
-  }, []);
-
-  const updateClip = useCallback((clipId: string, patch: Partial<Omit<TimelineClip, 'id' | 'takeId'>>) => {
-    setTimeline((current) => current.map((c) => (c.id === clipId ? { ...c, ...patch } : c)));
-  }, []);
-
-  const duplicateTimelineClip = useCallback((clipId: string) => {
-    setTimeline((current) => {
-      const index = current.findIndex((c) => c.id === clipId);
-      if (index === -1) return current;
-      const copy: TimelineClip = { ...current[index], id: nextClipId() };
-      return [...current.slice(0, index + 1), copy, ...current.slice(index + 1)];
-    });
-  }, []);
-
-  const splitTimelineClip = useCallback(
-    (clipId: string) => {
-      setTimeline((current) => {
-        const index = current.findIndex((c) => c.id === clipId);
-        if (index === -1) return current;
-        const clip = current[index];
-        const take = takes.find((t) => t.id === clip.takeId);
-        const start = clip.trimStartSeconds ?? 0;
-        const end = clip.trimEndSeconds ?? take?.durationSeconds ?? start + 1;
-        if (end - start < 1) return current;
-        const mid = start + (end - start) / 2;
-        const first: TimelineClip = { ...clip, trimEndSeconds: mid };
-        const second: TimelineClip = { ...clip, id: nextClipId(), trimStartSeconds: mid, trimEndSeconds: clip.trimEndSeconds };
-        return [...current.slice(0, index), first, second, ...current.slice(index + 1)];
-      });
-    },
-    [takes],
-  );
-
-  const addToTimeline = useCallback((takeId: string) => {
-    setTimeline((current) => [...current, { id: nextClipId(), takeId }]);
-  }, []);
-
-  const removeFromTimeline = useCallback((clipId: string) => {
-    setTimeline((current) => current.filter((c) => c.id !== clipId));
-    setCoverClipId((current) => (current === clipId ? null : current));
-  }, []);
-
-  const moveTimelineClip = useCallback((clipId: string, direction: -1 | 1) => {
-    setTimeline((current) => {
-      const index = current.findIndex((c) => c.id === clipId);
-      const target = index + direction;
-      if (index === -1 || target < 0 || target >= current.length) return current;
-      const next = [...current];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  }, []);
-
-  const swapTimelineClips = useCallback((clipIdA: string, clipIdB: string) => {
-    if (clipIdA === clipIdB) return;
-    setTimeline((current) => {
-      const a = current.findIndex((c) => c.id === clipIdA);
-      const b = current.findIndex((c) => c.id === clipIdB);
-      if (a === -1 || b === -1) return current;
-      const next = [...current];
-      [next[a], next[b]] = [next[b], next[a]];
-      return next;
-    });
-  }, []);
-
-  const clearTimeline = useCallback(() => {
-    setTimeline([]);
-    setCoverClipId(null);
-  }, []);
-
-  const takeForClip = useCallback(
-    (clip: TimelineClip) => takes.find((t) => t.id === clip.takeId),
-    [takes],
-  );
 
   const setAudioOffsetMs = useCallback((v: number) => {
     setAudioOffsetMsState(Math.max(-500, Math.min(500, Math.round(v))));
@@ -525,12 +367,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       openProject,
       deleteProject,
       renameProject,
+      markProjectExported,
       track,
       takes,
       edl,
       setEdl,
       applyEdl,
-      timeline,
       setTrack,
       setTrackDuration,
       trackRegion,
@@ -538,28 +380,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       addTake,
       removeTake,
       updateTake,
-      addToTimeline,
-      removeFromTimeline,
-      moveTimelineClip,
-      swapTimelineClips,
-      clearTimeline,
-      takeForClip,
       trackSections,
       setTrackSections,
-      applyTimeline,
-      assignClipTake,
-      undoTimeline,
-      canUndoTimeline: undoStack.length > 0,
-      updateClipTrim,
-      lastShuffle,
-      setLastShuffle,
       shuffleFrequency,
       setShuffleFrequency,
-      updateClip,
-      duplicateTimelineClip,
-      splitTimelineClip,
-      coverClipId,
-      setCoverClipId,
       resolution,
       setResolution,
       frameRate,
@@ -598,12 +422,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       openProject,
       deleteProject,
       renameProject,
+      markProjectExported,
       track,
       takes,
       edl,
       setEdl,
       applyEdl,
-      timeline,
       setTrack,
       setTrackDuration,
       trackRegion,
@@ -611,25 +435,9 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       addTake,
       removeTake,
       updateTake,
-      addToTimeline,
-      removeFromTimeline,
-      moveTimelineClip,
-      swapTimelineClips,
-      clearTimeline,
-      takeForClip,
       trackSections,
-      applyTimeline,
-      assignClipTake,
-      undoTimeline,
-      undoStack.length,
-      updateClipTrim,
-      lastShuffle,
       shuffleFrequency,
       setShuffleFrequency,
-      updateClip,
-      duplicateTimelineClip,
-      splitTimelineClip,
-      coverClipId,
       resolution,
       frameRate,
       gridOverlay,
