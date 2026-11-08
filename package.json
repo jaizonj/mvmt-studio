@@ -48,7 +48,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "expo lint",
     "doctor": "expo-doctor",
-    "test:shuffle": "tsc --ignoreConfig src/lib/shuffle.ts src/lib/analysis.ts --outDir tests/.build --module commonjs --target ES2022 --skipLibCheck && node --test tests/shuffle.test.cjs"
+    "test:shuffle": "tsc --ignoreConfig src/lib/shuffle.ts src/lib/analysis.ts --outDir tests/.build --module commonjs --target ES2022 --skipLibCheck && node --test tests/shuffle.test.cjs",
+    "test:edl": "tsc --ignoreConfig src/lib/shuffleEdl.ts --outDir tests/.build-edl --module commonjs --target ES2022 --skipLibCheck && node --test tests/edl.test.cjs"
   },
   "private": true
 }

@@ -42,3 +42,4 @@ yarn-error.*
 tests/.build/
 
 dist/
+tests/.build-edl/
