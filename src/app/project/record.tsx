@@ -7,6 +7,7 @@ import {
   Alert,
   AppState,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -18,6 +19,11 @@ import { IconButton } from '../../components/IconButton';
 import { RecordButton } from '../../components/RecordButton';
 import { DEFAULT_BPM, effectiveRegion, rmsOfFrames, SectionEnergyAccumulator } from '../../lib/analysis';
 import { TrackSheet } from '../../components/TrackSheet';
+import { Image } from 'expo-image';
+
+import { NativePreview } from '../../components/NativePreview';
+import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
+import type { Take } from '../../types';
 import { measureTakeDurationSeconds, persistTake, pickAudioTrack } from '../../lib/media';
 import { useStudio } from '../../store/StudioContext';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
@@ -62,6 +68,26 @@ const LENGTH_PRESETS: { label: string; seconds: number | null }[] = [
  * Camera preferences (facing/torch/mirror/zoom/countdown) live in the
  * studio store so Settings shows the real values from any screen.
  */
+/**
+ * Sync status in human words, from the take's MEASURED sync offset
+ * (same mapping the Takes rail preview uses everywhere): ~1 frame at
+ * 30 fps (0.04s) is plainly in sync; up to 0.10s is a slight offset;
+ * beyond that, check before export. No raw values are shown.
+ */
+function syncStatusText(take: Take): string {
+  const offset = take.syncOffsetSeconds;
+  if (offset === undefined) return 'Sync not measured';
+  const magnitude = Math.abs(offset);
+  if (magnitude <= 0.04) return 'In sync';
+  if (magnitude <= 0.1) return 'In sync · slight offset';
+  return 'Off sync — check before export';
+}
+
+/** The rail tile's thumbnail moment: 40% into the take. */
+function railSampleSeconds(take: Take): number {
+  return take.durationSeconds ? Math.max(0.1, take.durationSeconds * 0.4) : 0.5;
+}
+
 export default function CameraScreen() {
   const insets = useSafeAreaInsets();
   const studio = useStudio();
@@ -97,6 +123,26 @@ export default function CameraScreen() {
   const [trackOpen, setTrackOpen] = useState(false);
   const [zoomOpen, setZoomOpen] = useState(false);
   const [timersOpen, setTimersOpen] = useState(false);
+
+  // Takes rail (left side): the takes stack up here as they're recorded
+  // — this replaces the separate Takes screen. A tapped tile opens the
+  // preview card below.
+  const [railPreviewId, setRailPreviewId] = useState<string | null>(null);
+  const [railPaused, setRailPaused] = useState(false);
+  const [, setRailThumbTick] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const missing = takes.filter((t) => getCachedThumbnail(t.uri, railSampleSeconds(t)) === undefined);
+    if (missing.length === 0) return;
+    void Promise.all(missing.map((t) => loadThumbnails(t.uri, [railSampleSeconds(t)]))).then(() => {
+      if (alive) setRailThumbTick((n) => n + 1);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [takes]);
+  const railPreviewTake = railPreviewId ? (takes.find((t) => t.id === railPreviewId) ?? null) : null;
+  const edlTakeIds = useMemo(() => new Set((studio.edl?.segments ?? []).map((seg) => seg.takeId)), [studio.edl]);
   const [appActive, setAppActive] = useState(true);
   const [isFocused, setIsFocused] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
@@ -221,13 +267,59 @@ export default function CameraScreen() {
     setTimeout(() => setNotice((current) => (current === message ? null : current)), 2600);
   }, []);
 
-  // Guided-flow gating: Takes/Shuffle are unreachable before the first
-  // take exists. The button stays visible (with a lock flavour) and
-  // explains itself, rather than silently doing nothing.
-  const goToTakes = useCallback(() => {
+  // Forward navigation: the takes live on this screen's left rail now
+  // (no separate Takes screen). Next goes to the Editor — or straight
+  // to Export when a cut already exists. Gated on the first take.
+  const goForward = useCallback(() => {
     if (takes.length === 0) return flashNotice('Record a take first');
-    router.push('/project/takes');
-  }, [flashNotice, takes.length]);
+    if (studio.edl) return router.push('/project/export');
+    router.push('/project/editor');
+  }, [flashNotice, takes.length, studio.edl]);
+
+  const openRailPreview = useCallback((take: Take) => {
+    setRailPreviewId(take.id);
+    setRailPaused(false);
+  }, []);
+
+  const renameRailTake = useCallback((take: Take) => {
+    Alert.prompt(
+      'Rename take',
+      undefined,
+      (name) => {
+        const trimmed = (name ?? '').trim();
+        studio.updateTake(take.id, { displayName: trimmed ? trimmed.slice(0, 40) : undefined });
+      },
+      'plain-text',
+      take.displayName ?? '',
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const deleteRailTake = useCallback(
+    (take: Take) => {
+      const inCut = edlTakeIds.has(take.id);
+      Alert.alert(
+        'Delete take?',
+        inCut
+          ? 'This take is used in your cut — deleting it will clear the current edit.'
+          : 'This take will be removed.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: () => {
+              studio.removeTake(take.id);
+              if (inCut) studio.setEdl(null);
+              setRailPreviewId(null);
+            },
+          },
+        ],
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [edlTakeIds],
+  );
 
   const handlePickTrack = useCallback(async () => {
     try {
@@ -645,24 +737,134 @@ export default function CameraScreen() {
       {/* Bottom control bar — takes review | record | shuffle (next stages).
           Both side actions follow the flow and are gated on having a take. */}
       <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.md) }]}>
-        <Pressable
-          style={[styles.sideButton, takes.length === 0 && styles.sideButtonLocked]}
-          onPress={goToTakes}
-          accessibilityRole="button"
-          accessibilityLabel={takes.length === 0 ? 'Your takes, locked — record a take first' : 'Review your takes'}>
-          <Ionicons name={takes.length === 0 ? 'lock-closed-outline' : 'film-outline'} size={26} color="#FFFFFF" />
-          <Text style={styles.sideButtonLabel}>Takes{takes.length ? ` · ${takes.length}` : ''}</Text>
-        </Pressable>
+        <View style={styles.sideButtonSpacer} />
         <RecordButton recording={recording} onPress={handleRecordPress} />
         <Pressable
-          style={[styles.sideButton, takes.length === 0 && styles.sideButtonLocked]}
-          onPress={goToTakes}
+          style={styles.sideButton}
+          onPress={goForward}
           accessibilityRole="button"
-          accessibilityLabel={takes.length === 0 ? 'Next, locked — record a take first' : 'Next, review your takes'}>
-          <Ionicons name={takes.length === 0 ? 'lock-closed-outline' : 'arrow-forward-circle-outline'} size={26} color="#FFFFFF" />
+          accessibilityLabel="Next, open the editor">
+          <Ionicons name="arrow-forward-circle-outline" size={26} color="#FFFFFF" />
           <Text style={styles.sideButtonLabel}>Next</Text>
         </Pressable>
       </View>
+
+      {/* Takes rail — takes stack up on the LEFT as they're recorded,
+          each with a real preview frame (this replaces the separate
+          Takes screen). Tap a tile for the preview card. */}
+      {takes.length > 0 ? (
+        <ScrollView
+          style={[styles.takeRail, { top: insets.top + 118, bottom: insets.bottom + 208 }]}
+          contentContainerStyle={styles.takeRailContent}
+          showsVerticalScrollIndicator={false}>
+          {takes.map((take) => {
+            const thumb = getCachedThumbnail(take.uri, railSampleSeconds(take));
+            const inCut = edlTakeIds.has(take.id);
+            return (
+              <Pressable
+                key={take.id}
+                style={styles.railTile}
+                onPress={() => openRailPreview(take)}
+                accessibilityRole="button"
+                accessibilityLabel={`Preview take ${take.seq ?? ''}${inCut ? ', used in your cut' : ''}`}>
+                {thumb ? (
+                  <Image source={{ uri: thumb }} style={styles.railThumb} contentFit="cover" />
+                ) : (
+                  <View style={[styles.railThumb, styles.railThumbPlaceholder]}>
+                    <Ionicons name="film-outline" size={16} color={colors.labelSecondary} />
+                  </View>
+                )}
+                <View style={styles.railBadge}>
+                  <Text style={styles.railBadgeText}>{take.seq ?? ''}</Text>
+                </View>
+                {inCut ? <View style={styles.railInCutDot} /> : null}
+                <Text style={styles.railDuration}>{take.durationSeconds ? formatTime(take.durationSeconds) : '…'}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      ) : null}
+
+      {/* Take preview card — the rail tile's detail view: native
+          preview, sync in words, rename / delete. */}
+      {railPreviewTake ? (
+        <View style={styles.railPreviewBackdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={() => setRailPreviewId(null)}
+            accessibilityRole="button"
+            accessibilityLabel="Close take preview"
+          />
+          <View style={styles.railPreviewCard}>
+            {railPreviewTake.durationSeconds ? (
+              <NativePreview
+                request={{
+                  clips: [
+                    {
+                      uri: railPreviewTake.uri,
+                      startSeconds: 0,
+                      durationSeconds: railPreviewTake.durationSeconds,
+                      muted: true,
+                      volume: 1,
+                    },
+                  ],
+                  audioUri: null,
+                }}
+                requestKey={railPreviewTake.id}
+                paused={railPaused}
+                style={styles.railPreviewVideo}
+              />
+            ) : (
+              <View style={[styles.railPreviewVideo, styles.railPreviewUnavailable]}>
+                <Text style={styles.railPreviewUnavailableText}>
+                  Preview unavailable until this take&apos;s length is known.
+                </Text>
+              </View>
+            )}
+            <View style={styles.railPreviewMeta}>
+              <Text style={styles.railPreviewName} numberOfLines={1}>
+                {railPreviewTake.displayName?.trim() || `Take ${railPreviewTake.seq ?? ''}`}
+              </Text>
+              <Text style={styles.railPreviewSub}>
+                {formatTime(railPreviewTake.durationSeconds ?? 0)} ·{' '}
+                {railPreviewTake.facing === 'front' ? 'Front' : 'Back'} camera · {syncStatusText(railPreviewTake)}
+              </Text>
+            </View>
+            <View style={styles.railPreviewActions}>
+              <Pressable
+                style={styles.railActionButton}
+                onPress={() => setRailPaused((v) => !v)}
+                accessibilityRole="button"
+                accessibilityLabel={railPaused ? 'Play take' : 'Pause take'}>
+                <Ionicons name={railPaused ? 'play' : 'pause'} size={17} color={colors.label} />
+              </Pressable>
+              <Pressable
+                style={styles.railActionButton}
+                onPress={() => renameRailTake(railPreviewTake)}
+                accessibilityRole="button"
+                accessibilityLabel="Rename take">
+                <Ionicons name="pencil-outline" size={17} color={colors.label} />
+                <Text style={styles.railActionText}>Rename</Text>
+              </Pressable>
+              <Pressable
+                style={styles.railActionButton}
+                onPress={() => deleteRailTake(railPreviewTake)}
+                accessibilityRole="button"
+                accessibilityLabel="Delete take">
+                <Ionicons name="trash-outline" size={17} color={colors.danger} />
+                <Text style={[styles.railActionText, { color: colors.danger }]}>Delete</Text>
+              </Pressable>
+              <Pressable
+                style={styles.railActionButton}
+                onPress={() => setRailPreviewId(null)}
+                accessibilityRole="button"
+                accessibilityLabel="Close preview">
+                <Ionicons name="close" size={17} color={colors.label} />
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      ) : null}
 
       {/* Video length — where the zoom buttons used to sit (Jaizon):
           the bottom-centre row now picks how long each take records
@@ -888,7 +1090,6 @@ const styles = StyleSheet.create({
     textShadowColor: 'rgba(0,0,0,0.5)',
     textShadowRadius: 8,
   },
-  sideButtonLocked: { opacity: 0.45 },
   gridLineV: {
     position: 'absolute',
     top: 0,
@@ -968,6 +1169,74 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   timerChipText: { color: colors.label, fontSize: 13, fontWeight: '700' },
+  sideButtonSpacer: { width: 64 },
+  takeRail: { position: 'absolute', left: spacing.md, width: 60 },
+  takeRailContent: { gap: spacing.md, alignItems: 'center', paddingVertical: spacing.xs },
+  railTile: { width: 60, alignItems: 'center' },
+  railThumb: { width: 56, height: 74, borderRadius: radius.sm, backgroundColor: colors.card },
+  railThumbPlaceholder: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.elevated },
+  railBadge: {
+    position: 'absolute',
+    top: 4,
+    left: 6,
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: colors.material,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 4,
+  },
+  railBadgeText: { ...typeScale.caption, color: colors.label, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  railInCutDot: {
+    position: 'absolute',
+    top: 5,
+    right: 7,
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    backgroundColor: colors.accent,
+  },
+  railDuration: { ...typeScale.caption, color: colors.label, marginTop: 3, fontVariant: ['tabular-nums'] },
+  railPreviewBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.xl,
+    zIndex: 40,
+  },
+  railPreviewCard: {
+    width: '100%',
+    maxWidth: 340,
+    backgroundColor: colors.card,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    gap: spacing.md,
+  },
+  railPreviewVideo: { width: '100%', aspectRatio: 9 / 16, maxHeight: 360, borderRadius: radius.md },
+  railPreviewUnavailable: {
+    backgroundColor: colors.elevated,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.lg,
+  },
+  railPreviewUnavailableText: { ...typeScale.footnote, color: colors.labelSecondary, textAlign: 'center' },
+  railPreviewMeta: { gap: 2 },
+  railPreviewName: { ...typeScale.headline, color: colors.label },
+  railPreviewSub: { ...typeScale.footnote, color: colors.labelSecondary },
+  railPreviewActions: { flexDirection: 'row', gap: spacing.sm },
+  railActionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: colors.elevated,
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.md,
+    height: 38,
+  },
+  railActionText: { ...typeScale.subhead, color: colors.label, fontWeight: '600' },
   sideButton: {
     alignItems: 'center',
     gap: 3,
