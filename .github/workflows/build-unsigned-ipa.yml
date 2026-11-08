@@ -18,6 +18,13 @@ jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      # Expo SDK 58's PRECOMPILED modules only work on Expo's own cloud
+      # builders; on a plain CI Mac the precompiled path fails inside
+      # the ExpoModulesJSI SwiftPM build (strict-concurrency error in
+      # JavaScriptObject.swift). Compiling the modules from source the
+      # classic way avoids that path entirely.
+      EXPO_USE_PRECOMPILED_MODULES: "0"
     steps:
       - name: Check out the project
         uses: actions/checkout@v4
