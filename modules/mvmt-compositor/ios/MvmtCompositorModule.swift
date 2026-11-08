@@ -2025,27 +2025,18 @@ private final class CaptureCoordinator: NSObject,
   /// THE measurement: convert the first appended frame's host-clock
   /// PTS into a song position.
   ///
-  /// Preferred path — the player item's own host-time mapping
-  /// (`time(forHostTime:)`), which tracks the item's real playback
-  /// (including any drift between the item clock and the host clock).
-  ///
-  /// Fallback — an anchor pair sampled in this same callback: the
-  /// item's current position and host-now; the frame's song position
-  /// is the item position shifted by (framePTS − hostNow). Only used
-  /// when the item is actually playing (rate ≠ 0); a paused/failed
-  /// player yields nil — the position is never fabricated.
+  /// An anchor pair sampled in this same callback: the item's current
+  /// position and host-now; the frame's song position is the item
+  /// position shifted by (framePTS − hostNow). (An earlier revision
+  /// preferred AVPlayerItem.time(forHostTime:) — that API does not
+  /// exist in the current SDK, confirmed by CI; the anchor pair is
+  /// the measurement.) Only used when the item is actually playing
+  /// (rate ≠ 0); a paused/failed player yields nil — the position is
+  /// never fabricated.
   private func measureFirstFrameLocked(pts: CMTime) {
     guard let item = songItem else {
       firstFrameSongPosition = nil
       return
-    }
-    let mapped = item.time(forHostTime: pts)
-    if mapped.isValid, mapped.isNumeric {
-      let seconds = CMTimeGetSeconds(mapped)
-      if seconds.isFinite {
-        firstFrameSongPosition = seconds
-        return
-      }
     }
     guard let player = songPlayer, player.rate != 0 else {
       firstFrameSongPosition = nil
