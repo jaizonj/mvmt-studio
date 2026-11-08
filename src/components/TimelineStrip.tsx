@@ -1,5 +1,9 @@
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Image } from 'expo-image';
+import type { VideoThumbnail } from 'expo-video';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, View, type ScrollViewInstance } from 'react-native';
 
+import { getCachedThumbnail, loadThumbnails } from '../lib/thumbnails';
 import { colors, formatTime, radius, spacing } from '../theme';
 
 export interface TimelineStripClip {
@@ -8,6 +12,10 @@ export interface TimelineStripClip {
   label: string;
   /** Played length of this clip in the cut, seconds. */
   lengthSeconds: number;
+  /** Source video for filmstrip thumbnails. */
+  sourceUri?: string;
+  /** Where this clip starts inside its source video, seconds. */
+  sourceStartSeconds?: number;
 }
 
 const SEGMENT_COLORS = [
@@ -17,68 +25,222 @@ const SEGMENT_COLORS = [
   'rgba(162,255,209,0.85)', // mint
 ];
 
+/** Timeline scale — CapCut-like: fixed pixels per second, scrollable. */
+const PX_PER_SEC = 30;
+const STRIP_HEIGHT = 58;
+const TILE_WIDTH = 34;
+
 /**
- * The cut as a timeline: one segment per clip, width proportional to its
- * played length, labelled with its take and duration. It re-renders from
- * the shared timeline state, so after a Shuffle the new arrangement
- * appears here immediately.
+ * The cut as a REAL timeline editor (CapCut-style), rebuilt after
+ * Jaizon's device test (2026-11-08) — the old proportional bar read as
+ * "one big cut" and showed nothing of the actual footage:
  *
- * Interactive (Triller-style): when `onSelectClip` is provided, tapping
- * a segment selects that cut so the user can switch which take it uses;
- * the selected segment gets a white outline.
+ * - Fixed time scale with a ruler (tick every second, label every 5s),
+ *   horizontally scrollable for longer cuts.
+ * - Every cut is a filmstrip: real frames sampled from its take across
+ *   the cut's range (expo-video thumbnails, colour placeholder until
+ *   they land), so you can SEE each clip.
+ * - A playhead tracks the preview playback and the strip auto-scrolls
+ *   to follow it; the currently playing cut is underlined.
+ * - Tap a cut to select it and switch which take it uses (the take
+ *   picker renders below, in the Shuffle screen) — this timeline IS
+ *   the editor; there is no separate Edit stage.
  */
 export function TimelineStrip({
   clips,
   selectedClipId,
   onSelectClip,
+  playbackSeconds,
+  isPlaying = false,
 }: {
   clips: TimelineStripClip[];
   selectedClipId?: string | null;
   onSelectClip?: (clipId: string) => void;
+  /** Preview position inside the edit, seconds — drives the playhead. */
+  playbackSeconds?: number | null;
+  isPlaying?: boolean;
 }) {
+  const scrollRef = useRef<ScrollViewInstance>(null);
+  const scrollOffsetRef = useRef(0);
+  const viewportWidthRef = useRef(0);
+  const [, setThumbTick] = useState(0);
+
   const total = clips.reduce((sum, c) => sum + Math.max(0, c.lengthSeconds), 0);
+  const totalWidth = Math.max(1, total * PX_PER_SEC);
+
+  // Filmstrip sample times per clip: one frame per tile across the cut's
+  // own range inside its take.
+  const samples = useMemo(() => {
+    const perClip = new Map<string, number[]>();
+    for (const clip of clips) {
+      if (!clip.sourceUri || clip.lengthSeconds <= 0) continue;
+      const width = Math.max(18, clip.lengthSeconds * PX_PER_SEC);
+      const tiles = Math.max(1, Math.round(width / TILE_WIDTH));
+      const start = clip.sourceStartSeconds ?? 0;
+      const times: number[] = [];
+      for (let i = 0; i < tiles; i++) {
+        times.push(Math.round((start + ((i + 0.5) * clip.lengthSeconds) / tiles) * 20) / 20);
+      }
+      perClip.set(clip.id, times);
+    }
+    return perClip;
+  }, [clips]);
+
+  const samplesKey = useMemo(
+    () =>
+      clips
+        .map((c) => `${c.sourceUri ?? ''}@${(samples.get(c.id) ?? []).join(',')}`)
+        .join('|'),
+    [clips, samples],
+  );
+
+  // Generate any thumbnails not already cached, then re-render once.
+  useEffect(() => {
+    let alive = true;
+    const byUri = new Map<string, number[]>();
+    for (const clip of clips) {
+      if (!clip.sourceUri) continue;
+      for (const t of samples.get(clip.id) ?? []) {
+        if (getCachedThumbnail(clip.sourceUri, t) === undefined) {
+          const list = byUri.get(clip.sourceUri) ?? [];
+          list.push(t);
+          byUri.set(clip.sourceUri, list);
+        }
+      }
+    }
+    if (byUri.size === 0) return;
+    Promise.all([...byUri.entries()].map(([uri, times]) => loadThumbnails(uri, times))).then(() => {
+      if (alive) setThumbTick((n) => n + 1);
+    });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [samplesKey]);
+
+  // Keep the playhead in view while the preview plays.
+  useEffect(() => {
+    if (!isPlaying || playbackSeconds == null) return;
+    const x = playbackSeconds * PX_PER_SEC;
+    const offset = scrollOffsetRef.current;
+    const viewW = viewportWidthRef.current;
+    if (viewW > 0 && (x < offset + 24 || x > offset + viewW - 70)) {
+      scrollRef.current?.scrollTo({ x: Math.max(0, x - 56), animated: true });
+    }
+  }, [playbackSeconds, isPlaying]);
+
   if (clips.length === 0 || total <= 0) return null;
+
+  const playheadX = playbackSeconds != null ? Math.min(Math.max(0, playbackSeconds), total) * PX_PER_SEC : null;
+
+  // Which cut is under the playhead (for the playing underline).
+  let activeClipId: string | null = null;
+  if (playbackSeconds != null) {
+    let acc = 0;
+    for (const clip of clips) {
+      const len = Math.max(0, clip.lengthSeconds);
+      if (playbackSeconds < acc + len || clip === clips[clips.length - 1]) {
+        activeClipId = clip.id;
+        break;
+      }
+      acc += len;
+    }
+  }
+
+  const rulerTicks = [];
+  for (let s = 0; s <= Math.floor(total); s++) {
+    rulerTicks.push(
+      <View key={`tick-${s}`} style={[styles.tick, { left: s * PX_PER_SEC }, s % 5 === 0 && styles.tickMajor]} />,
+    );
+    if (s % 5 === 0) {
+      rulerTicks.push(
+        <Text key={`label-${s}`} style={[styles.rulerLabel, { left: s * PX_PER_SEC + 3 }]}>
+          {formatTime(s)}
+        </Text>,
+      );
+    }
+  }
+
   return (
     <View>
       <View style={styles.headerRow}>
-        <Text style={styles.title}>Your cut · timeline</Text>
+        <Text style={styles.title}>Your cut</Text>
         <Text style={styles.total}>
-          {clips.length} clips · {formatTime(total)}
+          {playbackSeconds != null
+            ? `${formatTime(Math.min(playbackSeconds, total))} / ${formatTime(total)} · ${clips.length} cuts`
+            : `${clips.length} cuts · ${formatTime(total)}`}
         </Text>
       </View>
-      <View style={styles.strip}>
-        {clips.map((clip, i) => {
-          const selected = selectedClipId === clip.id;
-          const segmentStyle = [
-            styles.segment,
-            { flexGrow: Math.max(0.1, clip.lengthSeconds), backgroundColor: SEGMENT_COLORS[i % SEGMENT_COLORS.length] },
-            i > 0 && styles.segmentDivider,
-            selected && styles.segmentSelected,
-          ];
-          const inner = (
-            <>
-              <Text style={styles.segmentLabel} numberOfLines={1}>
-                {clip.label}
-              </Text>
-              <Text style={styles.segmentTime}>{formatTime(clip.lengthSeconds)}</Text>
-            </>
-          );
-          return onSelectClip ? (
-            <Pressable
-              key={clip.id}
-              style={segmentStyle}
-              onPress={() => onSelectClip(clip.id)}
-              accessibilityRole="button"
-              accessibilityState={{ selected }}
-              accessibilityLabel={`${clip.label}, cut ${i + 1}. Tap to switch its take.`}>
-              {inner}
-            </Pressable>
-          ) : (
-            <View key={clip.id} style={segmentStyle}>
-              {inner}
+      <View style={styles.editor}>
+        <ScrollView
+          ref={scrollRef}
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          scrollEventThrottle={100}
+          onScroll={(e) => {
+            scrollOffsetRef.current = e.nativeEvent.contentOffset.x;
+          }}
+          onLayout={(e) => {
+            viewportWidthRef.current = e.nativeEvent.layout.width;
+          }}>
+          <View style={{ width: totalWidth }}>
+            <View style={styles.ruler}>{rulerTicks}</View>
+            <View style={styles.stripRow}>
+              {clips.map((clip, i) => {
+                const width = Math.max(18, clip.lengthSeconds * PX_PER_SEC);
+                const selected = selectedClipId === clip.id;
+                const active = activeClipId === clip.id && playbackSeconds != null;
+                const times = samples.get(clip.id) ?? [];
+                const tileWidth = width / Math.max(1, times.length || 1);
+                return (
+                  <Pressable
+                    key={clip.id}
+                    style={[
+                      styles.segment,
+                      { width, backgroundColor: SEGMENT_COLORS[i % SEGMENT_COLORS.length] },
+                      i > 0 && styles.segmentDivider,
+                      active && styles.segmentActive,
+                      selected && styles.segmentSelected,
+                    ]}
+                    onPress={() => onSelectClip?.(clip.id)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected }}
+                    accessibilityLabel={`${clip.label}, cut ${i + 1} of ${clips.length}, ${formatTime(clip.lengthSeconds)}. Tap to switch its take.`}>
+                    <View style={styles.filmstrip}>
+                      {times.length > 0
+                        ? times.map((t, ti) => {
+                            const thumb: VideoThumbnail | null | undefined = clip.sourceUri
+                              ? getCachedThumbnail(clip.sourceUri, t)
+                              : null;
+                            return thumb ? (
+                              <Image
+                                key={ti}
+                                source={thumb}
+                                style={{ width: tileWidth, height: STRIP_HEIGHT }}
+                                contentFit="cover"
+                              />
+                            ) : (
+                              <View key={ti} style={{ width: tileWidth, height: STRIP_HEIGHT }} />
+                            );
+                          })
+                        : null}
+                    </View>
+                    <View style={styles.labelChip}>
+                      <Text style={styles.labelChipText} numberOfLines={1}>
+                        {clip.label}
+                      </Text>
+                    </View>
+                  </Pressable>
+                );
+              })}
             </View>
-          );
-        })}
+            {playheadX != null ? (
+              <View style={[styles.playhead, { left: playheadX }]} pointerEvents="none">
+                <View style={styles.playheadKnob} />
+              </View>
+            ) : null}
+          </View>
+        </ScrollView>
       </View>
       {onSelectClip ? <Text style={styles.hint}>Tap a cut to switch which take it uses</Text> : null}
     </View>
@@ -93,24 +255,74 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   title: { color: colors.label, fontSize: 15, fontWeight: '700' },
-  total: { color: colors.labelSecondary, fontSize: 13, fontWeight: '500' },
-  strip: {
-    flexDirection: 'row',
-    height: 46,
+  total: { color: colors.labelSecondary, fontSize: 13, fontWeight: '500', fontVariant: ['tabular-nums'] },
+  editor: {
+    backgroundColor: '#0C0C12',
     borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
     overflow: 'hidden',
-    backgroundColor: colors.card,
+    paddingVertical: 6,
   },
+  ruler: { height: 16, position: 'relative', marginBottom: 2 },
+  tick: {
+    position: 'absolute',
+    bottom: 0,
+    width: 1,
+    height: 4,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+  },
+  tickMajor: { height: 7, backgroundColor: 'rgba(255,255,255,0.45)' },
+  rulerLabel: {
+    position: 'absolute',
+    top: 0,
+    color: colors.labelTertiary,
+    fontSize: 9,
+    fontWeight: '600',
+    fontVariant: ['tabular-nums'],
+  },
+  stripRow: { flexDirection: 'row', height: STRIP_HEIGHT },
   segment: {
-    flexBasis: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 2,
-    minWidth: 26,
+    height: STRIP_HEIGHT,
+    borderRadius: 4,
+    overflow: 'hidden',
+    position: 'relative',
   },
-  segmentDivider: { borderLeftWidth: 1, borderLeftColor: 'rgba(11,11,16,0.55)' },
+  // Inside the segment's width (not a margin) so cut boundaries stay
+  // exactly on the ruler's time scale and the playhead lines up.
+  segmentDivider: { borderLeftWidth: 2, borderLeftColor: '#0C0C12' },
+  segmentActive: { borderBottomWidth: 3, borderBottomColor: colors.accent },
   segmentSelected: { borderWidth: 2, borderColor: '#FFFFFF' },
+  filmstrip: { flexDirection: 'row', position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  labelChip: {
+    position: 'absolute',
+    left: 3,
+    bottom: 3,
+    backgroundColor: 'rgba(10,10,16,0.72)',
+    borderRadius: 4,
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+  },
+  labelChipText: { color: '#FFFFFF', fontSize: 9, fontWeight: '700' },
+  playhead: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    width: 2,
+    marginLeft: -1,
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#000',
+    shadowOpacity: 0.5,
+    shadowRadius: 2,
+  },
+  playheadKnob: {
+    position: 'absolute',
+    top: -1,
+    left: -4,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#FFFFFF',
+  },
   hint: { color: colors.labelSecondary, fontSize: 12, fontWeight: '500', marginTop: spacing.sm },
-  segmentLabel: { color: '#14141F', fontSize: 11, fontWeight: '800' },
-  segmentTime: { color: 'rgba(20,20,31,0.75)', fontSize: 10, fontWeight: '600' },
 });

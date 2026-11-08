@@ -4,7 +4,6 @@ import { useMemo, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { FlowSteps } from '../components/FlowSteps';
 import { SettingsSheetConnected } from '../components/SettingsSheetConnected';
 import { saveToPhotoLibrary, shareFile } from '../lib/media';
 import { useStudio } from '../store/StudioContext';
@@ -70,9 +69,6 @@ export default function TakesScreen() {
             {takes.length ? ` · ${takes.length} take${takes.length === 1 ? '' : 's'}` : ''}
             {timeline.length ? ` · ${timeline.length} in your cut` : ''}
           </Text>
-          <View style={styles.stepsWrap}>
-            <FlowSteps current="takes" takesCount={takes.length} cutCount={timeline.length} />
-          </View>
         </View>
 
         {locked ? (
@@ -191,7 +187,6 @@ const styles = StyleSheet.create({
   gearButton: { padding: 6, marginBottom: spacing.xs },
   largeTitle: { ...typeScale.largeTitle, color: colors.label },
   headerSubtitle: { ...typeScale.subhead, color: colors.labelSecondary, marginTop: 2 },
-  stepsWrap: { marginTop: spacing.lg, alignItems: 'flex-start' },
   section: { paddingHorizontal: spacing.xl },
   emptyCard: {
     alignItems: 'center',

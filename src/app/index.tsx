@@ -14,7 +14,6 @@ import {
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { FlowSteps } from '../components/FlowSteps';
 import { IconButton } from '../components/IconButton';
 import { RecordButton } from '../components/RecordButton';
 import { SettingsSheet } from '../components/SettingsSheet';
@@ -101,6 +100,7 @@ export default function CameraScreen() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [trackOpen, setTrackOpen] = useState(false);
   const [zoomOpen, setZoomOpen] = useState(false);
+  const [timersOpen, setTimersOpen] = useState(false);
   const [appActive, setAppActive] = useState(true);
   const [isFocused, setIsFocused] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
@@ -556,16 +556,6 @@ export default function CameraScreen() {
         </View>
       </View>
 
-      {/* Flow indicator — pinned to the very TOP of the screen (Jaizon:
-          "at the top, not the middle"). Record → Takes → Shuffle →
-          Export, later steps locked until a take exists. Hidden while
-          recording (the recording pill takes its place lower down). */}
-      {!recording && countingDown === null ? (
-        <View style={[styles.flowStepsWrap, { top: insets.top + 6 }]} pointerEvents="none">
-          <FlowSteps current="record" takesCount={takes.length} cutCount={studio.timeline.length} onDark />
-        </View>
-      ) : null}
-
       {/* Countdown / recording status — centred, system style. */}
       {countingDown !== null ? (
         <View style={styles.centerOverlay} pointerEvents="none">
@@ -613,41 +603,6 @@ export default function CameraScreen() {
         </Pressable>
       </View>
 
-      {/* Timer controls — on the LEFT SIDE of the camera (Jaizon),
-          clearly two SEPARATE things: the camera Timer (seconds to get
-          into position) and the musical Count-in (beats). Both start
-          OFF; tapping cycles the values. Same controls live in Settings. */}
-      {!recording && countingDown === null && countIn === null ? (
-        <View style={styles.sideTimers}>
-          <Pressable
-            style={styles.timerChip}
-            onPress={() => {
-              const order = [0, 3, 5, 10] as const;
-              const next = order[(order.indexOf(countdown as (typeof order)[number]) + 1) % order.length];
-              setCountdown(next);
-              flashNotice(next === 0 ? 'Timer off — record starts straight away' : `Timer ${next}s — beeps each second`);
-            }}
-            accessibilityRole="button"
-            accessibilityLabel={`Camera timer, currently ${countdown === 0 ? 'off' : `${countdown} seconds`}. Tap to change.`}>
-            <Ionicons name="timer-outline" size={15} color="#FFFFFF" />
-            <Text style={styles.timerChipText}>Timer: {countdown === 0 ? 'Off' : `${countdown}s`}</Text>
-          </Pressable>
-          <Pressable
-            style={styles.timerChip}
-            onPress={() => {
-              const order = [0, 4, 8] as const;
-              const next = order[(order.indexOf(countInBeats as (typeof order)[number]) + 1) % order.length];
-              setCountInBeats(next);
-              flashNotice(next === 0 ? 'Count-in off' : `Count-in ${next} beats — clicks each beat`);
-            }}
-            accessibilityRole="button"
-            accessibilityLabel={`Beat count-in, currently ${countInBeats === 0 ? 'off' : `${countInBeats} beats`}. Tap to change.`}>
-            <Ionicons name="musical-note-outline" size={15} color="#FFFFFF" />
-            <Text style={styles.timerChipText}>Count-in: {countInBeats === 0 ? 'Off' : `${countInBeats}`}</Text>
-          </Pressable>
-        </View>
-      ) : null}
-
       {/* Video length — where the zoom buttons used to sit (Jaizon):
           the bottom-centre row now picks how long each take records
           (the length of the song part). Same value as the track sheet's
@@ -687,39 +642,118 @@ export default function CameraScreen() {
         </View>
       ) : null}
 
-      {/* Zoom — a collapsible pill on the RIGHT SIDE (Jaizon). Collapsed
-          it shows the current zoom; tap to expand the presets, tap one
-          (or the pill again) to collapse. Pinch-to-zoom still works. */}
+      {/* RIGHT-SIDE control column (Jaizon, 2026-11-08): zoom and the
+          timers live together on the right, each a single collapsible
+          pill. Timer + Count-in used to be two always-visible chips on
+          the left; now they're ONE pill — tap it and a small panel
+          opens with both controls (Timer = seconds to get into
+          position, Count-in = musical beats; both default OFF).
+          Opening one pill closes the other. Pinch-to-zoom still works. */}
       {!recording ? (
-        <View style={styles.sideZoom}>
-          {zoomOpen
-            ? ZOOM_PRESETS.map((preset) => {
-                const selected = Math.abs(zoom - preset.value) < 0.03;
-                return (
-                  <Pressable
-                    key={preset.label}
-                    onPress={() => {
-                      setZoom(preset.value);
-                      setZoomOpen(false);
-                    }}
-                    style={[styles.sideZoomOption, selected && styles.zoomPillSelected]}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected }}
-                    accessibilityLabel={`Zoom ${preset.label}`}>
-                    <Text style={[styles.zoomText, selected && styles.zoomTextSelected]}>{preset.label}</Text>
-                  </Pressable>
-                );
-              })
-            : null}
-          <Pressable
-            onPress={() => setZoomOpen((v) => !v)}
-            style={[styles.sideZoomMain, zoomOpen && styles.zoomPillSelected]}
-            accessibilityRole="button"
-            accessibilityState={{ expanded: zoomOpen }}
-            accessibilityLabel={zoomOpen ? 'Close zoom options' : `Zoom, currently ${currentZoomLabel}. Tap for zoom options.`}>
-            <Text style={[styles.zoomText, zoomOpen && styles.zoomTextSelected]}>{currentZoomLabel}</Text>
-            <Ionicons name={zoomOpen ? 'chevron-up' : 'chevron-down'} size={11} color={zoomOpen ? '#14141F' : '#FFFFFF'} />
-          </Pressable>
+        <View style={styles.sideRight}>
+          <View style={styles.sideGroup}>
+            {zoomOpen
+              ? ZOOM_PRESETS.map((preset) => {
+                  const selected = Math.abs(zoom - preset.value) < 0.03;
+                  return (
+                    <Pressable
+                      key={preset.label}
+                      onPress={() => {
+                        setZoom(preset.value);
+                        setZoomOpen(false);
+                      }}
+                      style={[styles.sideZoomOption, selected && styles.zoomPillSelected]}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected }}
+                      accessibilityLabel={`Zoom ${preset.label}`}>
+                      <Text style={[styles.zoomText, selected && styles.zoomTextSelected]}>{preset.label}</Text>
+                    </Pressable>
+                  );
+                })
+              : null}
+            <Pressable
+              onPress={() => {
+                setZoomOpen((v) => !v);
+                setTimersOpen(false);
+              }}
+              style={[styles.sideZoomMain, zoomOpen && styles.zoomPillSelected]}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: zoomOpen }}
+              accessibilityLabel={zoomOpen ? 'Close zoom options' : `Zoom, currently ${currentZoomLabel}. Tap for zoom options.`}>
+              <Text style={[styles.zoomText, zoomOpen && styles.zoomTextSelected]}>{currentZoomLabel}</Text>
+              <Ionicons name={zoomOpen ? 'chevron-up' : 'chevron-down'} size={11} color={zoomOpen ? '#14141F' : '#FFFFFF'} />
+            </Pressable>
+          </View>
+
+          {countingDown === null && countIn === null ? (
+            <View style={styles.sideGroup}>
+              {timersOpen ? (
+                <View style={styles.timerPanel}>
+                  <Text style={styles.timerRowLabel}>Timer</Text>
+                  <View style={styles.timerChipRow}>
+                    {([0, 3, 5, 10] as const).map((value) => (
+                      <Pressable
+                        key={`timer-${value}`}
+                        onPress={() => {
+                          setCountdown(value);
+                          flashNotice(value === 0 ? 'Timer off — record starts straight away' : `Timer ${value}s — beeps each second`);
+                        }}
+                        style={[styles.miniChip, countdown === value && styles.miniChipSelected]}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected: countdown === value }}
+                        accessibilityLabel={`Camera timer ${value === 0 ? 'off' : `${value} seconds`}`}>
+                        <Text style={[styles.miniChipText, countdown === value && styles.miniChipTextSelected]}>
+                          {value === 0 ? 'Off' : `${value}s`}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  <Text style={styles.timerRowLabel}>Count-in</Text>
+                  <View style={styles.timerChipRow}>
+                    {([0, 4, 8] as const).map((value) => (
+                      <Pressable
+                        key={`countin-${value}`}
+                        onPress={() => {
+                          setCountInBeats(value);
+                          flashNotice(value === 0 ? 'Count-in off' : `Count-in ${value} beats — clicks each beat`);
+                        }}
+                        style={[styles.miniChip, countInBeats === value && styles.miniChipSelected]}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected: countInBeats === value }}
+                        accessibilityLabel={`Beat count-in ${value === 0 ? 'off' : `${value} beats`}`}>
+                        <Text style={[styles.miniChipText, countInBeats === value && styles.miniChipTextSelected]}>
+                          {value === 0 ? 'Off' : `${value}`}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+              <Pressable
+                onPress={() => {
+                  setTimersOpen((v) => !v);
+                  setZoomOpen(false);
+                }}
+                style={[styles.timerChip, timersOpen && styles.zoomPillSelected]}
+                accessibilityRole="button"
+                accessibilityState={{ expanded: timersOpen }}
+                accessibilityLabel={
+                  timersOpen
+                    ? 'Close timer options'
+                    : `Timers, timer ${countdown === 0 ? 'off' : `${countdown} seconds`}, count-in ${countInBeats === 0 ? 'off' : `${countInBeats} beats`}. Tap for timer options.`
+                }>
+                <Ionicons name="timer-outline" size={15} color={timersOpen ? '#14141F' : '#FFFFFF'} />
+                <Text style={[styles.timerChipText, timersOpen && styles.miniChipTextSelected]}>
+                  {countdown === 0 && countInBeats === 0
+                    ? 'Timer'
+                    : [countdown > 0 ? `${countdown}s` : null, countInBeats > 0 ? `♪${countInBeats}` : null]
+                        .filter(Boolean)
+                        .join(' · ')}
+                </Text>
+                <Ionicons name={timersOpen ? 'chevron-up' : 'chevron-down'} size={11} color={timersOpen ? '#14141F' : '#FFFFFF'} />
+              </Pressable>
+            </View>
+          ) : null}
         </View>
       ) : null}
 
@@ -840,7 +874,6 @@ const styles = StyleSheet.create({
     textShadowColor: 'rgba(0,0,0,0.5)',
     textShadowRadius: 8,
   },
-  flowStepsWrap: { position: 'absolute', alignSelf: 'center' },
   sideButtonLocked: { opacity: 0.45 },
   gridLineV: {
     position: 'absolute',
@@ -939,20 +972,36 @@ const styles = StyleSheet.create({
     textShadowColor: 'rgba(0,0,0,0.5)',
     textShadowRadius: 4,
   },
-  sideTimers: {
-    position: 'absolute',
-    left: spacing.md,
-    top: '36%',
-    gap: spacing.sm,
-    alignItems: 'flex-start',
-  },
-  sideZoom: {
+  sideRight: {
     position: 'absolute',
     right: spacing.md,
     top: '36%',
-    alignItems: 'center',
-    gap: 6,
+    alignItems: 'flex-end',
+    gap: spacing.md,
   },
+  sideGroup: { alignItems: 'center', gap: 6 },
+  timerPanel: {
+    backgroundColor: colors.material,
+    borderColor: colors.materialBorder,
+    borderWidth: 1,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    gap: 6,
+    width: 178,
+  },
+  timerRowLabel: { color: colors.labelSecondary, fontSize: 11, fontWeight: '700', letterSpacing: 0.6 },
+  timerChipRow: { flexDirection: 'row', gap: 5, marginBottom: 4 },
+  miniChip: {
+    backgroundColor: 'rgba(255,255,255,0.10)',
+    borderRadius: radius.pill,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    minWidth: 34,
+    alignItems: 'center',
+  },
+  miniChipSelected: { backgroundColor: 'rgba(255,255,255,0.92)' },
+  miniChipText: { color: colors.label, fontSize: 12, fontWeight: '700' },
+  miniChipTextSelected: { color: '#14141F' },
   sideZoomMain: {
     flexDirection: 'row',
     alignItems: 'center',

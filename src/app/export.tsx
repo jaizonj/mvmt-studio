@@ -4,7 +4,6 @@ import { useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { FlowSteps } from '../components/FlowSteps';
 import { TimelinePreview, type PreviewClip } from '../components/TimelinePreview';
 import { effectiveRegion } from '../lib/analysis';
 import { isCompositorAvailable, renderVideo, type CompositeResult } from '../lib/compositor';
@@ -114,9 +113,6 @@ export default function ExportScreen() {
         <Text style={styles.headerSubtitle}>
           {locked ? 'Locked — finish the earlier steps first' : `${timeline.length} clips · your cut`}
         </Text>
-        <View style={styles.stepsWrap}>
-          <FlowSteps current="export" takesCount={takes.length} cutCount={timeline.length} />
-        </View>
       </View>
 
       {locked ? (
@@ -247,7 +243,6 @@ const styles = StyleSheet.create({
   backText: { color: colors.accent, fontSize: 17 },
   largeTitle: { ...typeScale.largeTitle, color: colors.label },
   headerSubtitle: { ...typeScale.subhead, color: colors.labelSecondary, marginTop: 2 },
-  stepsWrap: { marginTop: spacing.lg, alignItems: 'flex-start' },
   section: { paddingHorizontal: spacing.xl, marginBottom: spacing.xl },
   sectionTitle: {
     ...typeScale.title2,

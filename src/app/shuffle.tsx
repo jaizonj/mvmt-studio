@@ -5,7 +5,6 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { FlowSteps } from '../components/FlowSteps';
 import { SegmentedControl } from '../components/SegmentedControl';
 import { SettingsSheetConnected } from '../components/SettingsSheetConnected';
 import { TimelinePreview, type PreviewClip } from '../components/TimelinePreview';
@@ -58,6 +57,10 @@ export default function ShuffleScreen() {
     return map;
   }, [takes]);
 
+  // Preview playhead position, reported by TimelinePreview — drives the
+  // timeline editor's playhead + auto-scroll.
+  const [previewProgress, setPreviewProgress] = useState<{ seconds: number; playing: boolean } | null>(null);
+
   // The cut drawn as a timeline strip — updates the moment a shuffle lands.
   const stripClips = useMemo(
     () =>
@@ -69,6 +72,8 @@ export default function ShuffleScreen() {
           id: clip.id,
           label: `Take ${takeIndexById.get(clip.takeId) ?? ''}`,
           lengthSeconds: Math.max(0, end - start),
+          sourceUri: take?.uri,
+          sourceStartSeconds: start,
         };
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -95,7 +100,7 @@ export default function ShuffleScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [timeline, takes],
   );
-  const previewKey = previewClips.map((c) => `${c.id}:${c.trimStartSeconds}-${c.trimEndSeconds ?? ''}:${c.muted ? 'm' : ''}${c.volume ?? ''}`).join('|');
+  const previewKey = previewClips.map((c) => `${c.id}:${c.uri}:${c.trimStartSeconds}-${c.trimEndSeconds ?? ''}:${c.muted ? 'm' : ''}${c.volume ?? ''}`).join('|');
 
   const locked = takes.length === 0;
   const hasCut = timeline.length > 0;
@@ -125,6 +130,11 @@ export default function ShuffleScreen() {
       takes.map((t) => ({ id: t.id, energy: takeEnergies.get(t.id) ?? t.energy ?? 0.5 })),
       {
         candidates: 32,
+        // The chosen frequency IS the minimum shot length: Rapid must be
+        // allowed to cut every ~0.5s. Leaving the engine's 2.5s default
+        // here silently swallowed the frequency (device test 2026-11-08:
+        // "almost every beat" produced one full-length cut).
+        minShotSeconds: targetLength,
         previousSequence: lastShuffle?.takeSequence ?? (timeline.length ? timeline.map((c) => c.takeId) : undefined),
       },
     );
@@ -190,9 +200,7 @@ export default function ShuffleScreen() {
             Remix your takes into a cut
             {timeline.length ? ` · ${timeline.length} clips in your cut` : ''}
           </Text>
-          <View style={styles.stepsWrap}>
-            <FlowSteps current="shuffle" takesCount={takes.length} cutCount={timeline.length} />
-          </View>
+
         </View>
 
         {locked ? (
@@ -219,6 +227,7 @@ export default function ShuffleScreen() {
                   clips={previewClips}
                   trackUri={track?.uri}
                   trackStartSeconds={(effectiveRegion(studio.trackRegion, track?.durationSeconds)?.startSeconds ?? 0) + studio.audioOffsetMs / 1000}
+                  onProgress={(seconds, playing) => setPreviewProgress({ seconds, playing })}
                 />
                 {shimmering ? (
                   <LinearGradient
@@ -250,6 +259,8 @@ export default function ShuffleScreen() {
                   clips={stripClips}
                   selectedClipId={selectedClipId}
                   onSelectClip={(id) => setSelectedClipId((cur) => (cur === id ? null : id))}
+                  playbackSeconds={previewProgress?.seconds ?? null}
+                  isPlaying={previewProgress?.playing ?? false}
                 />
                 {selectedClipId && timeline.some((c) => c.id === selectedClipId) ? (
                   <View style={styles.takePicker}>
@@ -389,7 +400,6 @@ const styles = StyleSheet.create({
   gearButton: { padding: 6, marginBottom: spacing.xs },
   largeTitle: { ...typeScale.largeTitle, color: colors.label },
   headerSubtitle: { ...typeScale.subhead, color: colors.labelSecondary, marginTop: 2 },
-  stepsWrap: { marginTop: spacing.lg, alignItems: 'flex-start' },
   section: { paddingHorizontal: spacing.xl, marginBottom: spacing.xl },
   previewWrap: { position: 'relative' },
   shimmer: {

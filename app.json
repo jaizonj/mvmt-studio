@@ -71,7 +71,8 @@
           "supportsPictureInPicture": false
         }
       ],
-      "expo-sharing"
+      "expo-sharing",
+      "expo-image"
     ],
     "scheme": "mvmtstudio",
     "slug": "mvmt-studio",

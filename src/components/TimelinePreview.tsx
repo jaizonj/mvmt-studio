@@ -29,6 +29,12 @@ interface TimelinePreviewProps {
   trackUri?: string | null;
   /** Absolute track time the selected region starts at (default 0). */
   trackStartSeconds?: number;
+  /**
+   * Playback position within the EDIT (seconds from the cut's start),
+   * reported while playing and whenever the position jumps — drives the
+   * timeline editor's playhead.
+   */
+  onProgress?: (editSeconds: number, playing: boolean) => void;
 }
 
 /**
@@ -41,10 +47,31 @@ interface TimelinePreviewProps {
  * Mount it with a `key` that changes when the edit changes, so it always
  * starts from a clean player.
  */
-export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0 }: TimelinePreviewProps) {
+export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0, onProgress }: TimelinePreviewProps) {
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const indexRef = useRef(0);
+  const playingRef = useRef(false);
+  const onProgressRef = useRef(onProgress);
+  useEffect(() => {
+    onProgressRef.current = onProgress;
+  }, [onProgress]);
+
+  const clipLength = (clip: PreviewClip) =>
+    Math.max(0, (clip.trimEndSeconds ?? clip.durationSeconds ?? 0) - clip.trimStartSeconds);
+  const editOffsetOf = (i: number) => clips.slice(0, i).reduce((sum, c) => sum + clipLength(c), 0);
+
+  /** Current position inside the whole edit, for the timeline playhead. */
+  const reportProgress = useCallback(() => {
+    const clip = clips[indexRef.current];
+    if (!clip || !onProgressRef.current) return;
+    const within = Math.min(
+      Math.max(0, videoPlayer.currentTime - clip.trimStartSeconds),
+      clipLength(clip),
+    );
+    onProgressRef.current(editOffsetOf(indexRef.current) + within, playingRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clips]);
 
   const videoPlayer = useVideoPlayer(clips[0]?.uri ?? null, (player) => {
     player.loop = false;
@@ -66,6 +93,7 @@ export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0 }: Time
     } catch {
       /* player already released */
     }
+    playingRef.current = false;
     setPlaying(false);
   }, [videoPlayer, audioPlayer]);
 
@@ -103,6 +131,7 @@ export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0 }: Time
     // expo-video seeks by assigning currentTime (documented API).
     videoPlayer.currentTime = clip.trimStartSeconds;
     if (autoplay) videoPlayer.play();
+    reportProgress();
   };
 
   // Poll for trim-out points / natural ends.
@@ -111,6 +140,7 @@ export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0 }: Time
     const timer = setInterval(() => {
       const clip = clips[indexRef.current];
       if (!clip) return;
+      reportProgress();
       if (videoPlayer.currentTime >= clipEnd(clip) - 0.05) {
         const next = indexRef.current + 1;
         if (next < clips.length) {
@@ -118,6 +148,7 @@ export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0 }: Time
         } else {
           videoPlayer.pause();
           audioPlayer.pause();
+          playingRef.current = false;
           setPlaying(false);
           void startClip(0, false);
         }
@@ -131,7 +162,9 @@ export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0 }: Time
     if (playing) {
       videoPlayer.pause();
       audioPlayer.pause();
+      playingRef.current = false;
       setPlaying(false);
+      reportProgress();
       return;
     }
     await startClip(indexRef.current, false);
@@ -144,7 +177,9 @@ export function TimelinePreview({ clips, trackUri, trackStartSeconds = 0 }: Time
       audioPlayer.play();
     }
     videoPlayer.play();
+    playingRef.current = true;
     setPlaying(true);
+    reportProgress();
   };
 
   if (clips.length === 0) return null;

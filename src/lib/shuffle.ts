@@ -84,24 +84,32 @@ function takeEnergyForSection(take: ShuffleTakeInput, sectionIndex: number): num
 }
 
 /**
- * Build shot windows from sections: merge sections that are too short into
- * the previous shot (minimum shot length), then — per candidate — randomly
- * merge some adjacent windows so shot lengths vary between candidates
- * instead of cutting on every phrase like a metronome.
+ * Build shot windows from sections: accumulate consecutive sections into
+ * a window until it reaches the minimum shot length, then CLOSE it and
+ * start the next one — then, per candidate, randomly merge some adjacent
+ * windows so shot lengths vary instead of cutting like a metronome.
+ *
+ * REGRESSION GUARD (device test, 2026-11-08): the previous version merged
+ * every too-short section into the previous window without ever closing
+ * it. Whenever sections were shorter than minShotSeconds — e.g. Rapid
+ * frequency's 0.5s sections against the 2.5s default minimum — the whole
+ * track collapsed into ONE window and the "shuffle" came out as a single
+ * full-length cut with no cuts at all. Accumulate-and-close is the fix:
+ * a 15s track at the default minimum now yields ~6 windows, and at
+ * minShot = section length it yields one window per section.
  */
 function buildWindows(sections: MusicalSection[], minShotSeconds: number, random: () => number): ShotWindow[] {
   const base: ShotWindow[] = [];
   for (const section of sections) {
     const length = section.endSeconds - section.startSeconds;
     const last = base[base.length - 1];
-    if (last && length < minShotSeconds) {
-      // Too short to stand alone — extend the previous shot over it.
-      const total = last.endSeconds - last.startSeconds + length;
-      last.energy = (last.energy * (last.endSeconds - last.startSeconds) + section.energy * length) / total;
-      last.endSeconds = section.endSeconds;
-    } else if (last && last.endSeconds - last.startSeconds < minShotSeconds) {
-      const total = last.endSeconds - last.startSeconds + length;
-      last.energy = (last.energy * (last.endSeconds - last.startSeconds) + section.energy * length) / total;
+    const lastLength = last ? last.endSeconds - last.startSeconds : 0;
+    if (last && lastLength < minShotSeconds) {
+      // The open window is still below the minimum — extend it over this
+      // section (length-weighted energy). It closes on a later iteration
+      // once it reaches minShotSeconds.
+      const total = lastLength + length;
+      last.energy = total > 0 ? (last.energy * lastLength + section.energy * length) / total : section.energy;
       last.endSeconds = section.endSeconds;
     } else {
       base.push({
@@ -112,12 +120,30 @@ function buildWindows(sections: MusicalSection[], minShotSeconds: number, random
       });
     }
   }
-  // Randomly merge adjacent windows (never the result below min length —
-  // merging only ever lengthens) for shot-length variety across candidates.
+  // A short final tail shouldn't end the edit on a stub — fold it into
+  // the previous window (unless it's the only window there is).
+  if (base.length > 1) {
+    const tail = base[base.length - 1];
+    const tailLength = tail.endSeconds - tail.startSeconds;
+    if (tailLength < minShotSeconds * 0.6) {
+      const prev = base[base.length - 2];
+      const prevLength = prev.endSeconds - prev.startSeconds;
+      const total = prevLength + tailLength;
+      prev.energy = total > 0 ? (prev.energy * prevLength + tail.energy * tailLength) / total : prev.energy;
+      prev.endSeconds = tail.endSeconds;
+      base.pop();
+    }
+  }
+  // Randomly merge adjacent windows for shot-length variety across
+  // candidates — but CAP the merged length at ~2.2x the minimum. Without
+  // the cap, a lucky candidate could merge its way down to a couple of
+  // long shots and win on score, silently overriding the cut rate the
+  // user picked with the frequency control (device test, 2026-11-08).
   const windows: ShotWindow[] = [];
   for (let i = 0; i < base.length; i++) {
     const prev = windows[windows.length - 1];
-    if (prev && random() < 0.22) {
+    const mergedLength = prev ? base[i].endSeconds - prev.startSeconds : 0;
+    if (prev && random() < 0.22 && mergedLength <= minShotSeconds * 2.2) {
       prev.endSeconds = base[i].endSeconds;
     } else {
       windows.push({ ...base[i] });
@@ -162,6 +188,7 @@ function scoreSequence(
   sequence: string[],
   takesById: Map<string, ShuffleTakeInput>,
   previousSequence: string[] | undefined,
+  minShotSeconds: number,
 ): number {
   if (windows.length === 0) return 0;
 
@@ -174,13 +201,15 @@ function scoreSequence(
   }
   const energyScore = (energyTotal / windows.length) * 40;
 
-  // Cut alignment (15 pts): every window starts on a section/phrase
-  // boundary by construction; score drops if shots are uniformly tiny
-  // (flickery) — windows below the min length were already merged, so this
-  // rewards edits whose shortest shot still breathes.
+  // Cut alignment (15 pts): every window starts on a section boundary by
+  // construction. Judged RELATIVE to the requested minimum shot length:
+  // full marks once the shortest shot is ~1.5x the minimum. (An absolute
+  // yardstick here made long shots always outscore short ones, so at
+  // fast frequencies the winner was whichever candidate cut LEAST —
+  // the opposite of what the user asked for.)
   const lengths = windows.map((w) => w.endSeconds - w.startSeconds);
   const minLength = Math.min(...lengths);
-  const alignmentScore = clamp(minLength / 3, 0, 1) * 15;
+  const alignmentScore = clamp(minLength / (Math.max(minShotSeconds, 0.05) * 1.5), 0, 1) * 15;
 
   // Shot-length variety (15 pts): uniform lengths read as mechanical.
   const mean = lengths.reduce((a, b) => a + b, 0) / lengths.length;
@@ -233,7 +262,7 @@ export function generateShuffle(
     const windows = buildWindows(sections, minShotSeconds, random);
     if (windows.length === 0) continue;
     const sequence = generateCandidate(windows, takes, previousSequence, random);
-    const score = scoreSequence(windows, sequence, takesById, previousSequence);
+    const score = scoreSequence(windows, sequence, takesById, previousSequence, minShotSeconds);
     evaluated += 1;
     if (!best || score > best.score) best = { sequence, windows, score };
   }

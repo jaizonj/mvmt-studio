@@ -115,3 +115,30 @@ test('take energy heuristic ranks busier files higher', () => {
   assert.ok(energies.get('busy') > energies.get('still'));
   assert.ok(energies.get('unknown') >= 0 && energies.get('unknown') <= 1);
 });
+
+test('REGRESSION: sections shorter than the default minimum still produce many cuts', () => {
+  // Device test 2026-11-08: Rapid frequency subdivides to 0.5s sections,
+  // and the old buildWindows merged them ALL into one window — a 15s
+  // "shuffle" came out as a single full-length cut. With the engine's
+  // default 2.5s minimum, 0.5s sections must accumulate into ~2.5s shots.
+  const sections = sectionsFromEnergies(new Array(30).fill(0.5), 0.5); // 15s of 0.5s sections
+  const out = generateShuffle(sections, takes, { random: seededRandom(11) });
+  assert.ok(out);
+  assert.ok(out.slots.length >= 4, `expected several cuts, got ${out.slots.length}`);
+  assert.equal(out.slots[0].startSeconds, 0);
+  assert.equal(out.slots[out.slots.length - 1].endSeconds, 15);
+  for (let i = 1; i < out.slots.length; i++) {
+    assert.equal(out.slots[i].startSeconds, out.slots[i - 1].endSeconds, 'slots must be contiguous');
+  }
+});
+
+test('rapid frequency (minShot = section length) cuts almost every beat', () => {
+  const sections = sectionsFromEnergies(new Array(30).fill(0.5), 0.5); // 15s
+  const out = generateShuffle(sections, takes, { random: seededRandom(5), minShotSeconds: 0.5 });
+  assert.ok(out);
+  // Random variety merges may join a few neighbours, but a 15s rapid
+  // shuffle must land in double digits — never one big cut.
+  assert.ok(out.slots.length >= 15, `expected 15+ cuts, got ${out.slots.length}`);
+  const distinct = new Set(out.slots.map((s) => s.takeId));
+  assert.ok(distinct.size >= 2, 'rapid shuffle should actually switch takes');
+});
