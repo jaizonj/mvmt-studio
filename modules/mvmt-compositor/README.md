@@ -105,3 +105,74 @@ reinstall pods as usual (`npx expo prebuild`, `npx pod-install`).
 - No new JS dependencies: `expo` (for `requireOptionalNativeModule`) is
   already in the app; native side depends only on AVFoundation +
   ExpoModulesCore.
+
+---
+
+## v2 — Overhaul spec (Phase 1 contract, 2026-11-08)
+
+The TS contract for everything below already exists in `src/index.ts`.
+The Swift implementation must match it exactly. One internal builder —
+`buildComposition(request) -> (composition, videoComposition, audioMix)` —
+is shared by export AND preview. Nothing else in the app builds
+compositions.
+
+### Shared builder requirements
+- **Project canvas**: request `canvasWidth/canvasHeight` (default
+  1080×1920). EVERY segment is normalised into the canvas: apply the
+  source track's `preferredTransform`, compute its display size, then
+  scale ASPECT-FILL (max scale factor, never stretch) and centre.
+  Compose the final per-segment layer transform from those steps —
+  the v1 behaviour (raw preferredTransform, first-clip canvas) is gone.
+- **Frame rate**: `videoComposition.frameDuration = 1/request.frameRate`
+  (default 30).
+- **Validation/clamping**: clamp every clip's range to its asset's real
+  duration (load `.duration` / track timeRange). If a clip's clamped
+  range is empty, throw an error naming the clip index. Never insert a
+  range past the end of a source track.
+- **Master audio**: inserted exactly once, from `audioStartSeconds`,
+  clamped to the total video duration and to what remains of the file.
+- **Clip audio**: only for clips with `muted == false && volume > 0`
+  (the app mutes takes by default — song-only is the product default).
+
+### renderVideo (export)
+- Uses the shared builder + `AVAssetExportSession` (highest quality
+  preset compatible with the videoComposition; keep `.mp4` output).
+- **Progress + cancellation**: when the request carries `exportId`,
+  register the session so `cancelExport(exportId)` can cancel it, and
+  emit `onExportProgress { exportId, progress }` events (poll
+  `exporter.progress` on a timer while exporting; always emit a final
+  1.0 or the terminal error path cleans up without it).
+- **Measured result**: after export completes, load the WRITTEN file
+  and return its measured duration and display size. Never return the
+  requested duration.
+
+### inspectAsset(uri)
+Return `{ durationSeconds, width, height, frameRate, hasVideo, hasAudio }`
+— duration from the asset, display size = naturalSize with
+preferredTransform applied, frameRate = nominalFrameRate of the first
+video track.
+
+### Native preview
+- `createPreview(request) -> previewId`: build the composition with the
+  shared builder, create an `AVPlayer` + `AVPlayerItem` (with the
+  videoComposition and audioMix applied), store it in a registry keyed
+  by a generated id. Emit `onPreviewStatus { previewId, status }`
+  transitions (loading → ready; playing/paused from rate/KVO;
+  ended at item end; error with message).
+- `setPreviewPaused(previewId, paused)`, `seekPreview(previewId, seconds)`
+  (tolerance 0 seek — cut-accurate), `releasePreview(previewId)`
+  (pause, remove observers, drop from registry).
+- Position: a periodic time observer (0.25s) emitting
+  `onPreviewProgress { previewId, positionSeconds, durationSeconds, playing }`.
+  INFORMATIONAL ONLY — playback never depends on JS.
+- View: register an Expo view named `MvmtPreviewView` with a single
+  prop `previewId: String`; it renders the registered player's
+  `AVPlayerLayer` (resize/gravity = aspect fill) and re-attaches when
+  the prop changes. Layer must size to the view's bounds.
+- Module definition must declare `Events("onExportProgress",
+  "onPreviewProgress", "onPreviewStatus")` and the view.
+
+### Errors
+All failures throw `NSError` in the `MvmtCompositor` domain with a
+human-readable message naming the failing clip/step. No force-unwraps
+on asset data.

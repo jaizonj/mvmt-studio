@@ -1,41 +1,45 @@
 /**
- * MVMT Studio design tokens — native iOS / Human Interface direction.
+ * MVMT Studio design tokens — Overhaul design system (2026-11-08).
  *
- * Principles (from Jaizon's brief):
- * - Look like an Apple-made app: system font (no custom fontFamily anywhere —
- *   React Native uses SF Pro on iOS by default), large titles, generous
- *   spacing, grouped lists, bottom sheets.
- * - Restrained palette: near-black base, white/grey labels, ONE accent.
- * - Iridescent is an accent only — a thin gradient ring / hairline / selected
- *   state — never big rainbow surfaces.
- * - Camera controls are translucent materials (blur + tint), like iOS system
- *   overlays, so the picture always shows through.
+ * Identity: a premium, music-first creative studio.
+ * - Deep graphite surfaces (#101114 family), warm-white text (#F4F1E9),
+ *   ONE accent: acid lime (#C9F36B). No competing accent colours, no
+ *   decorative gradients on surfaces (the record ring keeps a subtle
+ *   lime ramp — the single sanctioned gradient).
+ * - System font only (SF Pro on iOS by default — no fontFamily anywhere).
+ * - Restrained borders, consistent radii, generous spacing, large
+ *   cinematic media areas. References: Apple Camera (capture clarity),
+ *   Final Cut Pro (editor gravity), CapCut (approachability) — with a
+ *   distinct MVMT voice, not a copy of any of them.
+ *
+ * Token NAMES are stable across the overhaul so screens can be
+ * redesigned one at a time against the same surface.
  */
 export const colors = {
-  base: '#000000',
-  groupedBackground: '#0B0B10',
-  card: '#17171F',
-  cardPressed: '#22222C',
-  separator: 'rgba(255,255,255,0.12)',
+  base: '#101114',
+  groupedBackground: '#101114',
+  card: '#17181D',
+  cardPressed: '#1F2026',
+  elevated: '#1D1E24',
+  separator: 'rgba(244,241,233,0.10)',
 
-  label: '#FFFFFF',
-  // Raised from 0.6/0.3 (Jaizon's device test: not enough contrast over
-  // bright video and dark cards alike).
-  labelSecondary: 'rgba(235,235,245,0.82)',
-  labelTertiary: 'rgba(235,235,245,0.5)',
+  label: '#F4F1E9',
+  labelSecondary: 'rgba(244,241,233,0.68)',
+  labelTertiary: 'rgba(244,241,233,0.42)',
 
-  // Translucent materials over the camera (pair with BlurView). Darkened
-  // from 0.55 alpha — controls washed out over bright scenes.
-  material: 'rgba(16,16,24,0.78)',
-  materialBorder: 'rgba(255,255,255,0.38)',
+  // Translucent materials over the camera, so the picture shows through.
+  material: 'rgba(16,17,20,0.78)',
+  materialBorder: 'rgba(244,241,233,0.22)',
 
-  accent: '#B9A7FF', // soft iridescent violet — the single accent colour
-  accentDim: 'rgba(185,167,255,0.22)',
+  accent: '#C9F36B', // acid lime — the single accent colour
+  accentDim: 'rgba(201,243,107,0.16)',
+  /** Text/icons drawn ON the accent colour. */
+  onAccent: '#14160C',
   danger: '#FF453A', // iOS system red
-  success: '#30D158', // iOS system green
+  success: '#7BD88F',
 
-  /** Thin iridescent gradient — record ring, hairlines, selected chips only. */
-  iridescent: ['#F5C6FF', '#B9C8FF', '#A9EFFF', '#C2FFDF'] as const,
+  /** The one sanctioned gradient (record ring / key selected states). */
+  iridescent: ['#E9FFA8', '#C9F36B', '#A8E04A', '#C9F36B'] as const,
 };
 
 export const spacing = {
@@ -48,7 +52,7 @@ export const spacing = {
   xxxl: 40,
 };
 
-/** iOS large-title / headline / body scale. No fontFamily: system font only. */
+/** Type scale — system font, MVMT weights. */
 export const type = {
   largeTitle: { fontSize: 34, fontWeight: '700' as const, letterSpacing: 0.2 },
   title2: { fontSize: 22, fontWeight: '700' as const },
@@ -59,6 +63,7 @@ export const type = {
   caption: { fontSize: 12, fontWeight: '500' as const },
 };
 
+/** One radius scale everywhere — no per-screen improvisation. */
 export const radius = {
   sm: 8,
   md: 12,
