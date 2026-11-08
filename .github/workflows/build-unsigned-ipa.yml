@@ -7,6 +7,7 @@
 # in — sideloaded apps run their native code normally.
 #
 # Trigger manually (Actions tab -> this workflow -> Run workflow) so
+# (registered 2026-11-08)
 # free macOS minutes are only spent on real builds.
 name: Build unsigned IPA (for Sideloadly)
 
