@@ -25,6 +25,7 @@ export {
   setPreviewPaused,
   startCapture,
   stopCapture,
+  waveformPeaks,
   type AssetInfo,
   type CapturePreviewProps,
   type CaptureResult,
@@ -38,4 +39,5 @@ export {
   type PreviewStatusEvent,
   type TakeSyncMeasurement,
   type TakeSyncStatus,
+  type WaveformPeaks,
 } from '../../modules/mvmt-compositor/src/index';

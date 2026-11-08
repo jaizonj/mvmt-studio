@@ -181,6 +181,18 @@ struct TakeSyncMeasurementRecord: Record {
   var peakRatio: Double? = nil
 }
 
+struct WaveformPeaksRecord: Record {
+  /// Normalised per-bucket peak amplitudes (0..1, small floor applied
+  /// natively so quiet sections still render as tiny bars), evenly
+  /// spaced across the track's duration.
+  @Field
+  var peaks: [Double] = []
+
+  /// The track's duration in seconds — the span the buckets cover.
+  @Field
+  var durationSeconds: Double = 0
+}
+
 // MARK: - Errors
 
 private func compositorError(_ message: String) -> NSError {
@@ -1058,6 +1070,106 @@ private enum MvmtCompositorEngine {
       start += syncEnvelopeHopSamples
     }
     return bestStart
+  }
+
+  // MARK: Waveform peaks (real decoded peaks)
+  //
+  // The Record screen's track strip and the audio-region picker draw
+  // the song's waveform from these peaks. Decoded with the same
+  // AVAssetReader setup as the sync measurement (8kHz mono 16-bit
+  // LinearPCM), but STREAMING: each sample folds into a per-bucket
+  // max-abs accumulator as it arrives, so only one sample buffer plus
+  // `buckets` floats are ever held — a long song is never fully
+  // decoded into memory. Peaks are normalised by the global maximum
+  // and floored so quiet sections still render as tiny bars.
+  //
+  // Every failure (no audio track, unreadable/undecodable file) returns
+  // nil rather than throwing: the JS side falls back to its
+  // deterministic stand-in bars.
+
+  /// Floor for normalised peaks — quiet sections stay visible.
+  private static let waveformPeakFloor: Double = 0.06
+  /// Decode rate for peak extraction. Peaks are bucket maxima over
+  /// ≥100ms spans at the bucket counts the UI requests, so the sync
+  /// measurement's 8kHz costs nothing visually and keeps long songs
+  /// fast.
+  private static let waveformSampleRate: Double = 8000
+
+  static func waveformPeaks(uri: String, buckets: Int) async -> WaveformPeaksRecord? {
+    let bucketCount = min(max(buckets, 8), 1024)
+    do {
+      let asset = AVURLAsset(url: resolveURL(uri))
+      let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+      guard let track = audioTracks.first else { return nil }
+      let timeRange = try await track.load(.timeRange)
+      let duration = CMTimeGetSeconds(timeRange.duration)
+      guard duration.isFinite, duration > 0 else { return nil }
+
+      let reader = try AVAssetReader(asset: asset)
+      reader.timeRange = timeRange
+      let outputSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVLinearPCMBitDepthKey: 16,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsFloatKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+        AVSampleRateKey: Int(waveformSampleRate),
+        AVNumberOfChannelsKey: 1,
+      ]
+      let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+      output.alwaysCopiesSampleData = false
+      guard reader.canAdd(output) else { return nil }
+      reader.add(output)
+      guard reader.startReading() else { return nil }
+
+      // Bucket b covers decoded samples [b × samplesPerBucket,
+      // (b+1) × samplesPerBucket) — sample 0 sits at the track
+      // timeRange start, so a running counter maps directly onto
+      // buckets spanning the track duration.
+      var maxima = [Float](repeating: 0, count: bucketCount)
+      let samplesPerBucket = duration * waveformSampleRate / Double(bucketCount)
+      var decodedSamples = 0
+      while let sampleBuffer = output.copyNextSampleBuffer() {
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+        let byteLength = CMBlockBufferGetDataLength(blockBuffer)
+        let sampleCount = byteLength / 2 // 16-bit mono
+        guard sampleCount > 0 else { continue }
+        var int16Samples = [Int16](repeating: 0, count: sampleCount)
+        let copyStatus = int16Samples.withUnsafeMutableBytes { pointer -> OSStatus in
+          guard let baseAddress = pointer.baseAddress else { return OSStatus(-1) }
+          return CMBlockBufferCopyDataBytes(
+            blockBuffer,
+            atOffset: 0,
+            dataLength: sampleCount * 2,
+            destination: baseAddress
+          )
+        }
+        guard copyStatus == noErr else { return nil }
+        for value in int16Samples {
+          let bucket = min(bucketCount - 1, Int(Double(decodedSamples) / samplesPerBucket))
+          // Convert BEFORE abs: |Int16.min| overflows in Int16.
+          let magnitude = abs(Float(value) / 32768.0)
+          if magnitude > maxima[bucket] {
+            maxima[bucket] = magnitude
+          }
+          decodedSamples += 1
+        }
+      }
+      if reader.status == .failed { return nil }
+      guard decodedSamples > 0 else { return nil }
+
+      let globalMax = maxima.max() ?? 0
+      let peaks: [Double] = maxima.map { raw in
+        let normalised = globalMax > 0 ? Double(raw) / Double(globalMax) : 0
+        return max(waveformPeakFloor, normalised)
+      }
+      let record = WaveformPeaksRecord()
+      record.peaks = peaks
+      record.durationSeconds = duration
+      return record
+    } catch {
+      return nil
+    }
   }
 }
 
@@ -2386,6 +2498,10 @@ public class MvmtCompositorModule: Module {
         expectedSongPositionAtTakeStartSeconds: expectedSongPositionAtTakeStartSeconds,
         searchWindowSeconds: searchWindowSeconds
       )
+    }
+
+    AsyncFunction("waveformPeaks") { (uri: String, buckets: Int) -> WaveformPeaksRecord? in
+      await MvmtCompositorEngine.waveformPeaks(uri: uri, buckets: buckets)
     }
 
     Function("isCaptureAvailable") { () -> Bool in

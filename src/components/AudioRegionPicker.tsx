@@ -1,10 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useAudioPlayer } from 'expo-audio';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 
 import { effectiveRegion } from '../lib/analysis';
+import { loadTrackPeaks, samplePeaks, standinPeaks } from '../lib/waveform';
 import { useStudio } from '../store/StudioContext';
 import { colors, formatTime, radius, spacing } from '../theme';
 
@@ -29,9 +30,12 @@ const BAR_COUNT = 48;
  * The selection lives in the studio store (AudioRegion) — recording,
  * shuffle sectioning and the editor all read that same value.
  *
- * Waveform note: the bars are a deterministic STAND-IN drawn from the
- * track name (real decoded waveform peaks are a TODO — see README). The
- * window geometry, labels and preview are fully real.
+ * Waveform note: the bars are REAL decoded peaks (the native
+ * `waveformPeaks` via src/lib/waveform.ts), resampled to BAR_COUNT.
+ * When the native engine is unavailable (Expo Go / older builds) or a
+ * file can't be decoded, they fall back to the deterministic stand-in
+ * drawn from the track name. The window geometry, labels and preview
+ * are fully real either way.
  */
 export function AudioRegionPicker() {
   const { track, trackRegion, setTrackRegion } = useStudio();
@@ -43,13 +47,24 @@ export function AudioRegionPicker() {
 
   const player = useAudioPlayer(track?.uri ?? null);
 
-  const bars = useMemo(() => {
-    const seed = (track?.name ?? 'track').split('').reduce((a, c) => a + c.charCodeAt(0), 0);
-    return Array.from({ length: BAR_COUNT }, (_, i) => {
-      const v = Math.abs(Math.sin(seed * 0.13 + i * 0.9)) * 0.6 + Math.abs(Math.sin(seed + i * 0.37)) * 0.4;
-      return 0.25 + v * 0.75;
+  // Bars are the real decoded peaks once they land (stored tagged
+  // with their uri); until then — and on any track switch — they are
+  // the stand-in, so first paint is exactly what it always was.
+  const [loadedBars, setLoadedBars] = useState<{ uri: string; bars: number[] } | null>(null);
+  const trackUri = track?.uri;
+  const trackName = track?.name;
+  useEffect(() => {
+    if (!trackUri || !trackName) return;
+    let alive = true;
+    void loadTrackPeaks({ uri: trackUri, name: trackName }).then((loaded) => {
+      if (alive) setLoadedBars({ uri: trackUri, bars: samplePeaks(loaded, BAR_COUNT) });
     });
-  }, [track?.name]);
+    return () => {
+      alive = false;
+    };
+  }, [trackUri, trackName]);
+  const bars =
+    loadedBars && loadedBars.uri === trackUri ? loadedBars.bars : standinPeaks(trackName ?? 'track', BAR_COUNT);
 
   // Never leave a preview playing after the picker unmounts (sheet closed).
   useEffect(() => {
@@ -155,7 +170,7 @@ export function AudioRegionPicker() {
         })}
       </View>
 
-      {/* Waveform stand-in with draggable window */}
+      {/* Waveform (real decoded peaks) with draggable window */}
       <Pressable
         style={styles.barWrap}
         onLayout={(e) => setBarWidth(e.nativeEvent.layout.width)}
@@ -191,7 +206,7 @@ export function AudioRegionPicker() {
           <Text style={styles.previewButtonText}>{previewing ? 'Stop' : 'Preview'}</Text>
         </Pressable>
       </View>
-      <Text style={styles.note}>Drag the highlighted part to move it. Waveform is a preview stand-in for now.</Text>
+      <Text style={styles.note}>Drag the highlighted part to move it.</Text>
     </View>
   );
 }

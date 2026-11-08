@@ -45,6 +45,7 @@ import {
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import type { Take } from '../../types';
 import { measureTakeDurationSeconds, persistTake, pickAudioTrack } from '../../lib/media';
+import { loadTrackPeaks, samplePeaks, standinPeaks } from '../../lib/waveform';
 import { useStudio } from '../../store/StudioContext';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
@@ -254,6 +255,27 @@ export default function CameraScreen() {
       alive = false;
     };
   }, [takes]);
+
+  // Track-strip waveform peaks: REAL decoded peaks (lib/waveform),
+  // stored tagged with the uri they belong to; the strip reads the
+  // ones matching the CURRENT track and renders the stand-in until
+  // they land, so it is never empty and a new track never shows the
+  // previous track's waveform.
+  const [loadedPeaks, setLoadedPeaks] = useState<{ uri: string; peaks: number[] } | null>(null);
+  const trackUri = track?.uri;
+  const trackName = track?.name;
+  useEffect(() => {
+    if (!trackUri || !trackName) return;
+    let alive = true;
+    void loadTrackPeaks({ uri: trackUri, name: trackName }).then((peaks) => {
+      if (alive) setLoadedPeaks({ uri: trackUri, peaks });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [trackUri, trackName]);
+  const trackPeaks = loadedPeaks && loadedPeaks.uri === trackUri ? loadedPeaks.peaks : null;
+
   const railPreviewTake = railPreviewId ? (takes.find((t) => t.id === railPreviewId) ?? null) : null;
   const edlTakeIds = useMemo(() => new Set((studio.edl?.segments ?? []).map((seg) => seg.takeId)), [studio.edl]);
   const [appActive, setAppActive] = useState(true);
@@ -1084,6 +1106,23 @@ export default function CameraScreen() {
 
   const regionEffForLabel = effectiveRegion(studio.trackRegion, track?.durationSeconds);
 
+  // Track-strip bars: STRIP_BAR_COUNT across the strip, resampled
+  // (max) from the loaded peaks — or from the stand-in until the
+  // decode lands. A bar is "in region" when its CENTRE falls inside
+  // the effective region (regionEffForLabel — the same region source
+  // the record flow and the length row use).
+  const STRIP_BAR_COUNT = 72;
+  const stripSourcePeaks = track ? (trackPeaks ?? standinPeaks(track.name, 120)) : [];
+  const stripBars = samplePeaks(stripSourcePeaks, STRIP_BAR_COUNT).map((peak, i) => {
+    const duration = track?.durationSeconds ?? 0;
+    const centreSeconds = duration > 0 ? ((i + 0.5) / STRIP_BAR_COUNT) * duration : 0;
+    const inRegion =
+      regionEffForLabel !== null &&
+      centreSeconds >= regionEffForLabel.startSeconds &&
+      centreSeconds <= regionEffForLabel.endSeconds;
+    return { key: i, height: Math.max(3, peak * 24), inRegion };
+  });
+
   // Rail preview card: with a track loaded, the preview is
   // SONG-REFERENCED (calibrationPreviewFor — the take plays against
   // the master song exactly as the editor would cut it) so sync can
@@ -1151,18 +1190,11 @@ export default function CameraScreen() {
         </View>
       ) : null}
 
-      {/* Top bar — track pill centred, Settings gear to the side. All material/blur. */}
+      {/* Top bar — Settings gear left, flash/flip right. The track
+          itself lives in the transparent waveform strip below (the
+          green track pill is gone — Jaizon, 2026-11-09). */}
       <View style={[styles.topBar, { top: insets.top + spacing.sm }]}>
         <IconButton icon="settings-outline" accessibilityLabel="Settings" onPress={() => router.push('/settings')} />
-        <Pressable style={styles.trackPill} onPress={() => setTrackOpen(true)} accessibilityRole="button">
-          <Ionicons name={track ? 'musical-notes' : 'add'} size={16} color={colors.onAccent} />
-          <Text style={styles.trackPillText} numberOfLines={1}>
-            {track ? track.name : 'Add a track'}
-          </Text>
-          {track?.durationSeconds ? (
-            <Text style={styles.trackPillDuration}>{formatTime(track.durationSeconds)}</Text>
-          ) : null}
-        </Pressable>
         <View style={styles.topRight}>
           <IconButton
             icon={torch ? 'flash' : 'flash-outline'}
@@ -1178,6 +1210,54 @@ export default function CameraScreen() {
           />
         </View>
       </View>
+
+      {/* Track strip — TRANSPARENT (no background, no border), full
+          width under the top bar. No track: a quiet centred "Add a
+          song" row. Track loaded: the song's waveform with the
+          selected part lit in the accent, name left / duration right
+          beneath the bars. The whole strip opens the track sheet
+          either way. Placement: top +56 with height 44 ends at +100,
+          clearing the recording pill (+112) and notice pill (+154).
+          Disabled + dimmed while recording, like the other controls. */}
+      <Pressable
+        style={[styles.trackStrip, { top: insets.top + 56 }, recording && styles.trackStripDisabled]}
+        disabled={recording}
+        onPress={() => setTrackOpen(true)}
+        accessibilityRole="button"
+        accessibilityState={{ disabled: recording }}
+        accessibilityLabel={
+          track ? `Track: ${track.name}. Change the track or choose which part to use` : 'Add a song'
+        }>
+        {track ? (
+          <>
+            <View style={styles.trackStripBars} pointerEvents="none">
+              {stripBars.map((bar) => (
+                <View
+                  key={bar.key}
+                  style={[
+                    styles.trackStripBar,
+                    { height: bar.height },
+                    bar.inRegion ? styles.trackStripBarInRegion : styles.trackStripBarOutRegion,
+                  ]}
+                />
+              ))}
+            </View>
+            <View style={styles.trackStripLabels} pointerEvents="none">
+              <Text style={styles.trackStripName} numberOfLines={1}>
+                {track.name}
+              </Text>
+              {track.durationSeconds ? (
+                <Text style={styles.trackStripDuration}>{formatTime(track.durationSeconds)}</Text>
+              ) : null}
+            </View>
+          </>
+        ) : (
+          <View style={styles.trackStripEmpty} pointerEvents="none">
+            <Ionicons name="musical-notes" size={15} color="rgba(244,241,233,0.65)" />
+            <Text style={styles.trackStripEmptyText}>Add a song</Text>
+          </View>
+        )}
+      </Pressable>
 
       {/* Countdown / recording status — centred, system style. */}
       {countingDown !== null ? (
@@ -1561,23 +1641,48 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   topRight: { gap: spacing.sm },
-  trackPill: {
-    flex: 1,
-    maxWidth: 210,
+  // Transparent track strip (Jaizon, 2026-11-09 — replaces the green
+  // track pill): deliberately NO backgroundColor/border — the waveform
+  // floats directly over the camera. `top` is set inline
+  // (insets.top + 56); height 44 ends at insets.top + 100, above the
+  // recording pill (+112) and notice pill (+154).
+  trackStrip: {
+    position: 'absolute',
+    left: spacing.lg,
+    right: spacing.lg,
+    height: 44,
+    justifyContent: 'center',
+  },
+  trackStripDisabled: { opacity: 0.35 },
+  trackStripBars: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    alignSelf: 'center',
-    // Jaizon: the track pill gets the green (accent) background.
-    backgroundColor: colors.accent,
-    borderColor: 'transparent',
-    borderWidth: 1,
-    borderRadius: radius.pill,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
+    gap: 2,
+    height: 26,
   },
-  trackPillText: { color: colors.onAccent, fontSize: 13, fontWeight: '600', flexShrink: 1 },
-  trackPillDuration: { color: colors.onAccent, fontSize: 12, fontWeight: '500' },
+  trackStripBar: { flex: 1, borderRadius: 1.5 },
+  // In-region bars: the accent at full opacity. Out-of-region: warm
+  // white (theme label #F4F1E9) at ~40%.
+  trackStripBarInRegion: { backgroundColor: colors.accent, opacity: 1 },
+  trackStripBarOutRegion: { backgroundColor: colors.label, opacity: 0.4 },
+  trackStripLabels: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: spacing.sm,
+    marginTop: 3,
+  },
+  // Micro-labels: warm white at 75% (label is #F4F1E9).
+  trackStripName: { color: 'rgba(244,241,233,0.75)', fontSize: 11, flexShrink: 1 },
+  trackStripDuration: { color: 'rgba(244,241,233,0.75)', fontSize: 11, fontVariant: ['tabular-nums'] },
+  trackStripEmpty: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  // Warm white at ~65%.
+  trackStripEmptyText: { color: 'rgba(244,241,233,0.65)', fontSize: 13, fontWeight: '500' },
   centerOverlay: {
     position: 'absolute',
     top: 0,

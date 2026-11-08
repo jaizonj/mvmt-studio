@@ -133,6 +133,18 @@ export interface TakeSyncMeasurement {
   peakRatio: number | null;
 }
 
+/** Result of `waveformPeaks` — real decoded waveform peaks. */
+export interface WaveformPeaks {
+  /**
+   * Normalised per-bucket peak amplitudes (0..1, floored natively at
+   * ~0.06 so quiet sections still render), evenly spaced across the
+   * track's duration.
+   */
+  peaks: number[];
+  /** Track duration in seconds — the span the buckets cover. */
+  durationSeconds: number;
+}
+
 /** Arguments for `startCapture` (the native song-synced recorder). */
 export interface CaptureStartArgs {
   /**
@@ -233,6 +245,7 @@ interface NativeMvmtCompositorModule {
     expectedSongPositionAtTakeStartSeconds: number,
     searchWindowSeconds: number,
   ): Promise<TakeSyncMeasurement>;
+  waveformPeaks(uri: string, buckets: number): Promise<WaveformPeaks | null>;
   isCaptureAvailable(): boolean;
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
@@ -330,6 +343,31 @@ export async function measureTakeSync(
     expectedSongPositionAtTakeStartSeconds,
     searchWindowSeconds,
   );
+}
+
+/**
+ * Decode a track's REAL waveform peaks: per-bucket max-abs amplitudes
+ * (normalised, small floor applied), streamed natively through
+ * AVAssetReader at 8kHz mono so even long songs never sit fully
+ * decoded in memory.
+ *
+ * Unlike `measureTakeSync` this NEVER throws: every failure — the
+ * module not being linked (Expo Go), an older build without the
+ * function, or an unreadable/undecodable file — resolves to null, and
+ * callers fall back to deterministic stand-in bars (src/lib/waveform).
+ *
+ * @param uri     The audio file (`file://` URI or absolute path).
+ * @param buckets How many evenly spaced buckets to return.
+ */
+export async function waveformPeaks(uri: string, buckets: number): Promise<WaveformPeaks | null> {
+  if (!nativeModule || typeof nativeModule.waveformPeaks !== 'function') return null;
+  try {
+    const result = await nativeModule.waveformPeaks(uri, Math.round(buckets));
+    if (!result || !Array.isArray(result.peaks) || result.peaks.length === 0) return null;
+    return result;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
