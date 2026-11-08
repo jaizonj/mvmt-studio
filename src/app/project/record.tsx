@@ -1,8 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
 import { setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
+import * as Brightness from 'expo-brightness';
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   AppState,
@@ -119,6 +120,33 @@ export default function CameraScreen() {
   const [countIn, setCountIn] = useState<number | null>(null);
   const [beatFlash, setBeatFlash] = useState(false);
   const [recording, setRecording] = useState(false);
+
+  /**
+   * Front-facing flash (Jaizon, 2026-11-08): the front camera has no torch
+   * LED, so with torch ON and the FRONT camera active, recording lights the
+   * screen instead — warm-white overlay + full system brightness, restored
+   * when recording stops. Back camera keeps using the real torch
+   * (enableTorch on CameraView).
+   */
+  const frontFlashActive = facing === 'front' && torch && recording;
+  const savedBrightnessRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!frontFlashActive) return;
+    let alive = true;
+    void Brightness.getBrightnessAsync()
+      .then((v) => {
+        if (!alive) return;
+        savedBrightnessRef.current = v;
+        void Brightness.setBrightnessAsync(1);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+      const prev = savedBrightnessRef.current;
+      savedBrightnessRef.current = null;
+      if (prev !== null) void Brightness.setBrightnessAsync(prev).catch(() => undefined);
+    };
+  }, [frontFlashActive]);
   const [elapsed, setElapsed] = useState(0);
   const [trackOpen, setTrackOpen] = useState(false);
   const [zoomOpen, setZoomOpen] = useState(false);
@@ -663,6 +691,7 @@ export default function CameraScreen() {
       </GestureDetector>
 
       {/* Framing guides from Settings — thirds grid and/or centre level line. */}
+      {frontFlashActive ? <View style={styles.frontFlash} pointerEvents="none" /> : null}
       {gridOverlay ? (
         <View style={StyleSheet.absoluteFill} pointerEvents="none">
           <View style={[styles.gridLineV, { left: '33.33%' }]} />
@@ -768,7 +797,7 @@ export default function CameraScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={`Preview take ${take.seq ?? ''}${inCut ? ', used in your cut' : ''}`}>
                 {thumb ? (
-                  <Image source={{ uri: thumb }} style={styles.railThumb} contentFit="cover" />
+                  <Image source={thumb} style={styles.railThumb} contentFit="cover" />
                 ) : (
                   <View style={[styles.railThumb, styles.railThumbPlaceholder]}>
                     <Ionicons name="film-outline" size={16} color={colors.labelSecondary} />
@@ -1005,15 +1034,7 @@ export default function CameraScreen() {
                     ? 'Close timer options'
                     : `Timers, timer ${countdown === 0 ? 'off' : `${countdown} seconds`}, count-in ${countInBeats === 0 ? 'off' : `${countInBeats} beats`}. Tap for timer options.`
                 }>
-                <Ionicons name="timer-outline" size={15} color={timersOpen ? '#14141F' : '#FFFFFF'} />
-                <Text style={[styles.timerChipText, timersOpen && styles.miniChipTextSelected]}>
-                  {countdown === 0 && countInBeats === 0
-                    ? 'Timer'
-                    : [countdown > 0 ? `${countdown}s` : null, countInBeats > 0 ? `♪${countInBeats}` : null]
-                        .filter(Boolean)
-                        .join(' · ')}
-                </Text>
-                <Ionicons name={timersOpen ? 'chevron-up' : 'chevron-down'} size={11} color={timersOpen ? '#14141F' : '#FFFFFF'} />
+                <Ionicons name="timer-outline" size={17} color={timersOpen ? '#14141F' : '#FFFFFF'} />
               </Pressable>
             </View>
           ) : null}
@@ -1050,15 +1071,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
     alignSelf: 'center',
-    backgroundColor: colors.material,
-    borderColor: colors.materialBorder,
+    // Jaizon: the track pill gets the green (accent) background.
+    backgroundColor: colors.accent,
+    borderColor: 'transparent',
     borderWidth: 1,
     borderRadius: radius.pill,
     paddingHorizontal: 12,
     paddingVertical: 9,
   },
-  trackPillText: { color: colors.label, fontSize: 13, fontWeight: '600', flexShrink: 1 },
-  trackPillDuration: { color: colors.labelSecondary, fontSize: 12, fontWeight: '500' },
+  trackPillText: { color: colors.onAccent, fontSize: 13, fontWeight: '600', flexShrink: 1 },
+  trackPillDuration: { color: colors.onAccent, fontSize: 12, fontWeight: '500' },
   centerOverlay: {
     position: 'absolute',
     top: 0,
@@ -1089,6 +1111,15 @@ const styles = StyleSheet.create({
     color: colors.label,
     textShadowColor: 'rgba(0,0,0,0.5)',
     textShadowRadius: 8,
+  },
+  frontFlash: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#FFF6E8',
+    opacity: 0.94,
   },
   gridLineV: {
     position: 'absolute',
@@ -1199,7 +1230,11 @@ const styles = StyleSheet.create({
   },
   railDuration: { ...typeScale.caption, color: colors.label, marginTop: 3, fontVariant: ['tabular-nums'] },
   railPreviewBackdrop: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     backgroundColor: 'rgba(0,0,0,0.55)',
     alignItems: 'center',
     justifyContent: 'center',
