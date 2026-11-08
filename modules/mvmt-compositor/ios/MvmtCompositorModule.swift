@@ -276,11 +276,15 @@ private enum MvmtCompositorEngine {
     }
 
     let durationSeconds = CMTimeGetSeconds(totalDuration)
-    return CompositeResultRecord(
-      uri: outputURL.absoluteString,
-      durationSeconds: durationSeconds.isFinite ? durationSeconds : 0,
-      width: Int(canvasDisplaySize.width.rounded()),
-      height: Int(canvasDisplaySize.height.rounded())
-    )
+    // NOTE: @Field-wrapped Record properties can't be set through the
+    // memberwise initializer in this SDK (it expects Field<T> values),
+    // so build the record empty and assign each field — the pattern
+    // ExpoModulesCore supports for returning records.
+    let result = CompositeResultRecord()
+    result.uri = outputURL.absoluteString
+    result.durationSeconds = durationSeconds.isFinite ? durationSeconds : 0
+    result.width = Int(canvasDisplaySize.width.rounded())
+    result.height = Int(canvasDisplaySize.height.rounded())
+    return result
   }
 }
