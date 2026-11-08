@@ -30,12 +30,28 @@ export interface Take {
    */
   energy?: number;
   /**
-   * Offset (seconds) into the track at which this take was meant to start.
-   * MVMT always records from the top of the track in this scaffold, so this
-   * is 0 today — the field exists so section-recording can set it later
-   * without changing the timeline model.
+   * Offset (seconds) into the track at which this take was meant to start
+   * (the region start it was recorded against).
    */
   trackOffsetSeconds: number;
+  /**
+   * MEASURED synchronization offset, seconds: where the song actually
+   * was (relative to the intended region start) when this take's first
+   * frames were captured — derived from the audio player's position
+   * sampled at record start/stop, not assumed. Positive = the camera
+   * effectively started late. Consumed by the EDL bridge
+   * (src/lib/shuffleEdl.ts) via the single mapping in src/lib/edl.ts.
+   * Undefined = not measured (older takes).
+   */
+  syncOffsetSeconds?: number;
+  /**
+   * Measured drift over the take, seconds: (song elapsed between the
+   * record-start and record-stop samples) − (the take's measured
+   * duration). Near zero = clocks agree; grows with device load.
+   */
+  syncDriftSeconds?: number;
+  /** User-facing name for the take (Takes screen rename). Default: "Take N". */
+  displayName?: string;
 }
 
 export type TransitionType = 'cut' | 'crossfade' | 'dip';
@@ -126,4 +142,25 @@ export type ExportQualityPref = 'high' | 'balanced' | 'small';
 export interface AudioRegion {
   startSeconds: number;
   durationSeconds: number | null;
+}
+
+/**
+ * A project — the unit the new IA is built around (Studio / Projects /
+ * workspace). Everything creative lives here and is persisted as JSON;
+ * media FILES live in the app sandbox and are referenced by URI.
+ * The canonical edit is the frame-based EDL (src/lib/edl.ts).
+ */
+export interface Project {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  track: AudioTrack | null;
+  trackRegion: AudioRegion;
+  takes: Take[];
+  /** The canonical edit. Null until the first shuffle/manual edit. */
+  edl: import('./lib/edl').Edl | null;
+  /** Take-id sequence of the current EDL — guarantees the next shuffle differs. */
+  lastShuffleSequence: string[] | null;
+  shuffleFrequency: ShuffleFrequency;
 }
