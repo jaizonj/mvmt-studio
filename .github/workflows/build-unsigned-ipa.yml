@@ -16,15 +16,15 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macos-26 is REQUIRED for Expo SDK 58: the macos-15 image tops out
+    # at Xcode 26.3, but Expo's documented floor for SDK 58 is Xcode
+    # 26.4+ — on anything older, expo-modules-jsi fails to compile
+    # ("sending 'slot' risks causing data races", Swift 6.2). The
+    # macos-26 image ships Xcode 26.6 (Swift 6.3), the combination with
+    # repeated independent SDK 58 build successes. EAS itself uses an
+    # even newer image (Xcode 27.1) for SDK 58.
+    runs-on: macos-26
     timeout-minutes: 60
-    env:
-      # Expo SDK 58's PRECOMPILED modules only work on Expo's own cloud
-      # builders; on a plain CI Mac the precompiled path fails inside
-      # the ExpoModulesJSI SwiftPM build (strict-concurrency error in
-      # JavaScriptObject.swift). Compiling the modules from source the
-      # classic way avoids that path entirely.
-      EXPO_USE_PRECOMPILED_MODULES: "0"
     steps:
       - name: Check out the project
         uses: actions/checkout@v4
@@ -41,16 +41,10 @@ jobs:
       - name: Generate the native iOS project (Expo prebuild + pods)
         run: npx expo prebuild --platform ios
 
-      # Xcode version matters both ways for Expo SDK 58:
-      #  - the default 16.4 (Swift 6.1) is too OLD: some SDK packages
-      #    declare Swift tools 6.2 and refuse to resolve;
-      #  - the newest 26.3 is too NEW: its stricter Swift concurrency
-      #    checks turn warnings in expo-modules-jsi into errors.
-      # SDK 58 targets Xcode 26.0 — pick the oldest 26.x on the image.
-      - name: Select Xcode 26.0 (the version Expo SDK 58 targets)
+      - name: Select Xcode 26.6 (Expo SDK 58's supported toolchain)
         run: |
-          ls -d /Applications/Xcode_26*.app || true
-          XCODE_APP="$(ls -d /Applications/Xcode_26.0.app 2>/dev/null || ls -d /Applications/Xcode_26*.app | sort -V | head -1)"
+          ls -d /Applications/Xcode_*.app || true
+          XCODE_APP="$(ls -d /Applications/Xcode_26.6.app 2>/dev/null || ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
           echo "Selecting $XCODE_APP"
           sudo xcode-select -s "$XCODE_APP"
           xcodebuild -version
