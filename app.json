@@ -1,0 +1,82 @@
+{
+  "expo": {
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {
+        "asyncRoutes": {
+          "web": true
+        }
+      },
+      "eas": {
+        "projectId": "f8e07bcd-0f16-4ff1-9ca3-c1ee643c3370"
+      }
+    },
+    "icon": "./assets/icon.png",
+    "ios": {
+      "bundleIdentifier": "com.mvmtstudio.app",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "MVMT Studio uses your camera to record music video takes.",
+        "NSMicrophoneUsageDescription": "MVMT Studio uses your microphone so your takes can include sound while you record to a track.",
+        "NSPhotoLibraryAddUsageDescription": "MVMT Studio can save finished takes to your photo library when you choose to.",
+        "NSPhotoLibraryUsageDescription": "MVMT Studio can save finished takes to your photo library when you choose to."
+      },
+      "supportsTablet": false
+    },
+    "name": "MVMT Studio",
+    "platforms": [
+      "ios"
+    ],
+    "orientation": "portrait",
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0B0B10",
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "barcodeScannerEnabled": false,
+          "cameraPermission": "MVMT Studio uses your camera to record music video takes.",
+          "microphonePermission": "MVMT Studio uses your microphone so your takes can include sound while you record to a track."
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "enableBackgroundPlayback": false,
+          "enableBackgroundRecording": false,
+          "microphonePermission": "MVMT Studio uses your microphone so your takes can include sound while you record to a track."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "isAccessMediaLocationEnabled": false,
+          "photosPermission": "MVMT Studio can save finished takes to your photo library when you choose to.",
+          "savePhotosPermission": "MVMT Studio can save finished takes to your photo library when you choose to."
+        }
+      ],
+      [
+        "expo-video",
+        {
+          "supportsBackgroundPlayback": false,
+          "supportsPictureInPicture": false
+        }
+      ],
+      "expo-sharing"
+    ],
+    "scheme": "mvmtstudio",
+    "slug": "mvmt-studio",
+    "userInterfaceStyle": "dark",
+    "version": "0.1.0",
+    "owner": "prodjaizons-team"
+  }
+}

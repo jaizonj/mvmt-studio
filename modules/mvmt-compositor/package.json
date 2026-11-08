@@ -1,0 +1,1 @@
+{"description":"MVMT Studio's native video compositing engine (iOS, AVFoundation): renders a timeline of trimmed clips plus a master audio track into one mp4.","license":"MIT","main":"src/index.ts","name":"mvmt-compositor","private":true,"types":"src/index.ts","version":"1.0.0"}

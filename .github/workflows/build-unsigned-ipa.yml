@@ -1,0 +1,60 @@
+# Builds an UNSIGNED .ipa of MVMT Studio on a cloud Mac.
+#
+# Why unsigned: Jaizon sideloads from his Windows PC with Sideloadly,
+# which signs the app with his own free Apple ID at install time. No
+# Apple Developer Program account is needed for this build.
+# The native compositing engine (modules/mvmt-compositor) is compiled
+# in — sideloaded apps run their native code normally.
+#
+# Trigger manually (Actions tab -> this workflow -> Run workflow) so
+# free macOS minutes are only spent on real builds.
+name: Build unsigned IPA (for Sideloadly)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Generate the native iOS project (Expo prebuild + pods)
+        run: npx expo prebuild --platform ios
+
+      - name: Build the app archive with signing OFF
+        run: |
+          cd ios
+          xcodebuild \
+            -workspace MVMTStudio.xcworkspace \
+            -scheme MVMTStudio \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/MVMTStudio.xcarchive" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package the unsigned .ipa
+        run: |
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/MVMTStudio.xcarchive/Products/Applications/MVMTStudio.app" Payload/
+          zip -qry MVMTStudio-unsigned.ipa Payload
+          ls -lh MVMTStudio-unsigned.ipa
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: MVMTStudio-unsigned-ipa
+          path: MVMTStudio-unsigned.ipa
+          retention-days: 14

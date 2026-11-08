@@ -1,0 +1,39 @@
+{
+  "build": {
+    "development": {
+      "autoIncrement": true,
+      "developmentClient": true,
+      "distribution": "internal",
+      "ios": {
+        "simulator": false
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "ios": {
+        "simulator": false
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "distribution": "store",
+      "ios": {
+        "simulator": false
+      }
+    }
+  },
+  "cli": {
+    "appVersionSource": "remote",
+    "version": ">= 16.0.1"
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "appleId": "REPLACE_WITH_JAIZONS_APPLE_ID_EMAIL",
+        "appleTeamId": "REPLACE_WITH_APPLE_TEAM_ID",
+        "ascAppId": "REPLACE_WITH_APP_STORE_CONNECT_APP_ID"
+      }
+    },
+    "development": {}
+  }
+}
