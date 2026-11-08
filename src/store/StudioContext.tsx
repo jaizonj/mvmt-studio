@@ -1,6 +1,8 @@
 import type { CameraType, VideoQuality } from 'expo-camera';
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
+import type { Edl } from '../lib/edl';
+import { loadProjects, saveProjects } from '../lib/persistence';
 import type {
   AudioRegion,
   AudioTrack,
@@ -9,17 +11,70 @@ import type {
   ExportQualityPref,
   FrameRatePref,
   MusicalSection,
+  Project,
   ShuffleFrequency,
-  ShuffleResultInfo,
   Take,
-  TimelineClip,
 } from '../types';
 
+/**
+ * Studio store — Overhaul Wave 2 (lead).
+ *
+ * PROJECTS are now the unit of work: creative state (track, region,
+ * takes, the canonical EDL, shuffle state) lives inside the ACTIVE
+ * project and is persisted to disk (src/lib/persistence.ts) — before
+ * this, everything was useState-only and a restart lost the whole
+ * studio (QA audit F-2). Camera/settings preferences stay global.
+ *
+ * The flat accessors (track, takes, …) read/write the ACTIVE project.
+ * The canonical edit is the frame-based `edl` — the legacy seconds-based
+ * timeline was removed in Wave 3 once every screen consumed the EDL.
+ */
+
+let idCounter = 0;
+function nextId(prefix: string): string {
+  idCounter += 1;
+  return `${prefix}-${Date.now().toString(36)}-${idCounter}`;
+}
+const nextProjectId = () => nextId('project');
+
+export function createEmptyProject(name: string): Project {
+  const now = Date.now();
+  return {
+    id: nextProjectId(),
+    name,
+    createdAt: now,
+    updatedAt: now,
+    track: null,
+    trackRegion: { startSeconds: 0, durationSeconds: null },
+    takes: [],
+    edl: null,
+    lastShuffleSequence: null,
+    shuffleFrequency: 'normal',
+  };
+}
+
 interface StudioState {
+  // ---- Projects ----
+  projects: Project[];
+  activeProject: Project | null;
+  activeProjectId: string | null;
+  /** False until the persisted state has been loaded from disk. */
+  hydrated: boolean;
+  createProject: (name?: string) => string;
+  openProject: (id: string) => void;
+  deleteProject: (id: string) => void;
+  renameProject: (id: string, name: string) => void;
+  /** Stamp the active project as exported (called on a successful render). */
+  markProjectExported: () => void;
+
+  // ---- Active project: creative state ----
   track: AudioTrack | null;
   takes: Take[];
-  /** The edit: an ordered list of take placements. */
-  timeline: TimelineClip[];
+  /** The canonical edit (frame-based EDL). Null until the first edit exists. */
+  edl: Edl | null;
+  setEdl: (edl: Edl | null) => void;
+  /** Apply a freshly generated edit + record its take sequence (so the next shuffle differs). */
+  applyEdl: (edl: Edl, shuffleSequence?: string[]) => void;
 
   setTrack: (track: AudioTrack | null) => void;
   setTrackDuration: (seconds: number) => void;
@@ -30,60 +85,17 @@ interface StudioState {
 
   addTake: (take: Take) => void;
   removeTake: (takeId: string) => void;
-
-  addToTimeline: (takeId: string) => void;
-  removeFromTimeline: (clipId: string) => void;
-  /** Move a timeline clip one step earlier/later. */
-  moveTimelineClip: (clipId: string, direction: -1 | 1) => void;
-  /** Swap the positions of two timeline clips (tap one, then tap another). */
-  swapTimelineClips: (clipIdA: string, clipIdB: string) => void;
-  clearTimeline: () => void;
-
-  /** Resolve a timeline clip back to its take. */
-  takeForClip: (clip: TimelineClip) => Take | undefined;
+  /** Patch a take in place (rename, measured sync/duration updates…). */
+  updateTake: (takeId: string, patch: Partial<Take>) => void;
 
   /** Cached phrase/energy analysis of the current track (see analysis.ts). */
   trackSections: MusicalSection[];
   setTrackSections: (sections: MusicalSection[]) => void;
 
-  /**
-   * Switch which take a timeline clip uses, keeping its trim range (the
-   * same section of the song) — the Triller-style per-cut take switch on
-   * the Shuffle timeline. Trim end clamps to the new take's length.
-   */
-  assignClipTake: (clipId: string, takeId: string) => void;
-  /** Replace the whole timeline (used by Shuffle) — snapshot first so it can be undone. */
-  applyTimeline: (
-    clips: { takeId: string; trimStartSeconds?: number; trimEndSeconds?: number }[],
-  ) => void;
-  /** Undo the last whole-timeline change / clip edit. */
-  undoTimeline: () => void;
-  canUndoTimeline: boolean;
-  /** Adjust a clip's trim in/out points (seconds inside its take). */
-  updateClipTrim: (clipId: string, trimStartSeconds: number, trimEndSeconds?: number) => void;
-  /** Patch any creative fields on a clip (speed, volume, fades, look, text, transition…). Edit stage only. */
-  updateClip: (clipId: string, patch: Partial<Omit<TimelineClip, 'id' | 'takeId'>>) => void;
-  /** Duplicate a clip in place (same take, same trims/creative settings). */
-  duplicateTimelineClip: (clipId: string) => void;
-  /** Split a clip into two at the midpoint of its current trim range. */
-  splitTimelineClip: (clipId: string) => void;
-  /** Which clip supplies the export cover/thumbnail frame. */
-  coverClipId: string | null;
-  setCoverClipId: (clipId: string | null) => void;
-
-  /** The most recent shuffle applied (score kept internal only — never displayed). */
-  lastShuffle: ShuffleResultInfo | null;
-  setLastShuffle: (info: ShuffleResultInfo | null) => void;
-  /** How often Shuffle changes clip — target section length for the engine. */
   shuffleFrequency: ShuffleFrequency;
   setShuffleFrequency: (v: ShuffleFrequency) => void;
 
-  /**
-   * Camera preferences — the "little options" that live in Settings.
-   * Kept in the store (not on the camera screen) so the Settings sheet
-   * shows and changes the REAL values from any flow screen; the camera
-   * picks changes up when you go back to it.
-   */
+  // ---- Global camera + settings preferences ----
   facing: CameraType;
   setFacing: (f: CameraType | ((current: CameraType) => CameraType)) => void;
   torch: boolean;
@@ -94,266 +106,284 @@ interface StudioState {
   setZoom: (v: number | ((current: number) => number)) => void;
   countdown: CountdownSeconds;
   setCountdown: (v: CountdownSeconds) => void;
-
-  // ---- Settings: configuration ONLY (no creative tools in Settings) ----
-  /** Recorded video quality, applied to the camera. */
   resolution: VideoQuality;
   setResolution: (v: VideoQuality) => void;
-  /** Preferred frame rate — a stored default; the camera picks the closest the device supports. */
   frameRate: FrameRatePref;
   setFrameRate: (v: FrameRatePref) => void;
-  /** Rule-of-thirds grid overlay on the camera. */
   gridOverlay: boolean;
   setGridOverlay: (v: boolean | ((current: boolean) => boolean)) => void;
-  /** Centre level/framing guide overlay on the camera. */
   levelGuide: boolean;
   setLevelGuide: (v: boolean | ((current: boolean) => boolean)) => void;
-  /** Sync correction for Bluetooth/output latency, milliseconds (−500..500). Applied to track playback seeks. */
   audioOffsetMs: number;
   setAudioOffsetMs: (v: number) => void;
-  /** Musical count-in beats played/flashed before a take starts (separate from the camera timer). */
   countInBeats: CountInBeats;
   setCountInBeats: (v: CountInBeats) => void;
-  /** Flash a beat dot while recording. */
   metronome: boolean;
   setMetronome: (v: boolean | ((current: boolean) => boolean)) => void;
-  /** Autosave preference for the project (persistence itself is a README TODO; the default is honoured when it lands). */
   autosave: boolean;
   setAutosave: (v: boolean | ((current: boolean) => boolean)) => void;
-  /** Default export quality, shown/chosen on the Export stage. */
   exportQuality: ExportQualityPref;
   setExportQuality: (v: ExportQualityPref) => void;
 }
 
 const StudioContext = createContext<StudioState | null>(null);
 
-let clipCounter = 0;
-function nextClipId(): string {
-  clipCounter += 1;
-  return `clip-${Date.now().toString(36)}-${clipCounter}`;
-}
-
 export function StudioProvider({ children }: { children: ReactNode }) {
-  const [track, setTrackState] = useState<AudioTrack | null>(null);
-  const [takes, setTakes] = useState<Take[]>([]);
-  const [timeline, setTimeline] = useState<TimelineClip[]>([]);
-  const [trackSections, setTrackSections] = useState<MusicalSection[]>([]);
-  const [trackRegion, setTrackRegionState] = useState<AudioRegion>({ startSeconds: 0, durationSeconds: null });
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [hydrated, setHydrated] = useState(false);
 
-  const setTrackRegion = useCallback((region: AudioRegion) => {
-    setTrackRegionState({
-      startSeconds: Math.max(0, region.startSeconds),
-      durationSeconds: region.durationSeconds === null ? null : Math.max(1, region.durationSeconds),
-    });
-    // Region changed — any sampled section table belongs to the old region.
-    setTrackSections([]);
-  }, []);
-  const [undoStack, setUndoStack] = useState<TimelineClip[][]>([]);
-  const [lastShuffle, setLastShuffle] = useState<ShuffleResultInfo | null>(null);
-  const [shuffleFrequency, setShuffleFrequency] = useState<ShuffleFrequency>('normal');
+  // Transient (never persisted): the track analysis cache.
+  const [trackSections, setTrackSections] = useState<MusicalSection[]>([]);
+
+  // Global preferences.
   const [facing, setFacing] = useState<CameraType>('back');
   const [torch, setTorch] = useState(false);
   const [mirror, setMirror] = useState(true);
   const [zoom, setZoom] = useState(0);
-  // Timer defaults OFF (Jaizon, device test 2026-11-08): pressing record
-  // starts the take straight away unless he turns a timer on himself.
+  // Timer defaults OFF (Jaizon, device test 2026-11-08).
   const [countdown, setCountdown] = useState<CountdownSeconds>(0);
-  const [coverClipId, setCoverClipId] = useState<string | null>(null);
-  // Settings (configuration only)
   const [resolution, setResolution] = useState<VideoQuality>('1080p');
   const [frameRate, setFrameRate] = useState<FrameRatePref>(30);
   const [gridOverlay, setGridOverlay] = useState(false);
   const [levelGuide, setLevelGuide] = useState(false);
   const [audioOffsetMs, setAudioOffsetMsState] = useState(0);
-  // Count-in defaults OFF too — it previously stacked after the camera
-  // timer (3-2-1 then 4-3-2-1), which read as one confusing countdown.
+  // Count-in defaults OFF too (device test 2026-11-08).
   const [countInBeats, setCountInBeats] = useState<CountInBeats>(0);
   const [metronome, setMetronome] = useState(false);
   const [autosave, setAutosave] = useState(true);
   const [exportQuality, setExportQuality] = useState<ExportQualityPref>('balanced');
 
+  const activeProject = useMemo(
+    () => projects.find((p) => p.id === activeProjectId) ?? null,
+    [projects, activeProjectId],
+  );
+  // Callbacks patch "the active project" without taking it as a
+  // dependency; the ref is synced in an effect (never during render).
+  const activeProjectRef = useRef<Project | null>(null);
+  useEffect(() => {
+    activeProjectRef.current = activeProject;
+  }, [activeProject]);
+
+  // ---- Hydrate from disk once; guarantee at least one project exists
+  // so the studio always opens onto something real. ----
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const loaded = await loadProjects();
+      if (!alive) return;
+      if (loaded && loaded.projects.length > 0) {
+        setProjects(loaded.projects);
+        setActiveProjectId(
+          loaded.activeProjectId && loaded.projects.some((p) => p.id === loaded.activeProjectId)
+            ? loaded.activeProjectId
+            : loaded.projects[0].id,
+        );
+      } else {
+        const first = createEmptyProject('My first project');
+        setProjects([first]);
+        setActiveProjectId(first.id);
+      }
+      setHydrated(true);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // ---- Persist (debounced) whenever projects change after hydration. ----
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!hydrated) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      void saveProjects({ version: 1, projects, activeProjectId });
+    }, 400);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, [projects, activeProjectId, hydrated]);
+
+  /** Patch the active project immutably + stamp updatedAt. */
+  const patchActiveProject = useCallback((patch: Partial<Project>) => {
+    setProjects((current) => {
+      const id = activeProjectRef.current?.id;
+      if (!id) return current;
+      return current.map((p) => (p.id === id ? { ...p, ...patch, updatedAt: Date.now() } : p));
+    });
+  }, []);
+
+  // ---- Project management ----
+  const createProject = useCallback((name?: string) => {
+    const project = createEmptyProject(name?.trim() || 'Untitled project');
+    setProjects((current) => [project, ...current]);
+    setActiveProjectId(project.id);
+    setTrackSections([]);
+    return project.id;
+  }, []);
+
+  const openProject = useCallback(
+    (id: string) => {
+      if (!projects.some((p) => p.id === id)) return;
+      setActiveProjectId(id);
+            setTrackSections([]);
+      },
+    [projects],
+  );
+
+  const deleteProject = useCallback(
+    (id: string) => {
+      setProjects((current) => {
+        const next = current.filter((p) => p.id !== id);
+        if (activeProjectId === id) {
+          setActiveProjectId(next[0]?.id ?? null);
+                          }
+        return next;
+      });
+    },
+    [activeProjectId],
+  );
+
+  const renameProject = useCallback((id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setProjects((current) => current.map((p) => (p.id === id ? { ...p, name: trimmed, updatedAt: Date.now() } : p)));
+  }, []);
+
+  const markProjectExported = useCallback(() => {
+    patchActiveProject({ exportedAt: Date.now() });
+  }, [patchActiveProject]);
+
+  // ---- Active-project creative state (legacy-compatible accessors) ----
+  const track = activeProject?.track ?? null;
+  const takes = useMemo(() => activeProject?.takes ?? [], [activeProject]);
+  const trackRegion = useMemo(
+    () => activeProject?.trackRegion ?? { startSeconds: 0, durationSeconds: null },
+    [activeProject],
+  );
+  const edl = activeProject?.edl ?? null;
+  const shuffleFrequency = activeProject?.shuffleFrequency ?? 'normal';
+
+  const setEdl = useCallback(
+    (next: Edl | null) => patchActiveProject({ edl: next }),
+    [patchActiveProject],
+  );
+
+  const applyEdl = useCallback(
+    (next: Edl, shuffleSequence?: string[]) =>
+      patchActiveProject({
+        edl: next,
+        lastShuffleSequence: shuffleSequence ?? activeProjectRef.current?.lastShuffleSequence ?? null,
+      }),
+    [patchActiveProject],
+  );
+
+  const setTrack = useCallback(
+    (next: AudioTrack | null) => {
+      patchActiveProject({
+        track: next,
+        trackRegion: { startSeconds: 0, durationSeconds: null },
+        lastShuffleSequence: null,
+      });
+      setTrackSections([]);
+      },
+    [patchActiveProject],
+  );
+
+  const setTrackDuration = useCallback(
+    (seconds: number) => {
+      const current = activeProjectRef.current;
+      if (!current?.track) return;
+      if (current.track.durationSeconds && Math.abs(current.track.durationSeconds - seconds) <= 0.5) return;
+      patchActiveProject({ track: { ...current.track, durationSeconds: seconds } });
+    },
+    [patchActiveProject],
+  );
+
+  const setTrackRegion = useCallback(
+    (region: AudioRegion) => {
+      patchActiveProject({
+        trackRegion: {
+          startSeconds: Math.max(0, region.startSeconds),
+          durationSeconds: region.durationSeconds === null ? null : Math.max(1, region.durationSeconds),
+        },
+      });
+      // Region changed — any sampled section table belongs to the old region.
+      setTrackSections([]);
+    },
+    [patchActiveProject],
+  );
+
+  const setShuffleFrequency = useCallback(
+    (v: ShuffleFrequency) => patchActiveProject({ shuffleFrequency: v }),
+    [patchActiveProject],
+  );
+
+  const addTake = useCallback(
+    (take: Take) => {
+      const current = activeProjectRef.current;
+      if (!current) return;
+      // Stable "Take N" numbering: assign the next sequence number so
+      // deleting a take never renumbers the survivors.
+      const withSeq: Take =
+        take.seq !== undefined
+          ? take
+          : { ...take, seq: current.takes.reduce((max, t) => Math.max(max, t.seq ?? 0), 0) + 1 };
+      patchActiveProject({ takes: [withSeq, ...current.takes] });
+    },
+    [patchActiveProject],
+  );
+
+  const updateTake = useCallback(
+    (takeId: string, patch: Partial<Take>) => {
+      const current = activeProjectRef.current;
+      if (!current) return;
+      patchActiveProject({ takes: current.takes.map((t) => (t.id === takeId ? { ...t, ...patch } : t)) });
+    },
+    [patchActiveProject],
+  );
+
+  const removeTake = useCallback(
+    (takeId: string) => {
+      const current = activeProjectRef.current;
+      if (!current) return;
+      patchActiveProject({ takes: current.takes.filter((t) => t.id !== takeId) });
+    },
+    [patchActiveProject],
+  );
+
+
   const setAudioOffsetMs = useCallback((v: number) => {
     setAudioOffsetMsState(Math.max(-500, Math.min(500, Math.round(v))));
   }, []);
 
-  const pushUndo = useCallback((snapshot: TimelineClip[]) => {
-    setUndoStack((current) => [...current.slice(-9), snapshot]);
-  }, []);
-
-  const assignClipTake = useCallback((clipId: string, takeId: string) => {
-    setTimeline((current) =>
-      current.map((c) => {
-        if (c.id !== clipId) return c;
-        const take = takes.find((t) => t.id === takeId);
-        const end = c.trimEndSeconds;
-        return {
-          ...c,
-          takeId,
-          trimEndSeconds:
-            end !== undefined && take?.durationSeconds && end >= take.durationSeconds ? undefined : end,
-        };
-      }),
-    );
-  }, [takes]);
-
-  const applyTimeline = useCallback(
-    (clips: { takeId: string; trimStartSeconds?: number; trimEndSeconds?: number }[]) => {
-      setTimeline((current) => {
-        pushUndo(current);
-        return clips.map((clip) => ({ id: nextClipId(), ...clip }));
-      });
-    },
-    [pushUndo],
-  );
-
-  const undoTimeline = useCallback(() => {
-    setUndoStack((current) => {
-      const previous = current[current.length - 1];
-      if (previous) setTimeline(previous);
-      return current.slice(0, -1);
-    });
-  }, []);
-
-  const updateClipTrim = useCallback((clipId: string, trimStartSeconds: number, trimEndSeconds?: number) => {
-    setTimeline((current) =>
-      current.map((c) => (c.id === clipId ? { ...c, trimStartSeconds, trimEndSeconds } : c)),
-    );
-  }, []);
-
-  const updateClip = useCallback((clipId: string, patch: Partial<Omit<TimelineClip, 'id' | 'takeId'>>) => {
-    setTimeline((current) => current.map((c) => (c.id === clipId ? { ...c, ...patch } : c)));
-  }, []);
-
-  const duplicateTimelineClip = useCallback((clipId: string) => {
-    setTimeline((current) => {
-      const index = current.findIndex((c) => c.id === clipId);
-      if (index === -1) return current;
-      const copy: TimelineClip = { ...current[index], id: nextClipId() };
-      return [...current.slice(0, index + 1), copy, ...current.slice(index + 1)];
-    });
-  }, []);
-
-  const splitTimelineClip = useCallback(
-    (clipId: string) => {
-      setTimeline((current) => {
-        const index = current.findIndex((c) => c.id === clipId);
-        if (index === -1) return current;
-        const clip = current[index];
-        const take = takes.find((t) => t.id === clip.takeId);
-        const start = clip.trimStartSeconds ?? 0;
-        const end = clip.trimEndSeconds ?? take?.durationSeconds ?? start + 1;
-        if (end - start < 1) return current; // too short to split usefully
-        const mid = start + (end - start) / 2;
-        const first: TimelineClip = { ...clip, trimEndSeconds: mid };
-        const second: TimelineClip = { ...clip, id: nextClipId(), trimStartSeconds: mid, trimEndSeconds: clip.trimEndSeconds };
-        return [...current.slice(0, index), first, second, ...current.slice(index + 1)];
-      });
-    },
-    [takes],
-  );
-
-  const setTrack = useCallback((next: AudioTrack | null) => {
-    setTrackState(next);
-    setTrackSections([]);
-    setTrackRegionState({ startSeconds: 0, durationSeconds: null });
-    setLastShuffle(null);
-    // A new track invalidates the old edit's timing assumptions, but the
-    // takes themselves are kept — the user may just be swapping songs.
-    // (Timeline is left untouched on purpose; see README "Design notes".)
-  }, []);
-
-  const setTrackDuration = useCallback((seconds: number) => {
-    setTrackState((current) =>
-      current && (!current.durationSeconds || Math.abs(current.durationSeconds - seconds) > 0.5)
-        ? { ...current, durationSeconds: seconds }
-        : current,
-    );
-  }, []);
-
-  const addTake = useCallback((take: Take) => {
-    setTakes((current) => [take, ...current]);
-  }, []);
-
-  const removeTake = useCallback((takeId: string) => {
-    setTakes((current) => current.filter((t) => t.id !== takeId));
-    setTimeline((current) => current.filter((c) => c.takeId !== takeId));
-  }, []);
-
-  const addToTimeline = useCallback((takeId: string) => {
-    setTimeline((current) => [...current, { id: nextClipId(), takeId }]);
-  }, []);
-
-  const removeFromTimeline = useCallback((clipId: string) => {
-    setTimeline((current) => current.filter((c) => c.id !== clipId));
-    setCoverClipId((current) => (current === clipId ? null : current));
-  }, []);
-
-  const moveTimelineClip = useCallback((clipId: string, direction: -1 | 1) => {
-    setTimeline((current) => {
-      const index = current.findIndex((c) => c.id === clipId);
-      const target = index + direction;
-      if (index === -1 || target < 0 || target >= current.length) return current;
-      const next = [...current];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  }, []);
-
-  const swapTimelineClips = useCallback((clipIdA: string, clipIdB: string) => {
-    if (clipIdA === clipIdB) return;
-    setTimeline((current) => {
-      const a = current.findIndex((c) => c.id === clipIdA);
-      const b = current.findIndex((c) => c.id === clipIdB);
-      if (a === -1 || b === -1) return current;
-      const next = [...current];
-      [next[a], next[b]] = [next[b], next[a]];
-      return next;
-    });
-  }, []);
-
-  const clearTimeline = useCallback(() => {
-    setTimeline([]);
-    setCoverClipId(null);
-  }, []);
-
-  const takeForClip = useCallback(
-    (clip: TimelineClip) => takes.find((t) => t.id === clip.takeId),
-    [takes],
-  );
-
   const value = useMemo<StudioState>(
     () => ({
+      projects,
+      activeProject,
+      activeProjectId,
+      hydrated,
+      createProject,
+      openProject,
+      deleteProject,
+      renameProject,
+      markProjectExported,
       track,
       takes,
-      timeline,
+      edl,
+      setEdl,
+      applyEdl,
       setTrack,
       setTrackDuration,
       trackRegion,
       setTrackRegion,
       addTake,
       removeTake,
-      addToTimeline,
-      removeFromTimeline,
-      moveTimelineClip,
-      swapTimelineClips,
-      clearTimeline,
-      takeForClip,
+      updateTake,
       trackSections,
       setTrackSections,
-      applyTimeline,
-      assignClipTake,
-      undoTimeline,
-      canUndoTimeline: undoStack.length > 0,
-      updateClipTrim,
-      lastShuffle,
-      setLastShuffle,
       shuffleFrequency,
       setShuffleFrequency,
-      updateClip,
-      duplicateTimelineClip,
-      splitTimelineClip,
-      coverClipId,
-      setCoverClipId,
       resolution,
       setResolution,
       frameRate,
@@ -384,33 +414,30 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setCountdown,
     }),
     [
+      projects,
+      activeProject,
+      activeProjectId,
+      hydrated,
+      createProject,
+      openProject,
+      deleteProject,
+      renameProject,
+      markProjectExported,
       track,
       takes,
-      timeline,
+      edl,
+      setEdl,
+      applyEdl,
       setTrack,
       setTrackDuration,
       trackRegion,
       setTrackRegion,
       addTake,
       removeTake,
-      addToTimeline,
-      removeFromTimeline,
-      moveTimelineClip,
-      swapTimelineClips,
-      clearTimeline,
-      takeForClip,
+      updateTake,
       trackSections,
-      applyTimeline,
-      assignClipTake,
-      undoTimeline,
-      undoStack.length,
-      updateClipTrim,
-      lastShuffle,
       shuffleFrequency,
-      updateClip,
-      duplicateTimelineClip,
-      splitTimelineClip,
-      coverClipId,
+      setShuffleFrequency,
       resolution,
       frameRate,
       gridOverlay,

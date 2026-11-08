@@ -38,6 +38,19 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
+      # Quality gate (QA audit A-09): unit tests, typecheck and lint must
+      # pass before any macOS archive time is spent — a red gate fails
+      # the build here instead of shipping a broken IPA.
+      - name: Gate — unit tests, typecheck, lint
+        run: |
+          npm run test:shuffle
+          npm run test:edl
+          npx tsc --noEmit
+          npx expo lint
+          # Bundle smoke test: catches unresolved require() asset paths
+          # that tsc cannot see (a route move broke one in Wave 3).
+          npx expo export --platform ios
+
       - name: Generate the native iOS project (Expo prebuild + pods)
         run: npx expo prebuild --platform ios
 

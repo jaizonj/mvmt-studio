@@ -1,17 +1,31 @@
 /**
- * App-side access to the native compositing engine (the local Expo
- * module in `modules/mvmt-compositor`, iOS AVFoundation).
+ * App-side access to the native media engine (the local Expo module in
+ * `modules/mvmt-compositor`, iOS AVFoundation).
  *
- * The engine only exists in development / EAS builds — custom native
- * code cannot run in Expo Go. `isCompositorAvailable()` is the gate:
- * Export shows the real "Render video" action when it's true and an
- * honest explanation when it isn't. Never call `renderVideo` without
+ * The engine only exists in development / sideload builds — custom
+ * native code cannot run in Expo Go. `isCompositorAvailable()` is the
+ * gate: UI shows real preview/export actions when it's true and an
+ * honest explanation when it isn't. Never call the engine without
  * checking availability first.
  */
 export {
+  addExportProgressListener,
+  addPreviewProgressListener,
+  addPreviewStatusListener,
+  cancelExport,
+  createPreview,
+  inspectAsset,
   isCompositorAvailable,
+  releasePreview,
   renderVideo,
+  seekPreview,
+  setPreviewPaused,
+  type AssetInfo,
   type CompositeClipInput,
   type CompositeRequest,
   type CompositeResult,
+  type ExportProgressEvent,
+  type PreviewProgressEvent,
+  type PreviewStatus,
+  type PreviewStatusEvent,
 } from '../../modules/mvmt-compositor/src/index';

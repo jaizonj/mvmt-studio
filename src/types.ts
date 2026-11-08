@@ -30,48 +30,35 @@ export interface Take {
    */
   energy?: number;
   /**
-   * Offset (seconds) into the track at which this take was meant to start.
-   * MVMT always records from the top of the track in this scaffold, so this
-   * is 0 today — the field exists so section-recording can set it later
-   * without changing the timeline model.
+   * Offset (seconds) into the track at which this take was meant to start
+   * (the region start it was recorded against).
    */
   trackOffsetSeconds: number;
-}
-
-export type TransitionType = 'cut' | 'crossfade' | 'dip';
-export type ClipLook = 'none' | 'warm' | 'cool' | 'mono' | 'vivid';
-export type TextPosition = 'top' | 'bottom';
-
-/** One placement of a take on the editor timeline. The same take can appear more than once. */
-export interface TimelineClip {
-  /** Unique per placement (a take can be placed twice). */
-  id: string;
-  takeId: string;
-  /** Trim in-point inside the take, seconds. Default 0. */
-  trimStartSeconds?: number;
-  /** Trim out-point inside the take, seconds. Undefined = play to the end of the take. */
-  trimEndSeconds?: number;
-
-  // ---- Creative tools (Edit stage only — never Settings) ----
-  /** Playback/render speed multiplier for this clip. Default 1. */
-  speed?: number;
-  /** Clip audio volume 0..1. Default 1. Ignored when `muted`. */
-  volume?: number;
-  muted?: boolean;
-  fadeInSeconds?: number;
-  fadeOutSeconds?: number;
-  /** Colour look for this clip, applied when the video is rendered. */
-  look?: ClipLook;
-  /** Text drawn over this clip, if set. */
-  textOverlay?: string;
-  textPosition?: TextPosition;
   /**
-   * The join BETWEEN this clip and the next one (the transition lives on
-   * the earlier clip because it describes how it hands over). Edited from
-   * the join control between the two clips on the timeline.
+   * MEASURED synchronization offset, seconds: where the song actually
+   * was (relative to the intended region start) when this take's first
+   * frames were captured — derived from the audio player's position
+   * sampled at record start/stop, not assumed. Positive = the camera
+   * effectively started late. Consumed by the EDL bridge
+   * (src/lib/shuffleEdl.ts) via the single mapping in src/lib/edl.ts.
+   * Undefined = not measured (older takes).
    */
-  transitionType?: TransitionType;
-  transitionDurationSeconds?: number;
+  syncOffsetSeconds?: number;
+  /**
+   * Measured drift over the take, seconds: (song elapsed between the
+   * record-start and record-stop samples) − (the take's measured
+   * duration). Near zero = clocks agree; grows with device load.
+   */
+  syncDriftSeconds?: number;
+  /** User-facing name for the take (Takes screen rename). Default: "Take N". */
+  displayName?: string;
+  /**
+   * Stable per-project sequence number, assigned by the store in
+   * addTake (max existing + 1) — "Take N" numbering must not renumber
+   * surviving takes when one is deleted (design spec Appendix B).
+   * Older takes have none; the UI falls back to chronological order.
+   */
+  seq?: number;
 }
 
 /**
@@ -112,7 +99,7 @@ export const SHUFFLE_FREQUENCY_LENGTHS: Record<ShuffleFrequency, number> = {
   rapid: 0.5,
 };
 
-/** Settings-only configuration types (no creative tools — see SettingsSheet). */
+/** Settings-only configuration types (no creative tools — they live in the Editor). */
 export type FrameRatePref = 30 | 60;
 export type CountInBeats = 0 | 4 | 8;
 export type ExportQualityPref = 'high' | 'balanced' | 'small';
@@ -126,4 +113,27 @@ export type ExportQualityPref = 'high' | 'balanced' | 'small';
 export interface AudioRegion {
   startSeconds: number;
   durationSeconds: number | null;
+}
+
+/**
+ * A project — the unit the new IA is built around (Studio / Projects /
+ * workspace). Everything creative lives here and is persisted as JSON;
+ * media FILES live in the app sandbox and are referenced by URI.
+ * The canonical edit is the frame-based EDL (src/lib/edl.ts).
+ */
+export interface Project {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  track: AudioTrack | null;
+  trackRegion: AudioRegion;
+  takes: Take[];
+  /** The canonical edit. Null until the first shuffle/manual edit. */
+  edl: import('./lib/edl').Edl | null;
+  /** Take-id sequence of the current EDL — guarantees the next shuffle differs. */
+  lastShuffleSequence: string[] | null;
+  shuffleFrequency: ShuffleFrequency;
+  /** When the project's video was last successfully rendered (Export stamps it). */
+  exportedAt?: number;
 }

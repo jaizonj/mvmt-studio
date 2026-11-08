@@ -11,6 +11,7 @@
     "expo-asset": "~58.0.20",
     "expo-audio": "~58.0.11",
     "expo-blur": "~58.0.5",
+    "expo-brightness": "~58.0.2",
     "expo-camera": "~58.0.14",
     "expo-constants": "~58.0.15",
     "expo-dev-client": "~58.0.18",
@@ -48,7 +49,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "expo lint",
     "doctor": "expo-doctor",
-    "test:shuffle": "tsc --ignoreConfig src/lib/shuffle.ts src/lib/analysis.ts --outDir tests/.build --module commonjs --target ES2022 --skipLibCheck && node --test tests/shuffle.test.cjs"
+    "test:shuffle": "tsc --ignoreConfig src/lib/shuffle.ts src/lib/analysis.ts --outDir tests/.build --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/shuffle.test.cjs",
+    "test:edl": "tsc --ignoreConfig src/lib/shuffleEdl.ts --outDir tests/.build-edl --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/edl.test.cjs"
   },
   "private": true
 }

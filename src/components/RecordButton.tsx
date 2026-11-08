@@ -12,7 +12,8 @@ interface RecordButtonProps {
 /**
  * Capture button, bottom centre — iOS Camera / Snapchat placement.
  * Design rule: iridescent is a THIN accent ring only; the button itself is
- * the familiar white ring + red dot (stop square while recording).
+ * the familiar white ring + TEAL-BLUE dot (stop square while recording) —
+ * teal per Jaizon's art direction (2026-11-08), replacing the classic red.
  */
 export function RecordButton({ recording, disabled, onPress }: RecordButtonProps) {
   return (
@@ -38,6 +39,8 @@ export function RecordButton({ recording, disabled, onPress }: RecordButtonProps
 }
 
 const RING = 76;
+/** Jaizon's teal-blue for the record button centre. */
+const TEAL = '#0CA6B5';
 
 const styles = StyleSheet.create({
   wrap: {
@@ -74,12 +77,12 @@ const styles = StyleSheet.create({
     width: 52,
     height: 52,
     borderRadius: 26,
-    backgroundColor: colors.danger,
+    backgroundColor: TEAL,
   },
   stopSquare: {
     width: 34,
     height: 34,
     borderRadius: 8,
-    backgroundColor: colors.danger,
+    backgroundColor: TEAL,
   },
 });
