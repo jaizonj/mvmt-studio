@@ -43,12 +43,26 @@ export interface TimelineTrimDragEvent {
 
 export type TimelineScrubPhase = 'move' | 'end';
 
-/** Default timeline scale — CapCut-like: fixed pixels per second, scrollable. */
-const DEFAULT_PX_PER_SEC = 30;
+/**
+ * The one timeline scale — fixed, zoomed-in by default (simplification
+ * pass v2): no zoom controls anywhere; 60 px/s shows fewer, larger
+ * cuts at a time so the trim handles are easy to hit precisely.
+ */
+export const DEFAULT_PX_PER_SECOND = 60;
 const STRIP_HEIGHT = 58;
-const TILE_WIDTH = 34;
-/** Trim-handle grab width (the documented 44pt exception — stepper alternatives exist). */
-const HANDLE_WIDTH = 28;
+/**
+ * Filmstrip frames are horizontal rectangles that FILL their cut
+ * (Jaizon, 2026-11-09): a cut's block is as wide as the cut is long
+ * (duration × pxPerSecond), and the frames inside share that width
+ * out evenly — so a quick cut reads as a short rectangle and a long
+ * cut as a long one. Frames aim for ~76pt wide; the exact width is
+ * the segment width divided by the frame count, and contentFit
+ * "cover" centre-crops the vertical source into each rectangle
+ * without ever stretching it.
+ */
+const TARGET_FRAME_WIDTH = 76;
+/** Trim-handle grab width per side — generous zones so trimming is effortless. */
+const HANDLE_WIDTH = 36;
 const RULER_HEIGHT = 22;
 
 /**
@@ -118,7 +132,9 @@ function TrimHandle({
       accessible
       accessibilityRole="adjustable"
       accessibilityLabel={`Drag to trim the ${edge} of the selected cut`}>
-      <View style={styles.trimGrip} />
+      <View style={styles.trimGrip}>
+        <View style={styles.trimGripNotch} />
+      </View>
     </View>
   );
 }
@@ -184,18 +200,21 @@ function RulerBand({
  * Jaizon's device test (2026-11-08) — the old proportional bar read as
  * "one big cut" and showed nothing of the actual footage:
  *
- * - Time scale (pxPerSecond, editor-controlled zoom) with a ruler
- *   (tick every second, time labels that adapt to the zoom),
- *   horizontally scrollable for longer cuts.
- * - Every cut is a filmstrip: real frames sampled from its take across
- *   the cut's range (expo-video thumbnails, colour placeholder until
- *   they land), so you can SEE each clip.
+ * - One fixed, zoomed-in time scale (DEFAULT_PX_PER_SECOND) with a
+ *   ruler (tick every second, labels every 5s), horizontally
+ *   scrollable for longer cuts. No zoom controls (v2 simplification).
+ * - Every cut is a filmstrip of horizontal-rectangle frames that
+ *   fill the cut's length-proportional block: real frames sampled
+ *   from its take at the source time each frame position represents
+ *   (expo-video thumbnails, colour placeholder until they land),
+ *   sharing the cut's width out evenly and cover-cropped, never
+ *   stretched — so you can SEE each clip and read its length.
  * - A playhead tracks the preview playback and the strip auto-scrolls
  *   to follow it (suspended while the user is scrubbing/trimming);
  *   the currently playing cut is underlined.
- * - Tap a cut to select it. The selected cut grows lime trim handles
- *   on both edges (drag = ripple-aware trim, owned by the editor) and
- *   dragging on the ruler scrubs the preview.
+ * - Tap a cut to select it. The selected cut grows prominent lime
+ *   trim handles on both edges (drag = ripple-aware trim, owned by
+ *   the editor) and dragging on the ruler scrubs the preview.
  *
  * Skin (design system §5): graphite only — segment placeholder fills
  * alternate cardPressed/elevated and the filmstrip frames carry the
@@ -208,11 +227,9 @@ export function TimelineStrip({
   onSelectClip,
   playbackSeconds,
   isPlaying = false,
-  pxPerSecond = DEFAULT_PX_PER_SEC,
   onTrimDrag,
   onScrub,
   scrubbing = false,
-  headerAccessory,
 }: {
   clips: TimelineStripClip[];
   selectedClipId?: string | null;
@@ -220,17 +237,14 @@ export function TimelineStrip({
   /** Preview position inside the edit, seconds — drives the playhead. */
   playbackSeconds?: number | null;
   isPlaying?: boolean;
-  /** Timeline zoom: pixels per second (editor steps it through presets). */
-  pxPerSecond?: number;
   /** Drag-trim on the selected segment's handles (editor owns semantics). */
   onTrimDrag?: (event: TimelineTrimDragEvent) => void;
   /** Ruler scrub: reports the timeline second under the finger. */
   onScrub?: (seconds: number, phase: TimelineScrubPhase) => void;
   /** True while the editor is scrubbing — suspends playhead auto-follow. */
   scrubbing?: boolean;
-  /** Extra controls rendered at the right of the header row (e.g. zoom). */
-  headerAccessory?: ReactNode;
 }) {
+  const pxPerSecond = DEFAULT_PX_PER_SECOND;
   const scrollRef = useRef<ScrollViewInstance>(null);
   const scrollOffsetRef = useRef(0);
   const viewportWidthRef = useRef(0);
@@ -260,18 +274,22 @@ export function TimelineStrip({
   }, []);
   const hasScrub = useCallback(() => !!interactionRef.current.onScrub, []);
 
-  // Filmstrip sample times per clip: one frame per tile across the cut's
-  // own range inside its take.
+  // Filmstrip sample times per clip: the frames share the cut's own
+  // length out evenly — frame i covers an equal slice of the cut's
+  // duration and is sampled at the CENTRE of that slice, mapped into
+  // the take's source time. The frame COUNT targets ~76pt per frame,
+  // so longer cuts simply get more (or wider) frames.
   const samples = useMemo(() => {
     const perClip = new Map<string, number[]>();
     for (const clip of clips) {
       if (!clip.sourceUri || clip.lengthSeconds <= 0) continue;
       const width = Math.max(18, clip.lengthSeconds * pxPerSecond);
-      const tiles = Math.max(1, Math.round(width / TILE_WIDTH));
+      const tiles = Math.max(1, Math.round(width / TARGET_FRAME_WIDTH));
       const start = clip.sourceStartSeconds ?? 0;
+      const tileSeconds = clip.lengthSeconds / tiles;
       const times: number[] = [];
       for (let i = 0; i < tiles; i++) {
-        times.push(Math.round((start + ((i + 0.5) * clip.lengthSeconds) / tiles) * 20) / 20);
+        times.push(Math.round((start + (i + 0.5) * tileSeconds) * 20) / 20);
       }
       perClip.set(clip.id, times);
     }
@@ -340,9 +358,9 @@ export function TimelineStrip({
     }
   }
 
-  // Ruler: tick every second; labels every 5s at reading zoom, every
-  // 10s when zoomed out so they never collide.
-  const labelEvery = pxPerSecond >= 30 ? 5 : 10;
+  // Ruler: tick every second; at the fixed 60 px/s scale a label
+  // every 5s sits 300pt apart — never crowded.
+  const labelEvery = 5;
   const rulerTicks = [];
   for (let s = 0; s <= Math.floor(total); s++) {
     rulerTicks.push(
@@ -364,14 +382,11 @@ export function TimelineStrip({
     <View>
       <View style={styles.headerRow}>
         <Text style={styles.title}>Your cut</Text>
-        <View style={styles.headerRight}>
-          <Text style={styles.total}>
-            {playbackSeconds != null
-              ? `${formatTime(Math.min(playbackSeconds, total))} / ${formatTime(total)} · ${clips.length} cuts`
-              : `${clips.length} cuts · ${formatTime(total)}`}
-          </Text>
-          {headerAccessory}
-        </View>
+        <Text style={styles.total}>
+          {playbackSeconds != null
+            ? `${formatTime(Math.min(playbackSeconds, total))} / ${formatTime(total)} · ${clips.length} cuts`
+            : `${clips.length} cuts · ${formatTime(total)}`}
+        </Text>
       </View>
       <View style={styles.editor}>
         <ScrollView
@@ -400,7 +415,9 @@ export function TimelineStrip({
                 const selected = selectedClipId === clip.id;
                 const active = activeClipId === clip.id && playbackSeconds != null;
                 const times = samples.get(clip.id) ?? [];
-                const tileWidth = width / Math.max(1, times.length || 1);
+                // Frames share the cut's width out evenly: the longer
+                // the cut, the longer its rectangles.
+                const frameWidth = width / Math.max(1, times.length);
                 return (
                   <View
                     key={clip.id}
@@ -427,11 +444,11 @@ export function TimelineStrip({
                                 <Image
                                   key={ti}
                                   source={thumb}
-                                  style={{ width: tileWidth, height: STRIP_HEIGHT }}
+                                  style={{ width: frameWidth, height: STRIP_HEIGHT }}
                                   contentFit="cover"
                                 />
                               ) : (
-                                <View key={ti} style={{ width: tileWidth, height: STRIP_HEIGHT }} />
+                                <View key={ti} style={{ width: frameWidth, height: STRIP_HEIGHT }} />
                               );
                             })
                           : null}
@@ -490,7 +507,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: spacing.sm,
   },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   title: { ...typeScale.headline, color: colors.label },
   total: { ...typeScale.footnote, color: colors.labelSecondary, fontVariant: ['tabular-nums'] },
   editor: {
@@ -544,11 +560,19 @@ const styles = StyleSheet.create({
   trimHandleEnd: { right: 0 },
   trimGrip: {
     width: 6,
-    height: 30,
+    height: STRIP_HEIGHT,
     borderRadius: 3,
     backgroundColor: colors.accent,
     borderWidth: 1,
     borderColor: 'rgba(0,0,0,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  trimGripNotch: {
+    width: 2,
+    height: 16,
+    borderRadius: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
   },
   filmstrip: { flexDirection: 'row', position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   labelChip: {

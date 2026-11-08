@@ -32,7 +32,6 @@ import {
   framesToSeconds,
   layoutSegments,
   secondsToFrames,
-  segmentAtFrame,
   sourceFrameForTimelineFrame,
   validateEdl,
   type AssetMeasure,
@@ -48,17 +47,20 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../../th
 /**
  * Editor — workspace stage 3, the centrepiece (design system §3.5).
  *
- * One screen, two modes, ONE timeline: the canonical frame-based EDL
- * (src/lib/edl.ts). Auto Edit shuffles takes into a cut via the
- * shuffle→EDL bridge; Manual Edit trims/splits/swaps/reorders/deletes
- * cuts. Every mutation flows through `commitEdl`, which re-anchors
- * (see the sync invariant there), validates against measured asset
- * durations and records an undo snapshot.
+ * One screen, ONE timeline, no modes (simplification pass v2): the
+ * canonical frame-based EDL (src/lib/edl.ts). The timeline is directly
+ * interactive by default — tap a cut to select it, swap its take from
+ * the chips below, drag its ends to trim; the shuffle (the
+ * shuffle→EDL bridge) lives in its own section underneath. Every
+ * mutation flows through `commitEdl`, which re-anchors (see the sync
+ * invariant there), validates against measured asset durations and
+ * records an undo snapshot.
  *
  * Layout: a FIXED header, then ONE vertical ScrollView holding the
- * compact preview, transport, mode switch, timeline and mode panel —
- * every control is reachable by scrolling on any iPhone (the previous
- * fixed-flex layout clipped the lower panels on real devices).
+ * preview, transport, timeline, selected-cut panel and shuffle
+ * section — every control is reachable by scrolling on any iPhone
+ * (the previous fixed-flex layout clipped the lower panels on real
+ * devices).
  *
  * Preview is the native composition (NativePreview) built from the
  * SAME edlToCompositeRequest the exporter consumes — what plays here
@@ -66,24 +68,14 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../../th
  * drives playback. No scores are ever shown: shuffle stays magic.
  */
 
-type Mode = 'auto' | 'manual';
-
 /** Screen-level EDL history depth (design system Appendix B). */
 const HISTORY_CAP = 20;
 /** UI floor for a cut's length (design system §3.5) — prevents slivers. */
 const MIN_CUT_FRAMES = 3;
 /** Where take-chip thumbnails are sampled inside each take. */
 const CHIP_THUMB_SECONDS = 0.5;
-/** Timeline zoom steps (pixels per second); the strip defaults to 30. */
-const ZOOM_STEPS = [15, 22, 30, 45, 60, 90];
 /** Minimum interval between preview seeks while scrubbing the ruler. */
 const SCRUB_SEEK_INTERVAL_MS = 120;
-
-let segmentIdCounter = 0;
-function nextSegmentId(): string {
-  segmentIdCounter += 1;
-  return `seg-m${Date.now().toString(36)}-${segmentIdCounter}`;
-}
 
 /** A fresh random seed per shuffle tap (successive cuts must differ). */
 function randomSeed(): number {
@@ -124,36 +116,10 @@ function SweepOverlay({ width }: { width: number }) {
   );
 }
 
-function StepperGroup({
-  label,
-  onStep,
-}: {
-  label: string;
-  onStep: (delta: number) => void;
-}) {
-  return (
-    <View style={styles.stepperGroup}>
-      <Text style={styles.stepperLabel}>{label}</Text>
-      <View style={styles.stepperRow}>
-        {[-5, -1, 1, 5].map((d) => (
-          <Pressable
-            key={d}
-            onPress={() => onStep(d)}
-            style={styles.stepperButton}
-            accessibilityRole="button"
-            accessibilityLabel={`Nudge the ${label.toLowerCase()} of the cut ${d > 0 ? 'later' : 'earlier'} by ${Math.abs(d)}`}>
-            <Text style={styles.stepperButtonText}>{d > 0 ? `+${d}` : `${d}`}</Text>
-          </Pressable>
-        ))}
-      </View>
-    </View>
-  );
-}
-
 export default function EditorScreen() {
   const studio = useStudio();
   // Keyed remount per project: every piece of screen state below
-  // (mode, selection, EDL history, preview state) is per-project, so a
+  // (selection, EDL history, preview state) is per-project, so a
   // project switch starts the workspace clean — no reset effects.
   return <EditorWorkspace key={studio.activeProjectId ?? 'none'} />;
 }
@@ -165,7 +131,6 @@ function EditorWorkspace() {
   const storedEdl = studio.edl;
   const { width: winW, height: winH } = useWindowDimensions();
 
-  const [mode, setMode] = useState<Mode>('auto');
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [paused, setPaused] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -178,7 +143,6 @@ function EditorWorkspace() {
   const [undoStack, setUndoStack] = useState<(Edl | null)[]>([]);
   const [redoStack, setRedoStack] = useState<(Edl | null)[]>([]);
   const [, setChipThumbTick] = useState(0);
-  const [pxPerSecond, setPxPerSecond] = useState(30);
   const [scrubbing, setScrubbing] = useState(false);
   /** Uncommitted trim-drag result, shown in the timeline only (no
    *  history push, no preview rebuild) until the drag ends. */
@@ -304,8 +268,8 @@ function EditorWorkspace() {
   /**
    * The ONLY way the EDL changes: snapshot for undo, re-lay out,
    * RE-ANCHOR (the sync invariant above — applied here so EVERY
-   * mutation honours it: stepper and drag trims, split, delete,
-   * duplicate, reorder, take-switch), validate, store. The anchor is
+   * mutation honours it: drag trims and take-switch), validate,
+   * store. The anchor is
    * a no-op for fresh shuffle output, which the bridge already builds
    * anchored. Validation may clamp/drop a segment whose anchored
    * source start falls outside its take's measured length — correct
@@ -349,7 +313,7 @@ function EditorWorkspace() {
   const canUndo = undoStack.length > 0;
   const canRedo = redoStack.length > 0;
 
-  // ---- Auto Edit: shuffle --------------------------------------------
+  // ---- Shuffle ---------------------------------------------------------
   const canShuffle = takes.length >= 2;
   const handleShuffle = () => {
     if (!canShuffle) return;
@@ -377,17 +341,15 @@ function EditorWorkspace() {
     setSweepKey((k) => k + 1);
   };
 
-  // ---- Manual Edit operations ----------------------------------------
+  // ---- Selection & take swap ------------------------------------------
   const selected = edl?.segments.find((s) => s.id === selectedSegmentId) ?? null;
   const selectedIndex = selected && edl ? edl.segments.findIndex((s) => s.id === selected.id) : -1;
 
   const handleSelectClip = (id: string) => {
     const seg = edl?.segments.find((s) => s.id === id);
+    // Tapping a cut just selects it (there are no modes) and moves
+    // the playhead to its start so the panel and preview agree.
     setSelectedSegmentId(id);
-    // In Auto, tapping a cut IS the "refine this exact edit" path: the
-    // same EDL, carried into Manual with that cut selected. Switching
-    // modes never touches the EDL itself.
-    if (mode === 'auto') setMode('manual');
     if (seg && edl) {
       const start = framesToSeconds(seg.timelineStartFrame, edl.fps);
       setPositionSeconds(start);
@@ -424,45 +386,11 @@ function EditorWorkspace() {
     return frames > 0 && start >= frames;
   };
 
-  const handleTrimStart = (segment: EdlSegment, delta: number) => {
-    if (!edl) return;
-    // +delta: start later (source advances, cut shortens from the left).
-    // −delta: start earlier (source rewinds, cut lengthens) — bounded by
-    // the source's first frame.
-    const applied =
-      delta > 0
-        ? Math.min(delta, segment.durationFrames - MIN_CUT_FRAMES)
-        : -Math.min(-delta, segment.sourceStartFrame);
-    if (applied === 0) return;
-    commitEdl(
-      layoutSegments(
-        edl.segments.map((s) =>
-          s.id === segment.id
-            ? { ...partialOf(s), sourceStartFrame: s.sourceStartFrame + applied, durationFrames: s.durationFrames - applied }
-            : partialOf(s),
-        ),
-        edl,
-      ),
-    );
-  };
-
-  const handleTrimEnd = (segment: EdlSegment, delta: number) => {
-    if (!edl) return;
-    const durationFrames = Math.max(MIN_CUT_FRAMES, segment.durationFrames + delta);
-    if (durationFrames === segment.durationFrames) return;
-    commitEdl(
-      layoutSegments(
-        edl.segments.map((s) => (s.id === segment.id ? { ...partialOf(s), durationFrames } : partialOf(s))),
-        edl,
-      ),
-    );
-  };
-
   /**
    * Drag-trim from the timeline handles. 'move' events carry the
    * CUMULATIVE drag distance, so each move rebuilds a display-only
-   * draft from the committed EDL (frame-quantised, same 3-frame floor
-   * as the steppers, re-anchored so the filmstrip shows exactly what
+   * draft from the committed EDL (frame-quantised, same 3-frame UI
+   * floor, re-anchored so the filmstrip shows exactly what
    * will commit) — no history, no preview rebuild. 'end' commits the
    * draft through commitEdl (validate + history + preview rebuild).
    *
@@ -512,74 +440,6 @@ function EditorWorkspace() {
     }
     const laid = layoutSegments(partials, edl);
     setDraftEdl({ ...laid, segments: reanchorSegments(laid.segments, laid.fps) });
-  };
-
-  const playheadFrame = edl ? Math.round(positionSeconds * edl.fps) : 0;
-  const playheadSegment = edl ? segmentAtFrame(edl, playheadFrame) : null;
-  const canSplit =
-    !!selected &&
-    !!edl &&
-    playheadSegment?.id === selected.id &&
-    playheadFrame - selected.timelineStartFrame >= MIN_CUT_FRAMES &&
-    selected.timelineStartFrame + selected.durationFrames - playheadFrame >= MIN_CUT_FRAMES;
-
-  const handleSplit = () => {
-    if (!edl || !selected || !canSplit) return;
-    const local = playheadFrame - selected.timelineStartFrame;
-    const partials: ReturnType<typeof partialOf>[] = [];
-    for (const s of edl.segments) {
-      if (s.id !== selected.id) {
-        partials.push(partialOf(s));
-      } else {
-        partials.push({ ...partialOf(s), durationFrames: local });
-        partials.push({
-          id: nextSegmentId(),
-          takeId: s.takeId,
-          sourceStartFrame: s.sourceStartFrame + local,
-          durationFrames: s.durationFrames - local,
-        });
-      }
-    }
-    commitEdl(layoutSegments(partials, edl));
-  };
-
-  const handleDuplicate = () => {
-    if (!edl || !selected) return;
-    const copyId = nextSegmentId();
-    const partials: ReturnType<typeof partialOf>[] = [];
-    for (const s of edl.segments) {
-      partials.push(partialOf(s));
-      if (s.id === selected.id) partials.push({ ...partialOf(s), id: copyId });
-    }
-    // The copy is the same TAKE placed after the original — NOT a
-    // replay of the original's source moment: commitEdl's sync anchor
-    // re-derives its source start from its NEW timeline position, so
-    // it shows that take's performance at the later song moment.
-    commitEdl(layoutSegments(partials, edl));
-    setSelectedSegmentId(copyId);
-  };
-
-  const canMoveEarlier = selectedIndex > 0;
-  const canMoveLater = !!edl && selectedIndex >= 0 && selectedIndex < edl.segments.length - 1;
-
-  const handleMove = (direction: -1 | 1) => {
-    if (!edl || !selected) return;
-    const index = edl.segments.findIndex((s) => s.id === selected.id);
-    const target = index + direction;
-    if (index === -1 || target < 0 || target >= edl.segments.length) return;
-    const partials = edl.segments.map(partialOf);
-    const [moved] = partials.splice(index, 1);
-    partials.splice(target, 0, moved);
-    // Reordering swaps the cuts' song positions; commitEdl's sync
-    // anchor re-derives each moved cut's source start for its new
-    // position, so both cuts stay matched to the song.
-    commitEdl(layoutSegments(partials, edl));
-  };
-
-  const handleDelete = () => {
-    if (!edl || !selected) return;
-    commitEdl(layoutSegments(edl.segments.filter((s) => s.id !== selected.id).map(partialOf), edl));
-    setSelectedSegmentId(null);
   };
 
   // ---- Preview ---------------------------------------------------------
@@ -659,11 +519,12 @@ function EditorWorkspace() {
     [displayEdl, takes, takeIndexById],
   );
 
-  // Compact cinematic preview: 9:16, ~1/3 of the screen height,
-  // clamped so it never dominates the workspace again (the old layout
-  // sized it from whatever vertical space was left and clipped the
-  // panels below it on real devices).
-  const previewHeight = Math.round(Math.min(312, Math.max(248, winH * 0.34)));
+  // Prominent cinematic preview (v2): 9:16, just under half the
+  // screen height, clamped so it feels standard and easy to watch
+  // without crowding out the timeline below — the ScrollView still
+  // reaches everything. Width follows the 9:16 height, capped by the
+  // screen width minus horizontal padding.
+  const previewHeight = Math.round(Math.min(470, Math.max(340, winH * 0.46)));
   const previewWidth = Math.round(Math.min(winW - spacing.xl * 2, previewHeight * (9 / 16)));
 
   const frequencyCaption =
@@ -680,32 +541,6 @@ function EditorWorkspace() {
     : track
       ? track.name
       : 'No song loaded';
-
-  const zoomIndex = ZOOM_STEPS.indexOf(pxPerSecond);
-  const zoomAccessory = hasCut ? (
-    <View style={styles.zoomRow}>
-      <Pressable
-        onPress={() => setPxPerSecond(ZOOM_STEPS[zoomIndex - 1])}
-        disabled={zoomIndex <= 0}
-        hitSlop={6}
-        accessibilityRole="button"
-        accessibilityLabel="Zoom the timeline out"
-        accessibilityState={{ disabled: zoomIndex <= 0 }}
-        style={[styles.zoomButton, zoomIndex <= 0 && styles.historyButtonDisabled]}>
-        <Ionicons name="remove" size={16} color={colors.label} />
-      </Pressable>
-      <Pressable
-        onPress={() => setPxPerSecond(ZOOM_STEPS[zoomIndex + 1])}
-        disabled={zoomIndex >= ZOOM_STEPS.length - 1}
-        hitSlop={6}
-        accessibilityRole="button"
-        accessibilityLabel="Zoom the timeline in"
-        accessibilityState={{ disabled: zoomIndex >= ZOOM_STEPS.length - 1 }}
-        style={[styles.zoomButton, zoomIndex >= ZOOM_STEPS.length - 1 && styles.historyButtonDisabled]}>
-        <Ionicons name="add" size={16} color={colors.label} />
-      </Pressable>
-    </View>
-  ) : null;
 
   return (
     <View style={styles.root}>
@@ -855,23 +690,9 @@ function EditorWorkspace() {
             <Text style={styles.transportTime}>{formatTime(totalSeconds)}</Text>
           </View>
 
-          {/* Mode switch — never alters the cut, selection or playhead. */}
-          <View style={styles.section}>
-            <SegmentedControl
-              options={[
-                { value: 'auto' as Mode, label: 'Auto Edit' },
-                { value: 'manual' as Mode, label: 'Manual Edit' },
-              ]}
-              value={mode}
-              onChange={setMode}
-              accessibilityLabel="Editor mode"
-            />
-          </View>
-
-          {/* Timeline — visible in BOTH modes: in Auto it displays the
-              generated cut for inspection (tapping a cut jumps into
-              Manual with it selected); in Manual it is the editing
-              surface (select, drag-trim, ruler scrub). */}
+          {/* Timeline — the editing surface, directly interactive:
+              tap a cut to select it, drag its ends to trim, drag the
+              ruler to scrub the preview. */}
           <View style={styles.section}>
             {hasCut ? (
               <TimelineStrip
@@ -880,11 +701,9 @@ function EditorWorkspace() {
                 onSelectClip={handleSelectClip}
                 playbackSeconds={positionSeconds}
                 isPlaying={isPlaying}
-                pxPerSecond={pxPerSecond}
                 onTrimDrag={handleTrimDrag}
                 onScrub={handleScrub}
                 scrubbing={scrubbing}
-                headerAccessory={zoomAccessory}
               />
             ) : (
               <View style={styles.timelineEmpty}>
@@ -897,184 +716,99 @@ function EditorWorkspace() {
             )}
           </View>
 
-          {/* Mode panel */}
+          {/* Selected-cut panel — appears when a cut is tapped: swap
+              its take from the chips; trimming is drag-only, on the
+              timeline itself. */}
+          {selected && edl ? (
+            <View style={styles.section}>
+              <View style={styles.panel}>
+                <Text style={styles.cutTitle}>
+                  Cut {selectedIndex + 1} · Take {takeIndexById.get(selected.takeId) ?? ''}
+                </Text>
+                <Text style={styles.caption}>
+                  {formatTime(framesToSeconds(selected.timelineStartFrame, edl.fps))} –{' '}
+                  {formatTime(
+                    framesToSeconds(selected.timelineStartFrame + selected.durationFrames, edl.fps),
+                  )}{' '}
+                  on the timeline · {formatTime(framesToSeconds(selected.durationFrames, edl.fps))} long
+                </Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
+                  <View style={styles.chipRow}>
+                    {takes.map((take) => {
+                      const isCurrent = selected.takeId === take.id;
+                      const disabled = !isCurrent && switchWouldEmpty(selected, take);
+                      const thumb = getCachedThumbnail(take.uri, CHIP_THUMB_SECONDS);
+                      return (
+                        <Pressable
+                          key={take.id}
+                          disabled={isCurrent || disabled}
+                          onPress={() => handleSwitchTake(selected, take)}
+                          accessibilityRole="button"
+                          accessibilityState={{ selected: isCurrent, disabled: isCurrent || disabled }}
+                          accessibilityLabel={
+                            disabled
+                              ? `Take ${takeIndexById.get(take.id)}, too short for this cut`
+                              : `Use take ${takeIndexById.get(take.id)} for this cut`
+                          }
+                          style={[
+                            styles.takeChip,
+                            isCurrent && styles.takeChipCurrent,
+                            disabled && styles.takeChipDisabled,
+                          ]}>
+                          {thumb ? (
+                            <Image source={thumb} style={styles.takeChipThumb} contentFit="cover" />
+                          ) : (
+                            <View style={[styles.takeChipThumb, styles.takeChipThumbPlaceholder]} />
+                          )}
+                          <Text style={styles.takeChipText}>Take {takeIndexById.get(take.id)}</Text>
+                          {isCurrent ? <Ionicons name="checkmark" size={14} color={colors.accent} /> : null}
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </ScrollView>
+                <Text style={styles.caption}>Drag the ends of a cut to trim it.</Text>
+              </View>
+            </View>
+          ) : null}
+
+          {/* Shuffle — always available below the editing surface. */}
           <View style={styles.section}>
-            {mode === 'auto' ? (
-              <View style={styles.panel}>
-                <Pressable
-                  style={[styles.shuffleButton, !canShuffle && styles.shuffleButtonDisabled]}
-                  onPress={handleShuffle}
-                  disabled={!canShuffle}
-                  accessibilityRole="button"
-                  accessibilityLabel={hasCut ? 'Shuffle again for a different arrangement' : 'Shuffle takes into a cut'}>
-                  <Ionicons name="shuffle" size={20} color={canShuffle ? colors.onAccent : colors.labelTertiary} />
-                  <Text style={[styles.shuffleButtonText, !canShuffle && styles.shuffleButtonTextDisabled]}>
-                    {hasCut ? 'Try another' : 'Shuffle my cut'}
-                  </Text>
-                </Pressable>
-                {!canShuffle ? (
-                  <Text style={styles.caption}>
-                    Shuffle needs at least 2 takes — record one more to mix between takes.
-                  </Text>
-                ) : shuffleNote ? (
-                  <Text style={styles.caption}>{shuffleNote}</Text>
-                ) : justShuffled && hasCut ? (
-                  <Text style={styles.caption}>Your cut, remixed.</Text>
-                ) : null}
-                <Text style={styles.panelLabel}>Cut pace</Text>
-                <SegmentedControl
-                  options={[
-                    { value: 'chill' as ShuffleFrequency, label: 'Chill' },
-                    { value: 'normal' as ShuffleFrequency, label: 'Normal' },
-                    { value: 'fast' as ShuffleFrequency, label: 'Fast' },
-                    { value: 'rapid' as ShuffleFrequency, label: 'Rapid' },
-                  ]}
-                  value={studio.shuffleFrequency}
-                  onChange={studio.setShuffleFrequency}
-                  accessibilityLabel="Cut pace — how often the cut changes"
-                />
-                <Text style={styles.caption}>{frequencyCaption} Applies to the next shuffle.</Text>
-                {hasCut && edl ? (
-                  <>
-                    <Text style={styles.caption}>
-                      {edl.segments.length} cuts · {formatTime(totalSeconds)} — tap any cut above to fine-tune it.
-                    </Text>
-                    <Pressable
-                      style={styles.secondaryButton}
-                      onPress={() => setMode('manual')}
-                      accessibilityRole="button"
-                      accessibilityLabel="Switch to Manual Edit to refine this cut">
-                      <Ionicons name="options-outline" size={17} color={colors.label} />
-                      <Text style={styles.secondaryButtonText}>Edit manually</Text>
-                    </Pressable>
-                  </>
-                ) : null}
-              </View>
-            ) : (
-              <View style={styles.panel}>
-                {!edl || !hasCut ? (
-                  <Text style={styles.manualHint}>Shuffle first, then fine-tune here.</Text>
-                ) : selected ? (
-                  <>
-                    <Text style={styles.cutTitle}>
-                      Cut {selectedIndex + 1} · Take {takeIndexById.get(selected.takeId) ?? ''}
-                    </Text>
-                    <Text style={styles.caption}>
-                      {formatTime(framesToSeconds(selected.timelineStartFrame, edl.fps))} –{' '}
-                      {formatTime(
-                        framesToSeconds(selected.timelineStartFrame + selected.durationFrames, edl.fps),
-                      )}{' '}
-                      on the timeline · {formatTime(framesToSeconds(selected.durationFrames, edl.fps))} long
-                    </Text>
-                    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
-                      <View style={styles.chipRow}>
-                        {takes.map((take) => {
-                          const isCurrent = selected.takeId === take.id;
-                          const disabled = !isCurrent && switchWouldEmpty(selected, take);
-                          const thumb = getCachedThumbnail(take.uri, CHIP_THUMB_SECONDS);
-                          return (
-                            <Pressable
-                              key={take.id}
-                              disabled={isCurrent || disabled}
-                              onPress={() => handleSwitchTake(selected, take)}
-                              accessibilityRole="button"
-                              accessibilityState={{ selected: isCurrent, disabled: isCurrent || disabled }}
-                              accessibilityLabel={
-                                disabled
-                                  ? `Take ${takeIndexById.get(take.id)}, too short for this cut`
-                                  : `Use take ${takeIndexById.get(take.id)} for this cut`
-                              }
-                              style={[
-                                styles.takeChip,
-                                isCurrent && styles.takeChipCurrent,
-                                disabled && styles.takeChipDisabled,
-                              ]}>
-                              {thumb ? (
-                                <Image source={thumb} style={styles.takeChipThumb} contentFit="cover" />
-                              ) : (
-                                <View style={[styles.takeChipThumb, styles.takeChipThumbPlaceholder]} />
-                              )}
-                              <Text style={styles.takeChipText}>Take {takeIndexById.get(take.id)}</Text>
-                              {isCurrent ? <Ionicons name="checkmark" size={14} color={colors.accent} /> : null}
-                            </Pressable>
-                          );
-                        })}
-                      </View>
-                    </ScrollView>
-                    {takes.some((t) => selected.takeId !== t.id && switchWouldEmpty(selected, t)) ? (
-                      <Text style={styles.caption}>A take that is too short for this cut can&apos;t be used here.</Text>
-                    ) : null}
-                    <View style={styles.trimRow}>
-                      <StepperGroup label="Start" onStep={(d) => handleTrimStart(selected, d)} />
-                      <StepperGroup label="End" onStep={(d) => handleTrimEnd(selected, d)} />
-                    </View>
-                    <Text style={styles.caption}>
-                      Tip: drag the ends of the selected cut in the timeline to trim it. Starts{' '}
-                      {formatTime(framesToSeconds(Math.max(0, selected.sourceStartFrame), edl.fps))} into Take{' '}
-                      {takeIndexById.get(selected.takeId) ?? ''} ·{' '}
-                      {formatTime(framesToSeconds(selected.durationFrames, edl.fps))} long
-                    </Text>
-                    <View style={styles.actionsRow}>
-                      <Pressable
-                        onPress={handleSplit}
-                        disabled={!canSplit}
-                        hitSlop={6}
-                        accessibilityRole="button"
-                        accessibilityLabel="Split this cut at the playhead"
-                        accessibilityState={{ disabled: !canSplit }}
-                        style={[styles.actionButton, !canSplit && styles.historyButtonDisabled]}>
-                        <Ionicons name="cut-outline" size={15} color={colors.label} />
-                        <Text style={styles.actionButtonText}>Split</Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={handleDuplicate}
-                        hitSlop={6}
-                        accessibilityRole="button"
-                        accessibilityLabel="Duplicate this cut after itself"
-                        style={styles.actionButton}>
-                        <Ionicons name="copy-outline" size={15} color={colors.label} />
-                        <Text style={styles.actionButtonText}>Duplicate</Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={() => handleMove(-1)}
-                        disabled={!canMoveEarlier}
-                        hitSlop={6}
-                        accessibilityRole="button"
-                        accessibilityLabel="Move this cut earlier"
-                        accessibilityState={{ disabled: !canMoveEarlier }}
-                        style={[styles.actionButton, !canMoveEarlier && styles.historyButtonDisabled]}>
-                        <Ionicons name="chevron-back" size={15} color={colors.label} />
-                        <Text style={styles.actionButtonText}>Earlier</Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={() => handleMove(1)}
-                        disabled={!canMoveLater}
-                        hitSlop={6}
-                        accessibilityRole="button"
-                        accessibilityLabel="Move this cut later"
-                        accessibilityState={{ disabled: !canMoveLater }}
-                        style={[styles.actionButton, !canMoveLater && styles.historyButtonDisabled]}>
-                        <Text style={styles.actionButtonText}>Later</Text>
-                        <Ionicons name="chevron-forward" size={15} color={colors.label} />
-                      </Pressable>
-                      <Pressable
-                        onPress={handleDelete}
-                        hitSlop={6}
-                        accessibilityRole="button"
-                        accessibilityLabel="Delete this cut"
-                        style={styles.deleteButton}>
-                        <Ionicons name="trash-outline" size={15} color={colors.danger} />
-                        <Text style={styles.deleteButtonText}>Delete</Text>
-                      </Pressable>
-                    </View>
-                  </>
-                ) : (
-                  <Text style={styles.manualHint}>
-                    Tap a cut in the timeline to swap its take, trim it, split it at the playhead, or remove it.
-                  </Text>
-                )}
-              </View>
-            )}
+            <View style={styles.panel}>
+              <Pressable
+                style={[styles.shuffleButton, !canShuffle && styles.shuffleButtonDisabled]}
+                onPress={handleShuffle}
+                disabled={!canShuffle}
+                accessibilityRole="button"
+                accessibilityLabel={hasCut ? 'Shuffle again for a different arrangement' : 'Shuffle takes into a cut'}>
+                <Ionicons name="shuffle" size={20} color={canShuffle ? colors.onAccent : colors.labelTertiary} />
+                <Text style={[styles.shuffleButtonText, !canShuffle && styles.shuffleButtonTextDisabled]}>
+                  {hasCut ? 'Try another shuffle' : 'Shuffle my cut'}
+                </Text>
+              </Pressable>
+              {!canShuffle ? (
+                <Text style={styles.caption}>
+                  Shuffle needs at least 2 takes — record one more to mix between takes.
+                </Text>
+              ) : shuffleNote ? (
+                <Text style={styles.caption}>{shuffleNote}</Text>
+              ) : justShuffled && hasCut ? (
+                <Text style={styles.caption}>Your cut, remixed.</Text>
+              ) : null}
+              <Text style={styles.panelLabel}>Cut pace</Text>
+              <SegmentedControl
+                options={[
+                  { value: 'chill' as ShuffleFrequency, label: 'Chill' },
+                  { value: 'normal' as ShuffleFrequency, label: 'Normal' },
+                  { value: 'fast' as ShuffleFrequency, label: 'Fast' },
+                  { value: 'rapid' as ShuffleFrequency, label: 'Rapid' },
+                ]}
+                value={studio.shuffleFrequency}
+                onChange={studio.setShuffleFrequency}
+                accessibilityLabel="Cut pace — how often the cut changes"
+              />
+              <Text style={styles.caption}>{frequencyCaption} Applies to the next shuffle.</Text>
+            </View>
           </View>
         </ScrollView>
       )}
@@ -1192,45 +926,8 @@ const styles = StyleSheet.create({
   shuffleButtonDisabled: { backgroundColor: colors.elevated },
   shuffleButtonText: { color: colors.onAccent, ...typeScale.headline },
   shuffleButtonTextDisabled: { color: colors.labelTertiary },
-  secondaryButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 7,
-    backgroundColor: colors.card,
-    borderWidth: 1,
-    borderColor: colors.separator,
-    borderRadius: radius.md,
-    paddingVertical: 11,
-  },
-  secondaryButtonText: { color: colors.label, fontSize: 15, fontWeight: '600' },
   caption: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 18 },
-  manualHint: { ...typeScale.subhead, color: colors.labelSecondary, lineHeight: 21 },
   cutTitle: { ...typeScale.headline, color: colors.label },
-  actionsRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: spacing.sm, marginTop: spacing.xs },
-  actionButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    backgroundColor: colors.card,
-    borderRadius: radius.pill,
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-  },
-  actionButtonText: { color: colors.label, fontSize: 13, fontWeight: '600' },
-  deleteButton: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 6, paddingVertical: 7 },
-  deleteButtonText: { color: colors.danger, fontSize: 13, fontWeight: '600' },
-  zoomRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  zoomButton: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.card,
-    borderWidth: 1,
-    borderColor: colors.separator,
-  },
   chipScroll: { marginHorizontal: -spacing.xs },
   chipRow: { flexDirection: 'row', gap: spacing.sm, paddingHorizontal: spacing.xs, paddingVertical: 2 },
   takeChip: {
@@ -1250,20 +947,6 @@ const styles = StyleSheet.create({
   takeChipThumb: { width: 40, height: 40, borderRadius: radius.sm },
   takeChipThumbPlaceholder: { backgroundColor: colors.elevated },
   takeChipText: { color: colors.label, fontSize: 14, fontWeight: '600' },
-  trimRow: { flexDirection: 'row', gap: spacing.xl, flexWrap: 'wrap' },
-  stepperGroup: { gap: 6 },
-  stepperLabel: { ...typeScale.caption, color: colors.labelSecondary, letterSpacing: 0.6 },
-  stepperRow: { flexDirection: 'row', gap: 5 },
-  stepperButton: {
-    backgroundColor: colors.card,
-    borderRadius: radius.sm,
-    minWidth: 38,
-    height: 34,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 6,
-  },
-  stepperButtonText: { color: colors.label, fontSize: 13, fontWeight: '700', fontVariant: ['tabular-nums'] },
   emptyCard: {
     alignItems: 'center',
     gap: spacing.sm,
