@@ -233,15 +233,16 @@ private enum MvmtCompositorEngine {
         throw compositorError("Clip \(index + 1) has an empty display size: \(clip.uri)")
       }
       let fillScale = max(canvasSize.width / displaySize.width, canvasSize.height / displaySize.height)
-      let transform = preferredTransform
-        .concatenating(CGAffineTransform(translationX: -displayRect.origin.x, y: -displayRect.origin.y))
-        .concatenating(CGAffineTransform(scaleX: fillScale, y: fillScale))
-        .concatenating(
-          CGAffineTransform(
-            translationX: (canvasSize.width - displaySize.width * fillScale) / 2,
-            translationY: (canvasSize.height - displaySize.height * fillScale) / 2
-          )
-        )
+      // Built in steps — the fully chained expression defeats the Swift
+      // type-checker ("unable to type-check in reasonable time", CI).
+      var transform = preferredTransform
+      transform = transform.concatenating(
+        CGAffineTransform(translationX: -displayRect.origin.x, y: -displayRect.origin.y)
+      )
+      transform = transform.concatenating(CGAffineTransform(scaleX: fillScale, y: fillScale))
+      let centreX = (canvasSize.width - displaySize.width * fillScale) / 2
+      let centreY = (canvasSize.height - displaySize.height * fillScale) / 2
+      transform = transform.concatenating(CGAffineTransform(translationX: centreX, translationY: centreY))
       segmentRanges.append(CMTimeRange(start: cursor, duration: range.duration))
       segmentTransforms.append(transform)
 
