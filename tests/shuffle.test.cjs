@@ -6,8 +6,8 @@
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { generateShuffle, seededRandom } = require('./.build/lib/shuffle.js');
-const { buildSections, estimateTakeEnergies, SectionEnergyAccumulator } = require('./.build/lib/analysis.js');
+const { generateShuffle, seededRandom } = require('./.build/src/lib/shuffle.js');
+const { buildSections, estimateTakeEnergies, SectionEnergyAccumulator } = require('./.build/src/lib/analysis.js');
 
 function sectionsFromEnergies(energies, sectionSeconds = 4) {
   return energies.map((energy, i) => ({
