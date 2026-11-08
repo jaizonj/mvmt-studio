@@ -62,11 +62,21 @@ ownership, status, and each agent's report summary.
 
 ## Programme status
 
+**SHIPPED (2026-11-08).** The overhaul and the follow-up editor rebuild
+are complete on branch `overhaul`: CI run **42470406509** green,
+unsigned IPA (16.6 MB) delivered to Jaizon for Sideloadly. The branch
+awaits Jaizon's device pass (`docs/TEST_MATRIX.md`) before merging to
+`master` — that pass is the last open gate.
+
 - [x] Phase 1: audit reviewed; contracts written (EDL, native v2, theme).
-- [ ] Wave 1: Swift engine v2 · EDL/shuffle bridge + tests · design spec · QA audit.
-- [ ] Wave 2: projects store + navigation (lead) · record/sync · takes · editor · export.
-- [ ] Wave 3: integration, dead-code removal, full verification, CI build.
-- [ ] Final: delivery report + device-test matrix for Jaizon.
+- [x] Wave 1: Swift engine v2 · EDL/shuffle bridge + tests · design spec · QA audit.
+- [x] Wave 2: projects store + navigation (lead) · record/sync · takes · editor · export.
+- [x] Wave 3: integration, dead-code removal, full verification, CI build.
+- [x] Final: delivery report + device-test matrix for Jaizon.
+- [x] Post-overhaul round: takes rail on Record + camera polish, Editor
+  rebuild (scrolling, drag-trim, duplicate/reorder, sync anchor),
+  near-fullscreen Export — shipped in CI run 42470406509.
+- [ ] Jaizon's device pass → merge `overhaul` into `master`.
 
 ## Verification reality (read before claiming anything)
 
@@ -94,7 +104,7 @@ ownership, status, and each agent's report summary.
   persistence, doubled audio in the old build, placebo settings, CI without
   gates) all acted on in Wave 2.
 
-### Wave 2 (in progress, lead summary)
+### Wave 2 (complete, lead summary)
 - Lead: projects store + disk persistence (src/lib/persistence.ts), tab IA +
   project workspace routes, NativePreview component, CI quality gate, store
   exportedAt stamp + stable take sequence numbers.
@@ -108,7 +118,46 @@ ownership, status, and each agent's report summary.
   (PrimaryButton, SectionHeader, ProjectCard, EmptyState, GroupCard).
 - Agent Editor: rebuilding the workspace on EDL + NativePreview (running).
 
-### Wave 3 cleanup inventory (lead, from live greps)
+### Wave 3 (complete, lead summary)
+- Integration done; cleanup inventory below fully actioned (JS
+  TimelinePreview, both SettingsSheets, and the legacy seconds-based
+  store timeline + TimelineClip type deleted; Record's gear navigates to
+  the Settings tab; Record navigation gates on the EDL).
+- Headless gate green: tsc clean, lint clean (0 warnings), 22/22 unit
+  tests, expo export OK. CI archive green (run 42466978730); unsigned
+  IPA delivered and device-tested by Jaizon — shuffle approved, Editor
+  rejected (no vertical scrolling; preview oversized), which opened the
+  post-overhaul round below.
+
+### Post-overhaul round (shipped 2026-11-08, CI run 42470406509)
+- Takes rail (commit 955d5a4): the separate Takes screen is
+  decommissioned — takes live as a left-side rail on Record with real
+  thumbnail frames and a preview card (native preview, sync in words,
+  rename/delete). Record's Next goes Record → Editor (or Export when an
+  EDL exists); bottom-bar lock icons removed (plain arrows always).
+- Camera polish (commit 9e416f5): front-facing flash = screen flash
+  (expo-brightness warm-white overlay + full brightness while recording
+  on the front camera with torch on); timers pill icon-only; top bar
+  raised level with flash/settings; Add-a-track pill on the green
+  accent; record button centre teal blue (#0CA6B5).
+- Editor rebuild + near-fullscreen Export (commit 4e98684): fixed
+  header + one vertical ScrollView (scroll bug fixed structurally);
+  compact preview (clamp 248–312pt); timeline in both modes with zoom
+  15–90 px/s, ruler scrubbing, drag-to-trim handles, Duplicate + Move
+  earlier/later. Binding SYNC ANCHOR inside commitEdl: every mutation
+  re-derives each segment's sourceStartFrame from its timeline position
+  via the measured take offsets, so clips stay in sync; a duplicate
+  anchors at its new position (not a replay). First cut's start handle
+  is inert by design (nothing to ripple against; the anchor forbids
+  slipping). Auto→Manual refine keeps the identical EDL. Export ready
+  state is a near-fullscreen black stage with overlay back/title/
+  transport; render logic untouched (verified by diff scan).
+- Verification at ship time: tsc clean, lint clean, 22/22 tests, expo
+  export OK, CI green, main.jsbundle verified inside the IPA.
+  Device-only checks (Jaizon): whole-Editor scrolling first, then
+  sync-after-edit behaviour and Export legibility — TEST_MATRIX.md.
+
+### Wave 3 cleanup inventory (lead, from live greps — all actioned)
 - TimelinePreview.tsx: zero importers remain — delete the component.
 - SettingsSheet/SettingsSheetConnected: only record.tsx remains (gear →
   Settings tab navigation replaces it) — then delete both.
