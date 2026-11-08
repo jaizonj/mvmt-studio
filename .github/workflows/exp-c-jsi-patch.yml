@@ -1,0 +1,158 @@
+# EXPERIMENT C — "JSI source patch"
+#
+# Identical to the MAIN workflow (Release `archive`, precompiled
+# modules left at their default ON — no EXPO_USE_PRECOMPILED_MODULES
+# override), EXCEPT that after `npm ci` we patch the one file that
+# fails to compile with precompiled modules on:
+#
+#   node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/
+#     Runtime/Values/JavaScriptObject.swift
+#
+# Error: `sending 'slot' risks causing data races` at
+#   try encode(JavaScriptValue.Slot(slot), runtime)
+# inside `JavaScriptActor.assumeIsolated { ... }` in withEncodedValue.
+#
+# The patch copies the raw slot pointer into a nonisolated(unsafe)
+# local first, then builds the JavaScriptValue.Slot wrapper from that
+# copy INSIDE the isolated closure and binds it to a local constant
+# before calling encode — so no value is "sent" across the isolation
+# boundary; the closure only reads a raw pointer it already owns.
+# The pointer targets a temporary allocation that stays alive for the
+# whole synchronous call (the original code already relies on this via
+# its own nonisolated(unsafe) slot), so the patch does not change the
+# memory-safety contract, only how the value crosses into the closure.
+#
+# Runs on pushes to the ci-experiments branch only.
+name: Experiment C - JSI source patch
+
+on:
+  push:
+    branches: [ci-experiments]
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Patch expo-modules-jsi JavaScriptObject.swift (data-race workaround)
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, sys
+
+          path = pathlib.Path(
+              "node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/"
+              "Runtime/Values/JavaScriptObject.swift"
+          )
+          lines = path.read_text().splitlines(keepends=True)
+
+          # Locate the failing encode line inside withEncodedValue.
+          encode_idx = next(
+              (i for i, l in enumerate(lines)
+               if "try encode(JavaScriptValue.Slot(slot), runtime)" in l),
+              None,
+          )
+          if encode_idx is None:
+              sys.exit("PATCH FAILED: target encode line not found")
+
+          # Locate the enclosing assumeIsolated line just above it.
+          iso_idx = next(
+              (i for i in range(encode_idx - 1, max(encode_idx - 6, -1), -1)
+               if "JavaScriptActor.assumeIsolated" in lines[i]),
+              None,
+          )
+          if iso_idx is None:
+              sys.exit("PATCH FAILED: assumeIsolated line not found")
+
+          indent = lines[iso_idx][: len(lines[iso_idx]) - len(lines[iso_idx].lstrip())]
+          inner = indent + "  "
+
+          # 1) Before the isolated closure: take a nonisolated(unsafe)
+          #    copy of the raw slot pointer.
+          insert = [
+              f"{indent}// CI EXPERIMENT PATCH: copy the raw slot pointer into a\n",
+              f"{indent}// nonisolated(unsafe) local so the isolated closure below\n",
+              f"{indent}// captures only a raw pointer it owns, instead of 'sending'\n",
+              f"{indent}// 'slot' itself across the isolation boundary (which the\n",
+              f"{indent}// Swift 6 compiler rejects: \"sending 'slot' risks causing\n",
+              f"{indent}// data races\"). The pointer's allocation outlives this\n",
+              f"{indent}// synchronous call, as the original code already assumes.\n",
+              f"{indent}nonisolated(unsafe) let slotPointerCopy = slot\n",
+          ]
+          # 2) Inside the closure: build the Slot wrapper from the copy
+          #    and bind it to a local constant before calling encode.
+          replacement = [
+              f"{inner}let slotWrapper = JavaScriptValue.Slot(slotPointerCopy)\n",
+              f"{inner}try encode(slotWrapper, runtime)\n",
+          ]
+
+          lines[encode_idx:encode_idx + 1] = replacement
+          lines[iso_idx:iso_idx] = insert
+          path.write_text("".join(lines))
+          print("PATCH APPLIED to", path)
+          PYEOF
+          echo "---- patched region ----"
+          grep -n -B2 -A4 "slotPointerCopy" node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/Values/JavaScriptObject.swift | head -30
+
+      - name: Generate the native iOS project (Expo prebuild + pods)
+        run: npx expo prebuild --platform ios
+
+      # Same Xcode selection as the main workflow: SDK 58 targets
+      # Xcode 26.0 — pick the oldest 26.x on the image.
+      - name: Select Xcode 26.0 (the version Expo SDK 58 targets)
+        run: |
+          ls -d /Applications/Xcode_26*.app || true
+          XCODE_APP="$(ls -d /Applications/Xcode_26.0.app 2>/dev/null || ls -d /Applications/Xcode_26*.app | sort -V | head -1)"
+          echo "Selecting $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+
+      # Same as the main workflow: Release archive, signing OFF.
+      # Full log is tee'd to a file and uploaded either way.
+      - name: Build the app archive with signing OFF
+        run: |
+          cd ios
+          set -o pipefail
+          xcodebuild \
+            -workspace MVMTStudio.xcworkspace \
+            -scheme MVMTStudio \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/MVMTStudio.xcarchive" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-xcodebuild.log"
+
+      - name: Package the unsigned .ipa
+        run: |
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/MVMTStudio.xcarchive/Products/Applications/MVMTStudio.app" Payload/
+          zip -qry MVMTStudio-unsigned.ipa Payload
+          ls -lh MVMTStudio-unsigned.ipa
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-c-jsi-patch-unsigned-ipa
+          path: MVMTStudio-unsigned.ipa
+          retention-days: 14
+
+      - name: Upload the full xcodebuild log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-c-xcodebuild-log
+          path: build-xcodebuild.log
+          retention-days: 14
+          if-no-files-found: ignore

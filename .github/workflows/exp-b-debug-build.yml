@@ -1,0 +1,87 @@
+# EXPERIMENT B — "Debug build + manual packaging"
+#
+# Hypothesis: the Release `archive` path is not required to get a
+# sideloadable .app. A plain `xcodebuild build` in the Debug
+# configuration (with precompiled modules disabled, same as the latest
+# main-workflow attempt) may succeed where the archive path struggles,
+# and the resulting .app can be packaged into an unsigned .ipa exactly
+# the same way (Payload/ + zip) for Sideloadly.
+#
+# Runs on pushes to the ci-experiments branch only.
+name: Experiment B - Debug build + manual packaging
+
+on:
+  push:
+    branches: [ci-experiments]
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      # Same as the latest main workflow: compile modules from source
+      # instead of using Expo's precompiled modules.
+      EXPO_USE_PRECOMPILED_MODULES: "0"
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Generate the native iOS project (Expo prebuild + pods)
+        run: npx expo prebuild --platform ios
+
+      # Same Xcode selection as the main workflow: SDK 58 targets
+      # Xcode 26.0 — pick the oldest 26.x on the image.
+      - name: Select Xcode 26.0 (the version Expo SDK 58 targets)
+        run: |
+          ls -d /Applications/Xcode_26*.app || true
+          XCODE_APP="$(ls -d /Applications/Xcode_26.0.app 2>/dev/null || ls -d /Applications/Xcode_26*.app | sort -V | head -1)"
+          echo "Selecting $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+
+      # The experiment itself: `build`, NOT `archive`, Debug config.
+      - name: Build the app (Debug, signing OFF)
+        run: |
+          cd ios
+          set -o pipefail
+          xcodebuild \
+            -workspace MVMTStudio.xcworkspace \
+            -scheme MVMTStudio \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build/DD" \
+            build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-xcodebuild.log"
+
+      - name: Package the unsigned .ipa
+        run: |
+          mkdir -p Payload
+          cp -R "build/DD/Build/Products/Debug-iphoneos/MVMTStudio.app" Payload/
+          zip -qry MVMTStudio-unsigned-debug.ipa Payload
+          ls -lh MVMTStudio-unsigned-debug.ipa
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-b-debug-unsigned-ipa
+          path: MVMTStudio-unsigned-debug.ipa
+          retention-days: 14
+
+      - name: Upload the xcodebuild log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-b-xcodebuild-log
+          path: build-xcodebuild.log
+          retention-days: 14
+          if-no-files-found: ignore
