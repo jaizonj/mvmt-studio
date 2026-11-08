@@ -77,6 +77,8 @@ interface StudioState {
   /** The canonical edit (frame-based EDL). Null until the first edit exists. */
   edl: Edl | null;
   setEdl: (edl: Edl | null) => void;
+  /** Apply a freshly generated edit + record its take sequence (so the next shuffle differs). */
+  applyEdl: (edl: Edl, shuffleSequence?: string[]) => void;
   /** TRANSITIONAL legacy seconds-based timeline; removed in Wave 3. */
   timeline: TimelineClip[];
 
@@ -308,6 +310,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchActiveProject],
   );
 
+  const applyEdl = useCallback(
+    (next: Edl, shuffleSequence?: string[]) =>
+      patchActiveProject({
+        edl: next,
+        lastShuffleSequence: shuffleSequence ?? activeProjectRef.current?.lastShuffleSequence ?? null,
+      }),
+    [patchActiveProject],
+  );
+
   const setTrack = useCallback(
     (next: AudioTrack | null) => {
       patchActiveProject({
@@ -518,6 +529,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       takes,
       edl,
       setEdl,
+      applyEdl,
       timeline,
       setTrack,
       setTrackDuration,
@@ -590,6 +602,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       takes,
       edl,
       setEdl,
+      applyEdl,
       timeline,
       setTrack,
       setTrackDuration,
