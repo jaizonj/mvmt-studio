@@ -236,7 +236,7 @@ private func compositorError(_ message: String) -> NSError {
 /// Runs `block` inside an ObjC @try/@catch. Returns the NSException
 /// it raised, or nil when it completed normally.
 @discardableResult
-private func avTry(_ block: () -> Void) -> NSException? {
+private func avTry(_ block: @escaping () -> Void) -> NSException? {
   MvmtExceptionGuard.catching(block)
 }
 
