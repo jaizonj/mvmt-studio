@@ -112,7 +112,7 @@ reinstall pods as usual (`npx expo prebuild`, `npx pod-install`).
 
 The TS contract for everything below already exists in `src/index.ts`.
 The Swift implementation must match it exactly. One internal builder —
-`buildComposition(request) -> (composition, videoComposition, audioMix)` —
+`buildComposition(request, forExport:) -> (composition, videoComposition, audioMix)` —
 is shared by export AND preview. Nothing else in the app builds
 compositions.
 
@@ -125,6 +125,10 @@ compositions.
   the v1 behaviour (raw preferredTransform, first-clip canvas) is gone.
 - **Frame rate**: `videoComposition.frameDuration = 1/request.frameRate`
   (default 30).
+- **Watermark**: export builds only. The CoreAnimation tool must
+  never ride on a preview build — assigning such a videoComposition
+  to a preview player item throws on device (2026-11-09 crash);
+  previews overlay the logo at the JS layer instead.
 - **Validation/clamping**: clamp every clip's range to its asset's real
   duration (load `.duration` / track timeRange). If a clip's clamped
   range is empty, throw an error naming the clip index. Never insert a

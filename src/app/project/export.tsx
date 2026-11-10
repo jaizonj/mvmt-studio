@@ -5,6 +5,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { NativePreview } from '../../components/NativePreview';
+import { WatermarkOverlay } from '../../components/WatermarkOverlay';
 import { SegmentedControl } from '../../components/SegmentedControl';
 import {
   addExportProgressListener,
@@ -172,6 +173,7 @@ export default function ExportScreen() {
   const cutCount = cut?.edl.segments.length ?? 0;
 
   // ---- Preview transport (display state only — the native player owns timing).
+  const [stageWidth, setStageWidth] = useState(0);
   const [paused, setPaused] = useState(true);
   const [position, setPosition] = useState(0);
   const [previewStatus, setPreviewStatus] = useState<PreviewStatus>('loading');
@@ -348,7 +350,7 @@ export default function ExportScreen() {
                 bar (back button + title pill) and the transport pill
                 along the stage's bottom edge. Buttons on the picture
                 is the point of this layout. */}
-            <View style={styles.stage}>
+            <View style={styles.stage} onLayout={(e) => setStageWidth(e.nativeEvent.layout.width)}>
               <NativePreview
                 request={request}
                 requestKey={`${requestKey}#${previewNonce}`}
@@ -357,6 +359,7 @@ export default function ExportScreen() {
                 onStatus={setPreviewStatus}
                 style={styles.stagePreview}
               />
+              <WatermarkOverlay enabled={watermarkEnabled} width={stageWidth} />
               {previewStatus === 'loading' ? (
                 <View style={styles.previewLoading} pointerEvents="none">
                   <ActivityIndicator color={colors.label} />

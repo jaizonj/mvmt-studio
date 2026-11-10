@@ -218,6 +218,63 @@ private func compositorError(_ message: String) -> NSError {
   )
 }
 
+// MARK: - NSException guard
+//
+// Several AVFoundation APIs validate-and-THROW NSExceptions instead
+// of returning errors, and Swift cannot catch those — every crash in
+// this app's device history was that species (prerollAtRate:, the
+// AVAssetWriterInput initialiser validating against a
+// sourceFormatHint, -[AVPlayerItem setVideoComposition:] rejecting a
+// composition). MvmtExceptionGuard (ObjC, same module) runs a closure
+// inside @try/@catch and hands back whatever was raised, so the
+// throw-prone calls wrapped with avTry degrade gracefully — a failed
+// build, a degraded preview, an aborted take — instead of aborting
+// the process. Only genuine validation sites are wrapped; provably
+// non-throwing calls (play/pause/seek/startRunning) are NOT, so real
+// bugs stay loud.
+
+/// Runs `block` inside an ObjC @try/@catch. Returns the NSException
+/// it raised, or nil when it completed normally.
+@discardableResult
+private func avTry(_ block: () -> Void) -> NSException? {
+  MvmtExceptionGuard.catching(block)
+}
+
+/// An ordinary compositor error describing a caught AVFoundation
+/// exception — for guarded sites whose failure path is "throw a
+/// normal Swift error".
+private func exceptionError(_ context: String, _ exception: NSException) -> NSError {
+  compositorError("\(context) (\(exception.name.rawValue): \(exception.reason ?? "no reason given"))")
+}
+
+/// Guarded `AVMutableCompositionTrack.insertTimeRange`: the bridged
+/// Swift error covers most rejections, but out-of-range insertions
+/// can also raise an NSException. Both become an ordinary thrown
+/// error here, so a take whose metadata lies about its contents
+/// fails the build instead of aborting the app.
+private func insertTimeRangeGuarded(
+  into target: AVMutableCompositionTrack,
+  _ range: CMTimeRange,
+  of source: AVAssetTrack,
+  at start: CMTime,
+  _ what: String
+) throws {
+  var swiftError: Error?
+  let exception = avTry {
+    do {
+      try target.insertTimeRange(range, of: source, at: start)
+    } catch {
+      swiftError = error
+    }
+  }
+  if let exception {
+    throw exceptionError(what, exception)
+  }
+  if let swiftError {
+    throw swiftError
+  }
+}
+
 // MARK: - Shared composition builder output
 
 private struct BuiltComposition {
@@ -230,8 +287,13 @@ private struct BuiltComposition {
 // MARK: - Engine (AVFoundation)
 //
 // ONE builder — buildComposition — powers BOTH export (render) and
-// native preview (PreviewStore.create), so what you preview is exactly
-// what renders. Nothing else in the app builds compositions.
+// native preview (PreviewStore.create), so what you preview is what
+// renders. Nothing else in the app builds compositions. ONE carve-out:
+// the watermark animation tool is attached for EXPORT builds only
+// (the forExport flag) — assigning a videoComposition that carries an
+// animation tool to a preview player item throws on device
+// (crash log MVMTStudio-2026-11-09-220942); the app overlays the logo
+// in previews at the JS layer instead.
 
 private enum MvmtCompositorEngine {
   /// File paths may arrive as `file://` URIs or plain paths.
@@ -244,7 +306,7 @@ private enum MvmtCompositorEngine {
 
   // MARK: Shared builder
 
-  static func buildComposition(_ request: CompositeRequestRecord) async throws -> BuiltComposition {
+  static func buildComposition(_ request: CompositeRequestRecord, forExport: Bool) async throws -> BuiltComposition {
     let clips = request.clips
     guard !clips.isEmpty else {
       throw compositorError("At least one clip is required to build a composition.")
@@ -265,12 +327,6 @@ private enum MvmtCompositorEngine {
     guard frameRate >= 1, frameRate <= 240 else {
       throw compositorError("Invalid frame rate \(frameRate).")
     }
-    // Render grid: at least 60fps (Jaizon: capture defaults to 60fps,
-    // renders should keep every captured frame). The EDL's 30fps cut
-    // times are CMTime values — they land on the same instants on the
-    // finer grid (30 divides 60), so this changes only the sampling
-    // cadence, never the edit.
-    let renderFrameRate = max(frameRate, 60)
 
     let timescale: CMTimeScale = 600
     let composition = AVMutableComposition()
@@ -343,7 +399,10 @@ private enum MvmtCompositorEngine {
         duration: CMTime(seconds: clampedDuration, preferredTimescale: timescale)
       )
 
-      try compositionVideoTrack.insertTimeRange(range, of: sourceVideoTrack, at: cursor)
+      try insertTimeRangeGuarded(
+        into: compositionVideoTrack, range, of: sourceVideoTrack, at: cursor,
+        "Clip \(index + 1)'s video could not be added to the composition"
+      )
 
       // Normalise this segment into the project canvas: apply the
       // source's preferredTransform, take its display size, then scale
@@ -375,7 +434,10 @@ private enum MvmtCompositorEngine {
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         if let sourceAudioTrack = audioTracks.first {
           let targetTrack = try clipAudioTrack()
-          try targetTrack.insertTimeRange(range, of: sourceAudioTrack, at: cursor)
+          try insertTimeRangeGuarded(
+            into: targetTrack, range, of: sourceAudioTrack, at: cursor,
+            "Clip \(index + 1)'s audio could not be added to the composition"
+          )
           if clipAudioMixParameters == nil {
             clipAudioMixParameters = AVMutableAudioMixInputParameters(track: targetTrack)
           }
@@ -417,10 +479,12 @@ private enum MvmtCompositorEngine {
         else {
           throw compositorError("Could not create the composition master audio track.")
         }
-        try targetTrack.insertTimeRange(
+        try insertTimeRangeGuarded(
+          into: targetTrack,
           CMTimeRange(start: start, duration: length),
           of: sourceMasterTrack,
-          at: .zero
+          at: .zero,
+          "The master audio could not be added to the composition"
         )
         let parameters = AVMutableAudioMixInputParameters(track: targetTrack)
         parameters.setVolume(Float(max(0, min(1, request.audioVolume))), at: .zero)
@@ -432,7 +496,10 @@ private enum MvmtCompositorEngine {
     // the normalised canvas transforms ----
     let videoComposition = AVMutableVideoComposition()
     videoComposition.renderSize = canvasSize
-    videoComposition.frameDuration = CMTime(seconds: 1.0 / renderFrameRate, preferredTimescale: timescale)
+    // The render grid is exactly the request's frame rate (the EDL's
+    // 30fps grid) — the verified composition shape. (Round 3 sampled
+    // at max(frameRate, 60); reverted with the Edit-screen crash fix.)
+    videoComposition.frameDuration = CMTime(seconds: 1.0 / frameRate, preferredTimescale: timescale)
     videoComposition.instructions = segmentRanges.enumerated().map { index, range in
       let instruction = AVMutableVideoCompositionInstruction()
       instruction.timeRange = range
@@ -449,13 +516,19 @@ private enum MvmtCompositorEngine {
       audioMix = mix
     }
 
-    // ---- Optional watermark: the logo lockup flipping between the
-    // top-left and bottom-right corners every 5 seconds. It rides on
-    // THIS videoComposition — the same object preview assigns to its
-    // player item and export assigns to its session — so the preview
-    // shows exactly what renders. A missing/unloadable image degrades
-    // to no watermark: a render must never fail over branding.
-    if request.watermarkEnabled == true,
+    // ---- Optional watermark (EXPORT builds only): the logo lockup
+    // flipping between the top-left and bottom-right corners every
+    // 5 seconds, via a CoreAnimation tool on the videoComposition
+    // the export session renders. Preview builds must NOT carry the
+    // tool: -[AVPlayerItem setVideoComposition:] throws an uncaught
+    // NSException for a composition carrying an animation tool on
+    // device (crash log MVMTStudio-2026-11-09-220942) — the app
+    // overlays the logo in previews at the JS layer instead, so the
+    // request's watermark fields have no effect on a preview build.
+    // A missing/unloadable image degrades to no watermark: a render
+    // must never fail over branding.
+    if forExport,
+      request.watermarkEnabled == true,
       let watermarkUri = request.watermarkImageUri, !watermarkUri.isEmpty,
       let tool = makeWatermarkAnimationTool(
         imageURL: resolveURL(watermarkUri),
@@ -557,7 +630,7 @@ private enum MvmtCompositorEngine {
     _ request: CompositeRequestRecord,
     onProgress: ((Double) -> Void)? = nil
   ) async throws -> CompositeResultRecord {
-    let built = try await buildComposition(request)
+    let built = try await buildComposition(request, forExport: true)
 
     guard
       let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -569,20 +642,35 @@ private enum MvmtCompositorEngine {
       try? FileManager.default.removeItem(at: outputURL)
     }
 
-    guard
-      let exporter = AVAssetExportSession(
-        asset: built.composition,
-        presetName: AVAssetExportPresetHighestQuality
-      )
-    else {
-      throw compositorError("Could not create the export session.")
+    // Guarded: creating the session and assigning its
+    // videoComposition validate the built composition, and
+    // AVFoundation raises an NSException (not an error) for some
+    // invalid ones. A caught exception takes the ordinary
+    // export-failure path — throw, like every other failure here.
+    var createdExporter: AVAssetExportSession?
+    let exporterException = avTry {
+      guard
+        let session = AVAssetExportSession(
+          asset: built.composition,
+          presetName: AVAssetExportPresetHighestQuality
+        )
+      else {
+        return
+      }
+      session.outputURL = outputURL
+      session.outputFileType = .mp4
+      session.shouldOptimizeForNetworkUse = false
+      session.videoComposition = built.videoComposition
+      if let audioMix = built.audioMix {
+        session.audioMix = audioMix
+      }
+      createdExporter = session
     }
-    exporter.outputURL = outputURL
-    exporter.outputFileType = .mp4
-    exporter.shouldOptimizeForNetworkUse = false
-    exporter.videoComposition = built.videoComposition
-    if let audioMix = built.audioMix {
-      exporter.audioMix = audioMix
+    if let exporterException {
+      throw exceptionError("The export session rejected the composition", exporterException)
+    }
+    guard let exporter = createdExporter else {
+      throw compositorError("Could not create the export session.")
     }
 
     // Register for cancellation + progress when the caller gave an id.
@@ -1359,11 +1447,20 @@ private final class PreviewStore {
   // MARK: Lifecycle
 
   func create(request: CompositeRequestRecord) async throws -> String {
-    let built = try await MvmtCompositorEngine.buildComposition(request)
+    let built = try await MvmtCompositorEngine.buildComposition(request, forExport: false)
     let durationSeconds = CMTimeGetSeconds(built.duration)
     let previewId = await MainActor.run { () -> String in
       let item = AVPlayerItem(asset: built.composition)
-      item.videoComposition = built.videoComposition
+      // Guarded: -[AVPlayerItem setVideoComposition:] validates the
+      // composition against the asset and can THROW an uncaught
+      // NSException doing it (the animation-tool composition did
+      // exactly that on device — crash log
+      // MVMTStudio-2026-11-09-220942; the tool no longer ships in
+      // previews, but no composition a bad take can produce may ever
+      // abort the app again). On a caught exception the preview
+      // falls back to NO video composition: the stitched asset
+      // still plays — degraded framing, working preview.
+      avTry { item.videoComposition = built.videoComposition }
       item.audioMix = built.audioMix
       let player = AVPlayer(playerItem: item)
       let id = UUID().uuidString
@@ -1663,11 +1760,15 @@ private final class CaptureCoordinator: NSObject,
   private var configuration = CaptureConfiguration()
   private var outputsConfigured = false
   private var sessionConfigured = false
-  /// True when the active device was switched to a 60fps format by
-  /// configureSessionLocked (the capture default — see
-  /// applySixtyFpsFormatLocked). Read by the writer plumbing to tag
-  /// the video input's expected source frame rate.
-  private var captureIsSixtyFps = false
+  /// Pinned false, permanently: Round 3 forced a 60fps device format
+  /// (activeFormat under .inputPriority) and the preview crawled at
+  /// ~5fps on device, so format forcing was removed. The session
+  /// preset steers the format again — the configuration Jaizon
+  /// verified as perfect in the pre-Round-3 build — and the preset
+  /// steering in configureSessionLocked still reads this flag.
+  /// Nothing anywhere sets a device activeFormat, frame-duration
+  /// pins, or .inputPriority.
+  private let captureIsSixtyFps = false
   private var configuredPosition: AVCaptureDevice.Position?
   private var videoDevice: AVCaptureDevice?
   private var videoInput: AVCaptureDeviceInput?
@@ -1737,6 +1838,12 @@ private final class CaptureCoordinator: NSObject,
   private var finishedError: Error?
   private var startTimeoutItem: DispatchWorkItem?
   private var seekArmItem: DispatchWorkItem?
+  /// KVO token watching the current take's song item for
+  /// .readyToPlay when the zero-tolerance seek must wait for
+  /// readiness (see issueSeekWhenReadyLocked). Invalidated when the
+  /// seek is issued and wherever seekArmItem is torn down — no
+  /// dangling observers.
+  private var songStatusObservation: NSKeyValueObservation?
 
   // MARK: Availability
 
@@ -1823,93 +1930,6 @@ private final class CaptureCoordinator: NSObject,
     return AVCaptureDevice.default(for: .video)
   }
 
-  /// The device's best 60fps format (capture defaults to 60fps —
-  /// Jaizon): exact 1920×1080 with a frame-rate range covering 60
-  /// wins outright; otherwise the largest format at or under 1080p
-  /// whose ranges cover 60. Nil when the device cannot do 60 at all —
-  /// the caller then leaves the session-preset behaviour untouched.
-  private static func bestSixtyFpsFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
-    // The device offers SEVERAL 1920x1080 formats that "cover 60":
-    // the everyday one, slow-motion readout modes (topping out at
-    // 120/240), and 10-bit HDR variants. The first build picked the
-    // first match and the preview crawled at ~5fps on device — the
-    // wrong format makes the pipeline convert/process every frame.
-    // Rank candidates instead: prefer the LOWEST top frame rate
-    // that still covers 60 (the everyday 60 format tops out at 60;
-    // slo-mo modes top higher), then prefer the exact pixel format
-    // the data output consumes (8-bit full-range biplanar — zero
-    // per-frame conversion), then video-range, then anything else.
-    var best: AVCaptureDevice.Format?
-    var bestRank: (Int, Int)?
-    for format in device.formats {
-      let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-      guard dims.width == 1920, dims.height == 1080 else { continue }
-      // A normal cadence range: reaches 60 but also goes low
-      // (low-light headroom) — take the tightest top end offered.
-      let covering = format.videoSupportedFrameRateRanges
-        .filter { $0.minFrameRate <= 30 && $0.maxFrameRate >= 59.9 }
-        .min { $0.maxFrameRate < $1.maxFrameRate }
-      guard let range = covering else { continue }
-      let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
-      let subtypeRank =
-        subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        ? 0
-        : subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 1 : 2
-      let rank = (Int(range.maxFrameRate.rounded()), subtypeRank)
-      if let current = bestRank, rank >= current { continue }
-      best = format
-      bestRank = rank
-    }
-    return best
-  }
-
-  /// Switches the just-connected device to its 60fps format and pins
-  /// its frame duration to exactly 1/60. Called from the input-swap
-  /// block in configureSessionLocked, so each camera (front included)
-  /// gets its OWN device's format when the facing flips. Re-applying
-  /// to an already-configured device is a no-op — resetting the
-  /// active format mid-stream would glitch the running preview.
-  private func applySixtyFpsFormatLocked(to device: AVCaptureDevice) {
-    captureIsSixtyFps = false
-    guard let format = Self.bestSixtyFpsFormat(for: device) else { return }
-    let frameDuration = CMTime(value: 1, timescale: 60)
-    let targetDims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-    let currentDims = CMVideoFormatDescriptionGetDimensions(
-      device.activeFormat.formatDescription
-    )
-    let alreadySixty =
-      currentDims.width == targetDims.width && currentDims.height == targetDims.height
-      && CMTimeCompare(device.activeVideoMinFrameDuration, frameDuration) == 0
-      && CMTimeCompare(device.activeVideoMaxFrameDuration, frameDuration) == 0
-    if alreadySixty {
-      // Re-assert inputPriority in case another configure pass moved
-      // the preset — the device's format is the source of truth.
-      session.sessionPreset = .inputPriority
-      captureIsSixtyFps = true
-      return
-    }
-    // ORDER IS LOAD-BEARING: the session preset must be
-    // .inputPriority BEFORE activeFormat is assigned. Setting
-    // activeFormat on a device that is an input to a session
-    // running a dimensional preset throws NSInvalidArgumentException
-    // — the launch crash on the first build that touched
-    // activeFormat (the input is added to the session before this
-    // runs, and the session was steering by preset until now).
-    session.sessionPreset = .inputPriority
-    do {
-      try device.lockForConfiguration()
-      device.activeFormat = format
-      device.activeVideoMinFrameDuration = frameDuration
-      device.activeVideoMaxFrameDuration = frameDuration
-      device.unlockForConfiguration()
-      captureIsSixtyFps = true
-    } catch {
-      // Leave the preset defaults — capture still works, just at
-      // whatever format the session preset picks.
-      captureIsSixtyFps = false
-    }
-  }
-
   /// (Re)builds inputs/outputs to match `configuration`. Idempotent;
   /// safe to call whenever the session is stopped or running (but not
   /// mid-capture — callers guard that).
@@ -1930,12 +1950,10 @@ private final class CaptureCoordinator: NSObject,
     session.beginConfiguration()
     // The app (expo-audio) owns the audio session category.
     session.automaticallyConfiguresApplicationAudioSession = false
-    // Once a device has been switched to a 60fps format the session
-    // preset is .inputPriority (set by applySixtyFpsFormatLocked) —
-    // re-assigning a dimensional preset here could make the session
-    // re-pick the input's (30fps) format at commit time and silently
-    // undo the 60fps default, so the preset is only steered while no
-    // 60fps format is in force.
+    // Format forcing was removed after Round 3's 5fps device
+    // result: the session preset steers the device format
+    // (.hd1920x1080, else .high) — the exact configuration Jaizon
+    // verified as perfect in the pre-Round-3 build.
     if !captureIsSixtyFps {
       if session.canSetSessionPreset(.hd1920x1080) {
         session.sessionPreset = .hd1920x1080
@@ -1962,7 +1980,6 @@ private final class CaptureCoordinator: NSObject,
             videoInput = input
             videoDevice = device
             configuredPosition = configuration.facing
-            applySixtyFpsFormatLocked(to: device)
           } else {
             deviceError = compositorError("The capture session rejected the camera input.")
           }
@@ -2142,10 +2159,6 @@ private final class CaptureCoordinator: NSObject,
   /// reconfigure would trust them and rebuild nothing.
   private func handleRuntimeErrorLocked(_ error: NSError?) {
     sessionConfigured = false
-    // captureIsSixtyFps is deliberately NOT cleared here: after a
-    // plain runtime error the device keeps its 60fps format, and
-    // after a reset the reconfigure re-derives the flag via
-    // applySixtyFpsFormatLocked when the inputs are rebuilt.
     if let error,
       error.domain == AVFoundationErrorDomain,
       // AVFoundationErrorMediaServicesWereReset (-11819) — the named
@@ -2359,11 +2372,28 @@ private final class CaptureCoordinator: NSObject,
       try? FileManager.default.removeItem(at: url)
     }
     outputURL = url
-    do {
-      writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-    } catch {
+    // The bridged Swift error covers the documented failure modes;
+    // avTry additionally catches any NSException the writer's
+    // initialiser raises, so creation can only ever fail the start
+    // cleanly (the JS side shows its notice), never abort the app.
+    var writerCreateError: Error?
+    let writerException = avTry {
+      do {
+        self.writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+      } catch {
+        writerCreateError = error
+      }
+    }
+    if let writerException {
       state = .idle
-      continuation.resume(throwing: error)
+      continuation.resume(
+        throwing: exceptionError("The recording file could not be created", writerException)
+      )
+      return
+    }
+    if let writerCreateError {
+      state = .idle
+      continuation.resume(throwing: writerCreateError)
       return
     }
 
@@ -2391,7 +2421,10 @@ private final class CaptureCoordinator: NSObject,
 
   /// Sets up the internal song player and seeks it (ZERO tolerances —
   /// the seek must land on the exact requested position; this player
-  /// is the song clock for the whole capture). Capture "arms"
+  /// is the song clock for the whole capture). The seek waits for the
+  /// item to be .readyToPlay (see issueSeekWhenReadyLocked): a seek
+  /// issued against a still-loading item is unreliable on device.
+  /// Capture "arms"
   /// (transitions to .recording, samples start appending) only once
   /// the seek has completed and playback has started, or immediately
   /// when there is no song. A failed song never blocks the recording
@@ -2427,29 +2460,101 @@ private final class CaptureCoordinator: NSObject,
     songPlayer = player
 
     let target = CMTime(seconds: max(0, songStartSeconds), preferredTimescale: 600)
-    item.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+
+    // Outer bound: if the seek never lands, arm anyway (measurement
+    // stays nil) rather than hanging the recording — and PLAY unless
+    // the item failed. The old timeout armed WITHOUT playing, so a
+    // stalled seek produced a take recorded in silence.
+    let armTimeout = DispatchWorkItem { [weak self] in
+      guard let self, self.state == .preparing else { return }
+      if item.status != .failed {
+        player.play()
+      }
+      self.state = .recording
+    }
+    seekArmItem = armTimeout
+    queue.asyncAfter(deadline: .now() + 5, execute: armTimeout)
+
+    issueSeekWhenReadyLocked(item: item, player: player, target: target)
+  }
+
+  /// Issues the take's zero-tolerance seek — but only once the item
+  /// is .readyToPlay. A seek issued against a not-yet-ready item is
+  /// unreliable on device: the FIRST take of a session adopts the
+  /// standing player prepareSong created moments earlier, its item
+  /// still loading, and the take played from 0 instead of the picked
+  /// part (later takes adopt the promoted previous player, long
+  /// since ready — which is why only the first take was wrong). Not
+  /// ready yet → a KVO observation on the item's status issues the
+  /// seek the moment it turns ready; a failed item arms without
+  /// playing (the failed-item behaviour the seek completion has
+  /// always had). The 5s arm timeout in preparePlayerLocked remains
+  /// the outer bound either way.
+  private func issueSeekWhenReadyLocked(item: AVPlayerItem, player: AVPlayer, target: CMTime) {
+    tearDownSongStatusObservationLocked()
+    switch item.status {
+    case .readyToPlay:
+      issueSeekLocked(item: item, player: player, target: target)
+    case .failed:
+      // A failed song never blocks the recording: arm silent.
+      seekArmItem?.cancel()
+      seekArmItem = nil
+      state = .recording
+    default:
+      songStatusObservation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
+        guard let self else { return }
+        // Status changes arrive on an arbitrary thread — hop onto
+        // the capture queue like every other capture callback.
+        self.queue.async {
+          guard self.state == .preparing, self.songItem === observedItem else { return }
+          switch observedItem.status {
+          case .readyToPlay:
+            self.issueSeekLocked(item: observedItem, player: player, target: target)
+          case .failed:
+            self.tearDownSongStatusObservationLocked()
+            self.seekArmItem?.cancel()
+            self.seekArmItem = nil
+            self.state = .recording
+          default:
+            break
+          }
+        }
+      }
+    }
+  }
+
+  /// The zero-tolerance seek itself, plus its completion: cancel the
+  /// arm timeout, play (unless the item failed) and arm. A seek whose
+  /// completion reports finished == false was superseded before it
+  /// landed — re-issue the same seek ONCE before playing, so the
+  /// take still starts at the picked position.
+  private func issueSeekLocked(item: AVPlayerItem, player: AVPlayer, target: CMTime, isRetry: Bool = false) {
+    // The seek supersedes the readiness wait.
+    tearDownSongStatusObservationLocked()
+    item.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
       guard let self else { return }
       self.queue.async {
         guard self.state == .preparing else { return }
+        if !finished, !isRetry {
+          self.issueSeekLocked(item: item, player: player, target: target, isRetry: true)
+          return
+        }
         self.seekArmItem?.cancel()
         self.seekArmItem = nil
-        // Play even if the precise seek reports failure (e.g. it was
-        // superseded): the first-frame conversion measures wherever
-        // the song actually is. Only a FAILED item stays silent.
+        // Play even if the precise seek reports failure: the
+        // finish-time anchor measures wherever the song actually
+        // is. Only a FAILED item stays silent.
         if item.status != .failed {
           player.play()
         }
         self.state = .recording
       }
     }
-    // If the seek never lands, arm anyway (measurement stays nil)
-    // rather than hanging the recording.
-    let armTimeout = DispatchWorkItem { [weak self] in
-      guard let self, self.state == .preparing else { return }
-      self.state = .recording
-    }
-    seekArmItem = armTimeout
-    queue.asyncAfter(deadline: .now() + 5, execute: armTimeout)
+  }
+
+  private func tearDownSongStatusObservationLocked() {
+    songStatusObservation?.invalidate()
+    songStatusObservation = nil
   }
 
   /// The anchor algebra shared by the first-frame estimate and the
@@ -2605,13 +2710,26 @@ private final class CaptureCoordinator: NSObject,
     // MVMTStudio-2026-11-09-213806). It was only an encoder hint —
     // the real cadence lives in the sample timestamps. The settings
     // below are exactly the shape that recorded fine in every
-    // pre-60fps build.
-    let videoInput = AVAssetWriterInput(
-      mediaType: .video,
-      outputSettings: videoSettings,
-      sourceFormatHint: formatDescription
-    )
-    videoInput.expectsMediaDataInRealTime = true
+    // pre-60fps build. The initialiser is ALSO wrapped in avTry now:
+    // whatever it validates, a rejection must abort this take
+    // cleanly (the app's notice path), never the process.
+    var createdVideoInput: AVAssetWriterInput?
+    if let exception = avTry({
+      let input = AVAssetWriterInput(
+        mediaType: .video,
+        outputSettings: videoSettings,
+        sourceFormatHint: formatDescription
+      )
+      input.expectsMediaDataInRealTime = true
+      createdVideoInput = input
+    }) {
+      abortCaptureLocked(error: exceptionError("The video writer input was rejected", exception))
+      return false
+    }
+    guard let videoInput = createdVideoInput else {
+      abortCaptureLocked(error: compositorError("The video writer input could not be created."))
+      return false
+    }
     guard writer.canAdd(videoInput) else {
       abortCaptureLocked(error: compositorError("The writer rejected the video input."))
       return false
@@ -2658,13 +2776,20 @@ private final class CaptureCoordinator: NSObject,
       AVNumberOfChannelsKey: channels,
       AVEncoderBitRateKey: 128_000,
     ]
-    let input = AVAssetWriterInput(
-      mediaType: .audio,
-      outputSettings: settings,
-      sourceFormatHint: formatDescription
-    )
-    input.expectsMediaDataInRealTime = true
-    if writer.canAdd(input) {
+    // Guarded like the video input above (avTry): if this
+    // initialiser raises, createdInput stays nil and the take
+    // degrades to video-only instead of aborting the app.
+    var createdInput: AVAssetWriterInput?
+    avTry {
+      let input = AVAssetWriterInput(
+        mediaType: .audio,
+        outputSettings: settings,
+        sourceFormatHint: formatDescription
+      )
+      input.expectsMediaDataInRealTime = true
+      createdInput = input
+    }
+    if let input = createdInput, writer.canAdd(input) {
       writer.add(input)
       audioWriterInput = input
     }
@@ -2748,6 +2873,7 @@ private final class CaptureCoordinator: NSObject,
     startTimeoutItem = nil
     seekArmItem?.cancel()
     seekArmItem = nil
+    tearDownSongStatusObservationLocked()
     // Authoritative sync measurement BEFORE the song player pauses:
     // re-anchor the first-frame position from the provably-advancing
     // player (see refineSongPositionAtFinishLocked).
@@ -2807,6 +2933,7 @@ private final class CaptureCoordinator: NSObject,
     startTimeoutItem = nil
     seekArmItem?.cancel()
     seekArmItem = nil
+    tearDownSongStatusObservationLocked()
     if let continuation = startContinuation {
       startContinuation = nil
       continuation.resume(throwing: error)

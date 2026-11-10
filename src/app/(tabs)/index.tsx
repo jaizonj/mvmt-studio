@@ -31,8 +31,15 @@ export default function StudioHome() {
   useEffect(() => {
     if (!hydrated || !activeProject || launchedRef.current) return;
     launchedRef.current = true;
+    // Jaizon (2026-11-09): open to a FRESH project, not the most
+    // recent. If the restored active project has content (takes or
+    // a track), start a new one for this session — the old project
+    // stays untouched in Projects. An untouched project is already
+    // fresh, so reuse it: launches must not pile up empties.
+    const hasContent = activeProject.takes.length > 0 || activeProject.track !== null;
+    if (hasContent) studio.createProject();
     router.push('/project/record');
-  }, [hydrated, activeProject]);
+  }, [hydrated, activeProject, studio]);
 
   const startNewProject = () => {
     studio.createProject();

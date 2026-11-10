@@ -301,7 +301,7 @@ export default function CameraScreen() {
   // Go), the expo-camera path below runs exactly as before.
   const useNativeCapture = isCaptureAvailable();
   // Pre-warm the native song player while this screen is up: the
-  // module builds a standing, prerolled player for the current
+  // module builds a standing, pre-loaded player for the current
   // track so pressing record adopts it instead of paying the cold
   // load inside the take (Jaizon: the first takes of a session
   // lagged and messed up until the app "caught up"). No-op on the

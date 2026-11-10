@@ -18,6 +18,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { NativePreview, type NativePreviewHandle } from '../../components/NativePreview';
+import { WatermarkOverlay } from '../../components/WatermarkOverlay';
 import { SegmentedControl } from '../../components/SegmentedControl';
 import {
   TimelineStrip,
@@ -42,7 +43,6 @@ import {
 } from '../../lib/edl';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import { buildEdlFromShuffle, validateAgainstAssets } from '../../lib/shuffleEdl';
-import { resolveWatermarkUri } from '../../lib/watermark';
 import { useStudio } from '../../store/StudioContext';
 import type { ShuffleFrequency, Take } from '../../types';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
@@ -504,33 +504,24 @@ function EditorWorkspace() {
   const takeUriById = useCallback((id: string) => takes.find((t) => t.id === id)?.uri, [takes]);
 
   // Watermark: the flag lives on the project (toggled in Edit mode
-  // below); the logo's file URI is resolved once via the shared cache
-  // in src/lib/watermark.ts. The preview request carries both, so the
-  // preview stamps exactly what the export will (preview == export).
+  // below) and drives the WatermarkOverlay on the preview frame.
+  // The native preview request deliberately carries NO watermark
+  // fields: a composition with the animation tool throws when a
+  // player item assigns it (Edit crash, 2026-11-09), so previews are
+  // built tool-free (forExport: false in the module) and the stamp
+  // exists only in the export render and in this screen's overlay.
+  // Keeping the fields out of the request also means flipping the
+  // toggle never rebuilds the preview.
   const watermarkOn = studio.watermarkEnabled;
-  const [watermarkUri, setWatermarkUri] = useState<string | null>(null);
-  useEffect(() => {
-    if (!watermarkOn) return;
-    let alive = true;
-    void resolveWatermarkUri().then((uri) => {
-      if (alive) setWatermarkUri(uri);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [watermarkOn]);
 
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
     try {
-      return edlToCompositeRequest(edl, takeUriById, {
-        watermarkEnabled: watermarkOn,
-        watermarkImageUri: watermarkOn ? watermarkUri : null,
-      });
+      return edlToCompositeRequest(edl, takeUriById);
     } catch {
       return null;
     }
-  }, [edl, takeUriById, watermarkOn, watermarkUri]);
+  }, [edl, takeUriById]);
   const previewKey = previewRequest ? `${JSON.stringify(previewRequest)}#${previewNonce}` : '';
 
   const handleProgress = useCallback((pos: number, playing: boolean) => {
@@ -641,6 +632,7 @@ function EditorWorkspace() {
               style={StyleSheet.absoluteFill}
             />
             {sweepKey > 0 ? <SweepOverlay key={sweepKey} width={previewWidth} /> : null}
+            <WatermarkOverlay enabled={watermarkOn} width={previewWidth} />
             {previewStatus === 'loading' ? (
               <View style={styles.previewOverlay} pointerEvents="none">
                 <ActivityIndicator color={colors.label} />
