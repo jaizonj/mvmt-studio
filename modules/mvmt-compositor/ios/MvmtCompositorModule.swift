@@ -2586,11 +2586,14 @@ private final class CaptureCoordinator: NSObject,
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
       ],
     ]
-    if captureIsSixtyFps {
-      // Harmless metadata that lets the encoder size its queues for
-      // the real cadence when the session is running a 60fps format.
-      videoSettings[AVVideoExpectedSourceFrameRateKey] = 60
-    }
+    // Deliberately NO AVVideoExpectedSourceFrameRateKey here: with a
+    // sourceFormatHint attached, AVAssetWriterInput's initialiser
+    // validates the settings and THREW an uncaught NSException on
+    // device the moment record was pressed (crash log
+    // MVMTStudio-2026-11-09-213806). It was only an encoder hint —
+    // the real cadence lives in the sample timestamps. The settings
+    // below are exactly the shape that recorded fine in every
+    // pre-60fps build.
     let videoInput = AVAssetWriterInput(
       mediaType: .video,
       outputSettings: videoSettings,
