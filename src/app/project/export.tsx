@@ -65,9 +65,9 @@ const QUALITY_CANVAS: Record<ExportQualityPref, { width: number; height: number 
 };
 
 const QUALITY_CAPTIONS: Record<ExportQualityPref, string> = {
-  high: 'Best quality, bigger file.',
-  balanced: 'A good size for sharing.',
-  small: 'Smaller file, softer picture.',
+  high: 'Best quality · 60fps, bigger file.',
+  balanced: 'A good size for sharing · 30fps.',
+  small: 'Smaller file, softer picture · 30fps.',
 };
 
 interface ValidatedCut {
@@ -159,6 +159,10 @@ export default function ExportScreen() {
       const base = edlToCompositeRequest(effectiveEdl, takeUri, {
         watermarkEnabled,
         watermarkImageUri: watermarkEnabled ? watermarkUri : null,
+        // Export frame rate follows the quality tier (Jaizon):
+        // High renders 60fps; Balanced/Small render 30fps to keep
+        // files shareable (<20MB for typical clip lengths).
+        frameRate: exportQuality === 'high' ? 60 : 30,
       });
       // 'high' (null) renders at the cut's canvas — which follows the
       // takes, so 4K takes export at 4K; balanced/small are explicit

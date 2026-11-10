@@ -238,6 +238,15 @@ export function edlToCompositeRequest(
     watermarkEnabled?: boolean;
     /** On-device file URI of the watermark image (see src/lib/watermark.ts). */
     watermarkImageUri?: string | null;
+    /**
+     * Render frame rate for the composition (Jaizon, 2026-11-09:
+     * export High = 60fps; Balanced/Small = 30fps so files stay
+     * small enough to share, e.g. Discord <20MB). Defaults to the
+     * EDL's own fps. Cut boundaries live on the EDL's 30-grid and 30
+     * divides 60, so they land exactly at either rate — only the
+     * sampling of 60fps-shot takes differs.
+     */
+    frameRate?: number;
   } = {},
 ): CompositeRequest {
   const clips = edl.segments.map((segment) => {
@@ -258,7 +267,7 @@ export function edlToCompositeRequest(
     audioVolume: edl.audio.volume,
     canvasWidth: edl.canvas.width,
     canvasHeight: edl.canvas.height,
-    frameRate: edl.fps,
+    frameRate: options.frameRate ?? edl.fps,
     // Watermark: passed through untouched — the native engine decides
     // how to stamp it. Only the Editor preview and the Export render
     // set these; other callers (e.g. the Record screen's per-take
