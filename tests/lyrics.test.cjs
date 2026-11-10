@@ -588,3 +588,73 @@ test('payload: style resolves to a PostScript name + animation params', () => {
   );
   assert.equal(regular.style.fontPostScriptName, 'AvenirNext-Regular');
 });
+
+// ── JS↔Swift bridge contract ─────────────────────────────────────
+// Regression (Jaizon, 2026-11-10): lyrics exported in "a basic font
+// with no style". The Expo bridge converts the request's lyrics
+// record BY FIELD NAME; the Swift LyricStyleRecord declared
+// postScriptName / colorHex / strokeColorHex / backgroundColorHex
+// while the payload emits fontPostScriptName / color / strokeColor /
+// backgroundColor — so every styled field arrived empty on device
+// (system font, white, no stroke) while previews (pure JS) looked
+// right. These tests pin the payload's keys to the Swift records'
+// @Field names so the two sides can never drift again silently.
+const fs = require('node:fs');
+const path = require('node:path');
+
+function swiftRecordFields(structName) {
+  const swiftPath = path.join(
+    __dirname,
+    '..',
+    'modules',
+    'mvmt-compositor',
+    'ios',
+    'MvmtCompositorModule.swift',
+  );
+  const source = fs.readFileSync(swiftPath, 'utf8');
+  const match = source.match(new RegExp(`struct ${structName}: Record \\{([\\s\\S]*?)\\n\\}`));
+  assert.ok(match, `Swift record ${structName} not found`);
+  return [...match[1].matchAll(/var (\w+):/g)].map((m) => m[1]).sort();
+}
+
+test('composite lyric style keys match the Swift LyricStyleRecord fields exactly', () => {
+  const payload = buildCompositeLyrics(
+    payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }], {
+      strokeColor: '#000000',
+      strokeWidthRatio: 0.1,
+      background: 'pill',
+      backgroundColor: '#111111',
+    }),
+    0,
+    FPS,
+  );
+  assert.deepEqual(Object.keys(payload.style).sort(), swiftRecordFields('LyricStyleRecord'));
+  assert.deepEqual(
+    Object.keys(payload.style.animation).sort(),
+    swiftRecordFields('LyricAnimationRecord'),
+  );
+});
+
+test('composite lyric line keys match the Swift LyricLineRecord fields', () => {
+  const payload = buildCompositeLyrics(
+    payloadProject([
+      {
+        id: 'a',
+        text: 'hi there',
+        startFrame: 0,
+        endFrame: 30,
+        words: [
+          { text: 'hi', startFrame: 0, endFrame: 15 },
+          { text: 'there', startFrame: 15, endFrame: 30 },
+        ],
+      },
+    ]),
+    0,
+    FPS,
+  );
+  const swiftLineFields = swiftRecordFields('LyricLineRecord');
+  for (const key of Object.keys(payload.lines[0])) {
+    assert.ok(swiftLineFields.includes(key), `payload line key ${key} has no Swift field`);
+  }
+  assert.deepEqual(Object.keys(payload).sort(), swiftRecordFields('LyricsRecord'));
+});

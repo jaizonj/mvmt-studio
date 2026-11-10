@@ -21,7 +21,7 @@
         "NSCameraUsageDescription": "MVMT Studio uses your camera to record music video takes.",
         "NSMicrophoneUsageDescription": "MVMT Studio uses your microphone so your takes can include sound while you record to a track.",
         "NSPhotoLibraryAddUsageDescription": "MVMT Studio can save finished takes to your photo library when you choose to.",
-        "NSPhotoLibraryUsageDescription": "MVMT Studio can save finished takes to your photo library when you choose to."
+        "NSPhotoLibraryUsageDescription": "MVMT Studio can save finished takes to your photo library when you choose to, and lets you add videos from your library to a project."
       },
       "supportsTablet": false
     },
@@ -73,6 +73,14 @@
       ],
       "expo-sharing",
       "expo-image",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "MVMT Studio can save finished takes to your photo library when you choose to, and lets you add videos from your library to a project.",
+          "cameraPermission": false,
+          "microphonePermission": false
+        }
+      ],
       [
         "expo-font",
         {

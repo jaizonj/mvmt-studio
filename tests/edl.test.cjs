@@ -14,6 +14,7 @@ const {
   takeSyncOffsetSeconds,
   secondsToFrames,
   framesToSeconds,
+  canvasForTakes,
   DEFAULT_FPS,
 } = require('./.build-edl/src/lib/edl.js');
 
@@ -391,4 +392,24 @@ test('persistence: sync fields survive the project JSON round-trip', () => {
   assert.deepEqual(revived, take);
   // The revived take drives the shared offset identically.
   assert.equal(takeSyncOffsetSeconds(revived, 1, FPS), takeSyncOffsetSeconds(take, 1, FPS));
+});
+
+test('canvas: follows the largest RECORDED take; imports never vote', () => {
+  const recorded1080 = { id: 'r1', width: 1080, height: 1920 };
+  const recorded4k = { id: 'r2', width: 2160, height: 3840 };
+  const importLandscape4k = { id: 'i1', source: 'imported', width: 3840, height: 2160 };
+  const importSmall = { id: 'i2', source: 'imported', width: 1280, height: 720 };
+  const legacyNoDims = { id: 'r3' };
+
+  // No dimensions anywhere → no vote.
+  assert.equal(canvasForTakes([legacyNoDims]), null);
+  // Imports alone → still no vote: the canvas stays the caller's.
+  assert.equal(canvasForTakes([importLandscape4k, importSmall]), null);
+  // A 4K landscape import must not hijack a 1080p recorded project's canvas.
+  assert.deepEqual(canvasForTakes([recorded1080, importLandscape4k]), { width: 1080, height: 1920 });
+  // Recorded takes still raise the canvas among themselves.
+  assert.deepEqual(canvasForTakes([recorded1080, recorded4k, importLandscape4k]), {
+    width: 2160,
+    height: 3840,
+  });
 });

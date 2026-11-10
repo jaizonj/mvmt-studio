@@ -26,6 +26,7 @@ import { Image } from 'expo-image';
 import { NativePreview } from '../../components/NativePreview';
 import {
   CapturePreview,
+  inspectAsset,
   isCaptureAvailable,
   isCompositorAvailable,
   measureTakeSync,
@@ -48,6 +49,7 @@ import {
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import type { Take } from '../../types';
 import { measureTakeDurationSeconds, persistTake, pickAudioTrack } from '../../lib/media';
+import { importPickedVideo, pickVideoFromFiles, pickVideoFromLibrary } from '../../lib/importVideo';
 import { useStudio } from '../../store/StudioContext';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
@@ -113,6 +115,18 @@ const LENGTH_PRESETS: { label: string; seconds: number | null }[] = [
 function syncStatusText(take: Take): string {
   const adjust = take.syncAdjustFrames ?? 0;
   const adjustSuffix = adjust !== 0 ? ` · adjusted ${adjust > 0 ? '+' : '−'}${Math.abs(adjust)}f` : '';
+  if (take.source === 'imported') {
+    // IMPORTED takes are worded differently: a LARGE offset is not
+    // an error here — the song genuinely starts wherever it starts
+    // inside the file, and the shared mapping places the footage
+    // accordingly. The only questions are whether the sound match
+    // found it, and whether Jaizon has fine-tuned since.
+    if (take.syncSource === 'fileCorrelation') return `Synced by sound match${adjustSuffix}`;
+    if (take.syncOffsetSeconds === undefined) {
+      return `Aligned to the song's start — nudge to fine-tune${adjustSuffix}`;
+    }
+    return `Sync estimated${adjustSuffix}`;
+  }
   const offset = take.syncOffsetSeconds;
   if (offset === undefined) return `Sync unmeasured${adjustSuffix}`;
   const provenance =
@@ -469,6 +483,71 @@ export default function CameraScreen() {
     [audioOffsetMs, track],
   );
 
+  /**
+   * IMPORTED-TAKE SYNC — the import counterpart of the refinement
+   * above. An imported video can contain the song starting ANYWHERE
+   * inside it (filmed while the song played, a screen recording,
+   * another camera's angle), so instead of a ±2s window around the
+   * region start this runs the engine's FULL-SONG search (a window
+   * request beyond the local clamp — see measureTakeSync) and lets
+   * the correlation find where the song actually begins. Same gates,
+   * same stored fields, same precedence afterwards: a confident
+   * match lands as 'fileCorrelation' with syncOffsetSeconds =
+   * measured song position at the first frame − the take's region
+   * start. For imports that value is legitimately LARGE, so — unlike
+   * the landing pipeline's player/native samples — no sanity bound
+   * applies. No audioOffset term either: nothing was ever estimated
+   * in JS for an import, so the acoustic result stores as-is.
+   *
+   * Any non-'measured' outcome leaves the take unmeasured, which the
+   * shared mapping reads as "video start aligned to the region
+   * start" — the honest fallback, fine-tunable with the rail card's
+   * sync steppers. Returns the outcome for the import notice;
+   * 'deferred' means there is nothing to measure against yet (no
+   * track, or the engine isn't linked) — the legacy pass below picks
+   * the take up when a track exists.
+   */
+  const syncImportedTake = useCallback(
+    async (candidate: {
+      id: string;
+      uri: string;
+      trackOffsetSeconds: number;
+    }): Promise<'measured' | 'unmeasured' | 'deferred'> => {
+      if (!track || !isCompositorAvailable()) return 'deferred';
+      let songDurationSeconds = track.durationSeconds;
+      if (!songDurationSeconds || songDurationSeconds <= 0) {
+        try {
+          songDurationSeconds = (await inspectAsset(track.uri)).durationSeconds;
+        } catch {
+          return 'deferred';
+        }
+      }
+      if (!songDurationSeconds || songDurationSeconds <= 0) return 'deferred';
+      let result: TakeSyncMeasurement;
+      try {
+        // Expected = mid-song, window = the whole song: the request
+        // beyond the ±10s local clamp is what switches the engine
+        // into its full-range mode.
+        result = await measureTakeSync(candidate.uri, track.uri, songDurationSeconds / 2, songDurationSeconds);
+      } catch {
+        return 'deferred';
+      }
+      if (result.status !== 'measured' || result.songPositionAtFirstFrameSeconds === null) {
+        return 'unmeasured';
+      }
+      // Gone meanwhile (deleted mid-measurement)? Nothing to patch.
+      if (!liveTakesRef.current.some((t) => t.id === candidate.id)) return 'unmeasured';
+      studio.updateTake(candidate.id, {
+        syncOffsetSeconds: result.songPositionAtFirstFrameSeconds - candidate.trackOffsetSeconds,
+        syncSource: 'fileCorrelation',
+        ...(result.confidence !== null ? { syncConfidence: result.confidence } : {}),
+      });
+      return 'measured';
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [track],
+  );
+
   // LEGACY SYNC UPGRADE — takes recorded before file-based
   // measurement existed carry player-sample estimates (or nothing)
   // and no syncSource. Once per project per mount, on focus, quietly
@@ -476,7 +555,10 @@ export default function CameraScreen() {
   // correlation is real native work; never fan it out) and silently
   // (no notices, no UI). Idempotent via syncSource: once a take is
   // file-measured it is never a candidate again. Bails the moment
-  // focus is lost.
+  // focus is lost. IMPORTED takes whose sync was deferred (imported
+  // before any track existed) are candidates here too — the early
+  // return above leaves the pass un-run while there is no track, so
+  // when a track arrives this is what measures them.
   const syncUpgradedProjectRef = useRef<string | null>(null);
   useFocusEffect(
     useCallback(() => {
@@ -491,14 +573,21 @@ export default function CameraScreen() {
       void (async () => {
         for (const candidate of candidates) {
           if (!alive) return;
-          await refineTakeSyncFromFile(candidate);
+          // Imported takes get the full-song search (their song can
+          // start anywhere in the file); recorded takes get the
+          // local refinement around their known start.
+          if (candidate.source === 'imported') {
+            await syncImportedTake(candidate);
+          } else {
+            await refineTakeSyncFromFile(candidate);
+          }
         }
       })();
       return () => {
         alive = false;
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [refineTakeSyncFromFile, takes, track]),
+    }, [refineTakeSyncFromFile, syncImportedTake, takes, track]),
   );
 
   // iOS camera-session interruptions (call, Siri, Control Centre, app
@@ -631,6 +720,80 @@ export default function CameraScreen() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flashNotice]);
+
+  // ---- Import a video as a take -----------------------------------
+  // "Add whatever video you want and sync it to the audio" (Jaizon,
+  // 2026-11-10): a picked video is copied into the takes folder,
+  // probed, and added through the SAME store path as a recorded
+  // take (addTake — seq numbering included), marked
+  // source:'imported'. Its own audio is only ever used for sync
+  // measurement; in the cut it is muted like every take (master song
+  // only). Sync runs immediately when a track exists, and is
+  // deferred to the legacy pass above when it doesn't.
+  const [importing, setImporting] = useState(false);
+  const importVideo = useCallback(
+    async (from: 'library' | 'files') => {
+      if (importing) return;
+      setImporting(true);
+      try {
+        const pick = from === 'library' ? await pickVideoFromLibrary() : await pickVideoFromFiles();
+        if (pick.status === 'cancelled') return;
+        if (pick.status === 'denied') {
+          Alert.alert(
+            'Photo access needed',
+            'Allow photo library access to add videos from Photos — or add the video from Files instead.',
+          );
+          return;
+        }
+        const probed = await importPickedVideo(pick.video);
+        if (!probed.ok) {
+          flashNotice(probed.message);
+          return;
+        }
+        // The region start in force NOW is the take's anchor: the
+        // shared offset (takeSyncOffsetSeconds) maps the take
+        // against it exactly like a recorded take's.
+        const regionStartSeconds = studio.trackRegion.startSeconds;
+        const take: Take = {
+          id: probed.probe.id,
+          uri: probed.probe.uri,
+          createdAt: Date.now(),
+          facing: 'back', // neutral — imports have no camera; UI keys off `source`
+          source: 'imported',
+          durationSeconds: probed.probe.durationSeconds,
+          ...(probed.probe.width ? { width: probed.probe.width } : {}),
+          ...(probed.probe.height ? { height: probed.probe.height } : {}),
+          ...(probed.probe.fileSizeBytes ? { fileSizeBytes: probed.probe.fileSizeBytes } : {}),
+          trackOffsetSeconds: regionStartSeconds,
+        };
+        studio.addTake(take);
+        setRailOpen(true);
+        const outcome = await syncImportedTake(take);
+        flashNotice(
+          outcome === 'measured'
+            ? 'Video added — synced by sound match'
+            : outcome === 'deferred' && !track
+              ? 'Video added — pick the song and it will sync by sound'
+              : "Video added — aligned to the song's start; fine-tune it in the take's Sync controls",
+        );
+      } catch {
+        flashNotice("That video couldn't be added — try another file");
+      } finally {
+        setImporting(false);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [flashNotice, importing, syncImportedTake, track],
+  );
+
+  const chooseImportSource = useCallback(() => {
+    if (importing) return;
+    Alert.alert('Add a video', 'It becomes a take in this project, synced to your song by its sound.', [
+      { text: 'Photo Library', onPress: () => void importVideo('library') },
+      { text: 'Files', onPress: () => void importVideo('files') },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }, [importVideo, importing]);
 
   /**
    * THE take-landing pipeline — shared by BOTH capture paths, so a
@@ -1317,6 +1480,22 @@ export default function CameraScreen() {
         </Pressable>
       </View>
 
+      {/* Import tab — with zero takes there is no rail yet, so the
+          import affordance stands alone in the rail tab's slot.
+          Once takes exist it moves into the rail as its first cell
+          (below). Hidden while recording, like the rail itself. */}
+      {takes.length === 0 && !recording ? (
+        <Pressable
+          style={[styles.railTab, { top: insets.top + 64 }]}
+          onPress={chooseImportSource}
+          disabled={importing}
+          accessibilityRole="button"
+          accessibilityLabel="Add a video from Photos or Files">
+          <Ionicons name="add" size={16} color={colors.label} />
+          <Text style={styles.railTabCount}>Video</Text>
+        </Pressable>
+      ) : null}
+
       {/* Takes rail — COLLAPSED by default (Jaizon, 2026-11-09):
           a slim pull-tab on the left edge (film icon + count). Tap
           it and the rail slides in: takes stacked on the LEFT, each
@@ -1334,6 +1513,19 @@ export default function CameraScreen() {
             accessibilityRole="button"
             accessibilityLabel="Hide takes">
             <Ionicons name="chevron-back" size={15} color={colors.label} />
+          </Pressable>
+          {/* Import cell — always the rail's first cell: any video
+              from Photos or Files becomes a take, synced by sound. */}
+          <Pressable
+            style={styles.railTile}
+            onPress={chooseImportSource}
+            disabled={importing}
+            accessibilityRole="button"
+            accessibilityLabel="Add a video from Photos or Files">
+            <View style={[styles.railThumb, styles.railThumbPlaceholder]}>
+              <Ionicons name={importing ? 'hourglass-outline' : 'add'} size={22} color={colors.accent} />
+            </View>
+            <Text style={styles.railDuration}>{importing ? 'Adding…' : 'Add video'}</Text>
           </Pressable>
           {takes.map((take) => {
             const thumb = getCachedThumbnail(take.uri, railSampleSeconds(take));
@@ -1421,8 +1613,14 @@ export default function CameraScreen() {
               </Text>
               <Text style={styles.railPreviewSub}>
                 {formatTime(railPreviewTake.durationSeconds ?? 0)} ·{' '}
-                {railPreviewTake.facing === 'front' ? 'Front' : 'Back'} camera
-                {railCalibration ? '' : ` · ${syncStatusText(railPreviewTake)}`}
+                {railPreviewTake.source === 'imported'
+                  ? 'Imported video'
+                  : `${railPreviewTake.facing === 'front' ? 'Front' : 'Back'} camera`}
+                {railCalibration
+                  ? ''
+                  : railPreviewTake.source === 'imported' && !track
+                    ? ' · Add the song to sync it'
+                    : ` · ${syncStatusText(railPreviewTake)}`}
               </Text>
             </View>
             {/* Sync calibration — only with a track loaded (the

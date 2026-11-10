@@ -419,7 +419,11 @@ export async function inspectAsset(uri: string): Promise<AssetInfo> {
  *   estimate of the song position at the take's audio-track start —
  *   the centre of the search window.
  * @param searchWindowSeconds  ± window around the estimate to search.
- *   Default 2.
+ *   Default 2. Local searches clamp at ±10s. A request BEYOND 10
+ *   switches the engine to a full-song search (for imported videos,
+ *   whose song can begin anywhere): pass the song's duration as both
+ *   this and the expected position — the engine recentres the search
+ *   on the whole song. The confidence gates are unchanged.
  */
 export async function measureTakeSync(
   takeUri: string,

@@ -207,12 +207,18 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
  * shot at 4K exports at 4K instead of silently downscaling to the
  * 1080×1920 default. Takes without measured dimensions (expo path,
  * legacy) simply don't vote. Never shrinks the EDL's stored canvas.
+ *
+ * IMPORTED takes never vote: the canvas follows what was SHOT for
+ * the project, and an imported video (landscape, 4K, anything)
+ * conforms to it — the native builder aspect-fills every clip into
+ * the canvas, so an import can fill the frame but never redefine it.
  */
 export function canvasForTakes(
   takes: readonly import('../types').Take[],
 ): { width: number; height: number } | null {
   let best: { width: number; height: number } | null = null;
   for (const t of takes) {
+    if (t.source === 'imported') continue;
     if (!t.width || !t.height) continue;
     if (!best || t.width * t.height > best.width * best.height) {
       best = { width: t.width, height: t.height };

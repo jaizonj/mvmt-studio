@@ -16,8 +16,22 @@ export interface Take {
   /** file:// URI inside the app sandbox (copied out of the camera cache). */
   uri: string;
   createdAt: number;
-  /** Which camera this take was shot on. */
+  /** Which camera this take was shot on. Meaningless for imported
+   *  takes (they carry a neutral value) — the UI keys off `source`. */
   facing: CameraType;
+  /**
+   * Where this take came from: 'recorded' (shot in the app — the
+   * default when the field is absent, so every pre-import take reads
+   * as recorded) or 'imported' (picked from Photos/Files and synced
+   * to the song after the fact). Imported takes are first-class takes
+   * for the shuffle/editor/export, but two things treat them
+   * specially: they never vote on the EDL canvas (canvasForTakes —
+   * a landscape or 4K import conforms to the project's canvas instead
+   * of hijacking it), and their sync offset may legitimately be
+   * LARGE (the song can begin anywhere inside the file), so their
+   * sync status copy is worded differently.
+   */
+  source?: 'recorded' | 'imported';
   /** Recorded length in seconds, measured by the camera screen timer. */
   durationSeconds?: number;
   /** Measured display size of the recorded file (native path) — the

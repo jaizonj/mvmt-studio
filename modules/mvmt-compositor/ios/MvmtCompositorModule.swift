@@ -151,19 +151,21 @@ struct LyricAnimationRecord: Record {
 }
 
 struct LyricStyleRecord: Record {
-  /// PostScript name of the font to render with.
+  /// PostScript name of the font to render with. Field name must
+  /// match the JS payload key exactly (fontPostScriptName) — the
+  /// bridge converts by name; a mismatch silently empties the field.
   @Field
-  var postScriptName: String
+  var fontPostScriptName: String
 
   /// Font size as a fraction of the canvas WIDTH.
   @Field
   var sizeRatio: Double
 
   @Field
-  var colorHex: String
+  var color: String
 
   @Field
-  var strokeColorHex: String? = nil
+  var strokeColor: String? = nil
 
   /// Stroke thickness as a fraction of the font size.
   @Field
@@ -174,7 +176,7 @@ struct LyricStyleRecord: Record {
   var background: String = "none"
 
   @Field
-  var backgroundColorHex: String? = nil
+  var backgroundColor: String? = nil
 
   /// 'top' | 'center' | 'bottom'
   @Field
@@ -1234,8 +1236,8 @@ private enum MvmtCompositorEngine {
     durationSeconds: Double
   ) -> Bool {
     let style = lyrics.style
-    let fillColor = lyricColor(style.colorHex) ?? .white
-    let strokeColor = lyricColor(style.strokeColorHex)
+    let fillColor = lyricColor(style.color) ?? .white
+    let strokeColor = lyricColor(style.strokeColor)
     let strokeFraction = max(0, lyricFinite(style.strokeWidthRatio ?? 0, 0))
     // Font size = sizeRatio × canvas width (contract), clamped.
     let sizeRatio = lyricClamp(lyricFinite(style.sizeRatio, 0.045), 0.005, 0.5)
@@ -1288,13 +1290,13 @@ private enum MvmtCompositorEngine {
 
     // Font, shrunk to fit 92% of the canvas width.
     let maxTextWidth = renderSize.width * 0.92
-    var font = lyricFont(postScriptName: style.postScriptName, size: baseFontSize, bold: style.bold)
+    var font = lyricFont(postScriptName: style.fontPostScriptName, size: baseFontSize, bold: style.bold)
     let initialMeasure: [NSAttributedString.Key: Any] = [.font: font]
     let measured = NSAttributedString(string: text, attributes: initialMeasure).size()
     guard measured.width > 0, measured.height > 0 else { return nil }
     if measured.width > maxTextWidth {
       let scaledSize = baseFontSize * (maxTextWidth / measured.width)
-      font = lyricFont(postScriptName: style.postScriptName, size: scaledSize, bold: style.bold)
+      font = lyricFont(postScriptName: style.fontPostScriptName, size: scaledSize, bold: style.bold)
     }
     let boldFallback = style.bold && !font.fontDescriptor.symbolicTraits.contains(.traitBold)
     let measureAttributes: [NSAttributedString.Key: Any] = [.font: font]
@@ -1475,7 +1477,7 @@ private enum MvmtCompositorEngine {
     if wantsPill {
       let pillLayer = CALayer()
       pillLayer.frame = CGRect(origin: .zero, size: containerSize)
-      let pillColor = lyricColor(style.backgroundColorHex) ?? UIColor.black.withAlphaComponent(0.55)
+      let pillColor = lyricColor(style.backgroundColor) ?? UIColor.black.withAlphaComponent(0.55)
       pillLayer.backgroundColor = pillColor.cgColor
       pillLayer.cornerRadius = containerSize.height / 2
       innerLayer.addSublayer(pillLayer)
@@ -1736,6 +1738,13 @@ private enum MvmtCompositorEngine {
   // ~150M MACs (refine — 1921 lags × ~10s slice) — the dominant cost,
   // still ≲1s on device. Expected failure modes are reported in the
   // record's status, never thrown.
+  //
+  // IMPORTED videos search differently: the song can begin anywhere
+  // in the file, so a searchWindowSeconds request beyond the ±10s
+  // local clamp switches to a full-song search (the window recentres
+  // on the whole song; the coarse needle is capped at the take's
+  // first 60s to bound the cost). The gates are identical — a
+  // full-song match must clear the same ρ and peak-ratio floors.
 
   /// Below this take-audio RMS the mic cannot contain the song
   /// (earbuds, silence) — reported as 'noSongInMic'.
@@ -1751,6 +1760,13 @@ private enum MvmtCompositorEngine {
   private static let syncEnvelopeWindowSamples = 200
   /// Refine searches ±120ms around the coarse peak, sample by sample.
   private static let syncRefineHalfWindowSamples = 960
+  /// Full-range (import) searches cap the COARSE needle at the take's
+  /// first 60s (6000 envelope steps at 100Hz): the coarse stage only
+  /// has to locate the take's START within the refine window, and an
+  /// uncapped needle would make its cost grow with the whole imported
+  /// file's length. The refine stage still uses the loudest slice of
+  /// the full take, so the cap costs no accuracy.
+  private static let syncFullRangeNeedleSteps = 6000
   /// Refine correlates the loudest contiguous ~10s of the take.
   private static let syncRefineSliceSamples = 80_000
   /// Second peak must sit at least this far from the winner:
@@ -1783,13 +1799,20 @@ private enum MvmtCompositorEngine {
     guard expectedSongPositionAtTakeStartSeconds.isFinite else {
       return syncResult(status: "error")
     }
-    let window: Double
+    // A window request beyond the local clamp is the IMPORTED-video
+    // search: the song may begin anywhere inside an imported file, so
+    // the search recentres on the whole song once its duration is
+    // known (step 4) instead of around the caller's estimate. Local
+    // searches (recorded takes, whose start is known to within a
+    // second or two) keep the ±10s clamp exactly as before.
+    let fullRangeSearch = searchWindowSeconds.isFinite && searchWindowSeconds > 10
+    var window: Double
     if searchWindowSeconds.isFinite {
       window = min(max(searchWindowSeconds, 0.25), 10)
     } else {
       window = 2
     }
-    let expected = expectedSongPositionAtTakeStartSeconds
+    var expected = expectedSongPositionAtTakeStartSeconds
 
     do {
       // ---- 1. Track layout of the take file ----
@@ -1845,6 +1868,13 @@ private enum MvmtCompositorEngine {
       guard songDuration.isFinite, songDuration > 0 else {
         return syncResult(status: "error", intraFileAvOffsetSeconds: delta)
       }
+      if fullRangeSearch {
+        // Centre the search on the whole song: every feasible
+        // alignment is inside [0, songDuration], and step 4's range
+        // math decodes the full song PCM below.
+        expected = songDuration / 2
+        window = songDuration / 2
+      }
       // Candidate alignments put the take's audio start anywhere in
       // [expected − window, expected + window], and the take then runs
       // for its full duration — the decoded song range must cover all
@@ -1870,6 +1900,9 @@ private enum MvmtCompositorEngine {
       // take envelope and the song envelope maps to song position
       // songDecodeStart + o × 0.01.
       let takeEnvelope = rmsEnvelope(takePCM.samples)
+      let coarseNeedle = fullRangeSearch
+        ? Array(takeEnvelope.prefix(syncFullRangeNeedleSteps))
+        : takeEnvelope
       let songEnvelope = rmsEnvelope(songPCM.samples)
       let hopSeconds = Double(syncEnvelopeHopSamples) / syncSampleRate
       let minOffset = Int(((expected - window - songPCM.startSeconds) / hopSeconds).rounded())
@@ -1883,7 +1916,7 @@ private enum MvmtCompositorEngine {
         return syncResult(status: "outOfWindow", intraFileAvOffsetSeconds: delta)
       }
       let curve = envelopeCorrelationCurve(
-        needle: takeEnvelope,
+        needle: coarseNeedle,
         haystack: songEnvelope,
         offsets: lowOffset...highOffset
       )
