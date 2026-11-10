@@ -42,10 +42,27 @@ export interface CompositeRequest {
   canvasWidth?: number;
   /** Output canvas height in pixels. Default 1920. */
   canvasHeight?: number;
-  /** Output frame rate / composition frameDuration. Default 30. */
+  /**
+   * Requested frame rate. Default 30 (the EDL grid); the native
+   * builder floors the composition's render grid at 60fps, so this
+   * never lowers the render cadence below 60.
+   */
   frameRate?: number;
   /** Caller-chosen id for progress events + cancellation. Optional. */
   exportId?: string;
+  /**
+   * Watermark overlay (the MVMT studio logo lockup) on the rendered
+   * video: semi-transparent, flipping between the top-left and
+   * bottom-right corners every 5 seconds. Applies to preview and
+   * export identically. Default off.
+   */
+  watermarkEnabled?: boolean;
+  /**
+   * `file://` URI or path of the transparent watermark PNG. Only used
+   * when `watermarkEnabled` is true; if the image cannot be loaded
+   * the video renders without a watermark rather than failing.
+   */
+  watermarkImageUri?: string | null;
 }
 
 export interface CompositeResult {
@@ -249,6 +266,7 @@ interface NativeMvmtCompositorModule {
   isCaptureAvailable(): boolean;
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
+  prepareSong(songUri: string | null): Promise<void>;
   createPreview(request: CompositeRequest): Promise<string>;
   setPreviewPaused(previewId: string, paused: boolean): Promise<void>;
   seekPreview(previewId: string, seconds: number): Promise<void>;
@@ -432,6 +450,27 @@ export async function stopCapture(): Promise<CaptureResult> {
     );
   }
   return mod.stopCapture();
+}
+
+/**
+ * Pre-warms the native song player for a track (or tears the warm
+ * player down when passed null). The coordinator keeps ONE standing
+ * AVPlayer+item for the song, loaded and prerolled paused, so the
+ * next `startCapture` adopts it instead of paying the cold
+ * item-load/preroll cost inside the record press — the first takes
+ * of a session used to lag until the pipeline "caught up". Call it
+ * when the Record screen is focused with a track set, and whenever
+ * the track changes. Playback never starts from this call.
+ *
+ * Best-effort: silently no-ops in Expo Go and in older builds
+ * without the function — capture creates its player on demand
+ * exactly as before.
+ */
+export async function prepareSong(songUri: string | null): Promise<void> {
+  if (!nativeModule || typeof nativeModule.prepareSong !== 'function') {
+    return;
+  }
+  return nativeModule.prepareSong(songUri ?? null);
 }
 
 type NativeCaptureViewComponent = ComponentType<CapturePreviewProps>;

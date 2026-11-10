@@ -170,6 +170,14 @@ export interface Project {
   /** Take-id sequence of the current EDL — guarantees the next shuffle differs. */
   lastShuffleSequence: string[] | null;
   shuffleFrequency: ShuffleFrequency;
+  /**
+   * Whether the MVMT studio logo watermark (assets/logo-lockup.png) is
+   * stamped onto this project's videos — preview and export alike,
+   * toggled on the Edit screen. Undefined = ON: projects persisted
+   * before the flag existed behave as enabled, and the store exposes
+   * the effective value (`watermarkEnabled` in StudioContext).
+   */
+  watermarkEnabled?: boolean;
   /** When the project's video was last successfully rendered (Export stamps it). */
   exportedAt?: number;
 }

@@ -1,3 +1,4 @@
+import { Image } from 'expo-image';
 import { router } from 'expo-router';
 import { useEffect, useRef } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
@@ -56,7 +57,12 @@ export default function StudioHome() {
           <View style={styles.eyebrowDot} />
           <Text style={styles.eyebrow}>MUSIC VIDEO STUDIO</Text>
         </View>
-        <Text style={styles.wordmark}>MVMT</Text>
+        <Image
+          source={require('../../../assets/logo-lockup.png')}
+          style={styles.wordmark}
+          contentFit="contain"
+          accessibilityLabel="MVMT Studio"
+        />
         <Text style={styles.tagline}>Your song. Your performance. One cut.</Text>
       </View>
 
@@ -111,7 +117,10 @@ const styles = StyleSheet.create({
   eyebrowRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.md },
   eyebrowDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: colors.accent },
   eyebrow: { ...typeScale.caption, color: colors.labelSecondary, letterSpacing: 1.6 },
-  wordmark: { ...typeScale.largeTitle, color: colors.label, fontSize: 44, letterSpacing: 1.5 },
+  // The brand lockup image (assets/logo-lockup.png, 363×175) sits
+  // where the text wordmark used to — same spot in the hero, same
+  // left alignment as the eyebrow and tagline around it.
+  wordmark: { width: 190, aspectRatio: 363 / 175 },
   tagline: { ...typeScale.subhead, color: colors.labelSecondary, marginTop: spacing.sm, lineHeight: 21 },
   section: { paddingHorizontal: spacing.xl, marginBottom: spacing.xxl },
   newProjectHint: {

@@ -48,13 +48,27 @@ struct CompositeRequestRecord: Record {
   @Field
   var canvasHeight: Int? = nil
 
-  /// Output frame rate / composition frameDuration. Default 30.
+  /// Requested frame rate. Default 30 (the EDL grid); the builder
+  /// floors the composition's render grid at 60fps regardless — the
+  /// EDL's cut times are CMTime values and stay identical, the finer
+  /// grid only keeps every frame of a 60fps capture.
   @Field
   var frameRate: Double? = nil
 
   /// Caller-chosen id for onExportProgress events + cancelExport.
   @Field
   var exportId: String? = nil
+
+  /// Watermark overlay toggle (logo lockup, corner-flipping).
+  /// Nil/false = off.
+  @Field
+  var watermarkEnabled: Bool? = nil
+
+  /// `file://` URI or path of the transparent watermark PNG. Only
+  /// used when watermarkEnabled is true; an unloadable image renders
+  /// without the watermark rather than failing the render.
+  @Field
+  var watermarkImageUri: String? = nil
 }
 
 struct CompositeResultRecord: Record {
@@ -143,9 +157,10 @@ struct CaptureResultRecord: Record {
 
   /// The master song's position (seconds, same timeline as
   /// `songStartSeconds`) at the FIRST captured video frame — measured
-  /// natively through the player item's host-time mapping, never
-  /// estimated. Nil when no song was supplied or the player wasn't
-  /// ready/playing when the first frame landed.
+  /// natively by anchoring the song player's position to the capture
+  /// session's clock (provisional at the first frame, refined at
+  /// finish once playback is provably advancing), never estimated.
+  /// Nil when no song was supplied or the player never played.
   @Field
   var firstFrameSongPositionSeconds: Double? = nil
 
@@ -250,6 +265,12 @@ private enum MvmtCompositorEngine {
     guard frameRate >= 1, frameRate <= 240 else {
       throw compositorError("Invalid frame rate \(frameRate).")
     }
+    // Render grid: at least 60fps (Jaizon: capture defaults to 60fps,
+    // renders should keep every captured frame). The EDL's 30fps cut
+    // times are CMTime values — they land on the same instants on the
+    // finer grid (30 divides 60), so this changes only the sampling
+    // cadence, never the edit.
+    let renderFrameRate = max(frameRate, 60)
 
     let timescale: CMTimeScale = 600
     let composition = AVMutableComposition()
@@ -411,7 +432,7 @@ private enum MvmtCompositorEngine {
     // the normalised canvas transforms ----
     let videoComposition = AVMutableVideoComposition()
     videoComposition.renderSize = canvasSize
-    videoComposition.frameDuration = CMTime(seconds: 1.0 / frameRate, preferredTimescale: timescale)
+    videoComposition.frameDuration = CMTime(seconds: 1.0 / renderFrameRate, preferredTimescale: timescale)
     videoComposition.instructions = segmentRanges.enumerated().map { index, range in
       let instruction = AVMutableVideoCompositionInstruction()
       instruction.timeRange = range
@@ -428,11 +449,105 @@ private enum MvmtCompositorEngine {
       audioMix = mix
     }
 
+    // ---- Optional watermark: the logo lockup flipping between the
+    // top-left and bottom-right corners every 5 seconds. It rides on
+    // THIS videoComposition — the same object preview assigns to its
+    // player item and export assigns to its session — so the preview
+    // shows exactly what renders. A missing/unloadable image degrades
+    // to no watermark: a render must never fail over branding.
+    if request.watermarkEnabled == true,
+      let watermarkUri = request.watermarkImageUri, !watermarkUri.isEmpty,
+      let tool = makeWatermarkAnimationTool(
+        imageURL: resolveURL(watermarkUri),
+        renderSize: canvasSize,
+        durationSeconds: CMTimeGetSeconds(totalDuration)
+      )
+    {
+      videoComposition.animationTool = tool
+    }
+
     return BuiltComposition(
       composition: composition,
       videoComposition: videoComposition,
       audioMix: audioMix,
       duration: totalDuration
+    )
+  }
+
+  /// Builds the watermark CoreAnimation tool: a parent layer holding
+  /// the full-frame video layer plus the logo layer above it. The
+  /// logo (27% of the render width, aspect preserved, 85% opacity)
+  /// starts in the TOP-LEFT corner and flips to the BOTTOM-RIGHT
+  /// every 5 seconds for the whole composition — discrete keyframes,
+  /// so it teleports rather than sliding. CALayer coordinates are
+  /// bottom-left origin, so "top-left" means y near the frame's top.
+  /// Returns nil when the image cannot be loaded or the geometry is
+  /// unusable — callers treat nil as "render without a watermark".
+  private static func makeWatermarkAnimationTool(
+    imageURL: URL,
+    renderSize: CGSize,
+    durationSeconds: Double
+  ) -> AVVideoCompositionCoreAnimationTool? {
+    guard
+      renderSize.width > 0, renderSize.height > 0,
+      durationSeconds.isFinite, durationSeconds > 0,
+      let image = UIImage(contentsOfFile: imageURL.path),
+      let cgImage = image.cgImage, cgImage.width > 0, cgImage.height > 0
+    else {
+      return nil
+    }
+
+    let parentLayer = CALayer()
+    parentLayer.frame = CGRect(origin: .zero, size: renderSize)
+    let videoLayer = CALayer()
+    videoLayer.frame = parentLayer.bounds
+    parentLayer.addSublayer(videoLayer)
+
+    let watermarkWidth = renderSize.width * 0.27
+    let watermarkHeight = watermarkWidth * CGFloat(cgImage.height) / CGFloat(cgImage.width)
+    let margin = renderSize.width * 0.045
+
+    let watermarkLayer = CALayer()
+    watermarkLayer.contents = cgImage
+    watermarkLayer.contentsGravity = .resizeAspect
+    watermarkLayer.opacity = 0.85
+    watermarkLayer.bounds = CGRect(x: 0, y: 0, width: watermarkWidth, height: watermarkHeight)
+
+    // Corner CENTRES (CALayer position is the layer's centre).
+    let topLeft = CGPoint(
+      x: margin + watermarkWidth / 2,
+      y: renderSize.height - margin - watermarkHeight / 2
+    )
+    let bottomRight = CGPoint(
+      x: renderSize.width - margin - watermarkWidth / 2,
+      y: margin + watermarkHeight / 2
+    )
+    watermarkLayer.position = topLeft
+
+    // One 5-second slot per flip; slot i shows topLeft on even slots,
+    // bottomRight on odd ones, each holding until the next keyTime.
+    let slotCount = max(1, Int(ceil(durationSeconds / 5.0)))
+    if slotCount > 1 {
+      var positions: [CGPoint] = []
+      var keyTimes: [NSNumber] = []
+      for slot in 0..<slotCount {
+        positions.append(slot % 2 == 0 ? topLeft : bottomRight)
+        keyTimes.append(NSNumber(value: Double(slot) / Double(slotCount)))
+      }
+      let flip = CAKeyframeAnimation(keyPath: "position")
+      flip.values = positions.map { NSValue(cgPoint: $0) }
+      flip.keyTimes = keyTimes
+      flip.duration = durationSeconds
+      flip.beginTime = AVCoreAnimationBeginTimeAtZero
+      flip.calculationMode = .discrete
+      flip.isRemovedOnCompletion = false
+      watermarkLayer.add(flip, forKey: "cornerFlip")
+    }
+    parentLayer.addSublayer(watermarkLayer)
+
+    return AVVideoCompositionCoreAnimationTool(
+      postProcessingAsVideoLayer: videoLayer,
+      in: parentLayer
     )
   }
 
@@ -1548,6 +1663,11 @@ private final class CaptureCoordinator: NSObject,
   private var configuration = CaptureConfiguration()
   private var outputsConfigured = false
   private var sessionConfigured = false
+  /// True when the active device was switched to a 60fps format by
+  /// configureSessionLocked (the capture default — see
+  /// applySixtyFpsFormatLocked). Read by the writer plumbing to tag
+  /// the video input's expected source frame rate.
+  private var captureIsSixtyFps = false
   private var configuredPosition: AVCaptureDevice.Position?
   private var videoDevice: AVCaptureDevice?
   private var videoInput: AVCaptureDeviceInput?
@@ -1556,6 +1676,11 @@ private final class CaptureCoordinator: NSObject,
   private let audioOutput = AVCaptureAudioDataOutput()
   private weak var previewLayer: AVCaptureVideoPreviewLayer?
   private var activePreviewViews: Set<ObjectIdentifier> = []
+  /// Retained NotificationCenter tokens for the session-lifecycle
+  /// observers (see registerSessionObservers) — a block observer is
+  /// removed when its token is released, so the singleton holds the
+  /// tokens for its whole lifetime.
+  private var sessionObserverTokens: [NSObjectProtocol] = []
 
   // MARK: Recording state (queue-owned)
 
@@ -1577,6 +1702,30 @@ private final class CaptureCoordinator: NSObject,
   private var outputURL: URL?
   private var songPlayer: AVPlayer?
   private var songItem: AVPlayerItem?
+  /// The position the song player was seeked to for this capture —
+  /// the finish-time refinement requires the item to have advanced
+  /// genuinely beyond it before trusting a late anchor (a position
+  /// still clamped AT the target is the preroll signature).
+  private var songSeekStartSeconds: Double = 0
+  /// Resolved URL of the ACTIVE take's song (nil for a songless
+  /// take) — cleanup compares it against the standing player's URL
+  /// to decide whether the finished player is kept warm.
+  private var activeSongURL: URL?
+  // MARK: Standing (pre-warmed) song player (queue-owned)
+  //
+  // Cold-start fix (Jaizon: "the first few takes suck — after 2
+  // takes the app catches up"): preparePlayerLocked used to build a
+  // FRESH AVPlayer+AVPlayerItem per take, so early takes paid the
+  // full cold cost (asset open, item load, preroll, seek) inside the
+  // record press. The standing player is created ahead of time via
+  // prepareSong (JS calls it when Record is focused with a track),
+  // loaded and prerolled PAUSED; a take ADOPTS it when the URI
+  // matches, and cleanup keeps/promotes the finished player here so
+  // the next take starts warm. It never plays outside a take and
+  // never touches the audio session category.
+  private var warmedPlayer: AVPlayer?
+  private var warmedItem: AVPlayerItem?
+  private var warmedURL: URL?
   /// Format description of the latest pre-roll audio buffer, kept so
   /// the audio writer input can be created the moment the writer
   /// starts (audio samples themselves before the first frame drop).
@@ -1674,6 +1823,77 @@ private final class CaptureCoordinator: NSObject,
     return AVCaptureDevice.default(for: .video)
   }
 
+  /// The device's best 60fps format (capture defaults to 60fps —
+  /// Jaizon): exact 1920×1080 with a frame-rate range covering 60
+  /// wins outright; otherwise the largest format at or under 1080p
+  /// whose ranges cover 60. Nil when the device cannot do 60 at all —
+  /// the caller then leaves the session-preset behaviour untouched.
+  private static func bestSixtyFpsFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+    func coversSixty(_ format: AVCaptureDevice.Format) -> Bool {
+      format.videoSupportedFrameRateRanges.contains { range in
+        range.minFrameRate <= 60 && range.maxFrameRate >= 59.9
+      }
+    }
+    var best: AVCaptureDevice.Format?
+    var bestArea: Int64 = -1
+    for format in device.formats where coversSixty(format) {
+      let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+      guard dims.width > 0, dims.height > 0 else { continue }
+      if dims.width == 1920, dims.height == 1080 {
+        return format
+      }
+      let area = Int64(dims.width) * Int64(dims.height)
+      if dims.width <= 1920, dims.height <= 1080, area > bestArea {
+        best = format
+        bestArea = area
+      }
+    }
+    return best
+  }
+
+  /// Switches the just-connected device to its 60fps format and pins
+  /// its frame duration to exactly 1/60. Called from the input-swap
+  /// block in configureSessionLocked, so each camera (front included)
+  /// gets its OWN device's format when the facing flips. Re-applying
+  /// to an already-configured device is a no-op — resetting the
+  /// active format mid-stream would glitch the running preview.
+  private func applySixtyFpsFormatLocked(to device: AVCaptureDevice) {
+    captureIsSixtyFps = false
+    guard let format = Self.bestSixtyFpsFormat(for: device) else { return }
+    let frameDuration = CMTime(value: 1, timescale: 60)
+    let targetDims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+    let currentDims = CMVideoFormatDescriptionGetDimensions(
+      device.activeFormat.formatDescription
+    )
+    let alreadySixty =
+      currentDims.width == targetDims.width && currentDims.height == targetDims.height
+      && CMTimeCompare(device.activeVideoMinFrameDuration, frameDuration) == 0
+      && CMTimeCompare(device.activeVideoMaxFrameDuration, frameDuration) == 0
+    if alreadySixty {
+      // Re-assert inputPriority in case another configure pass moved
+      // the preset — the device's format is the source of truth.
+      session.sessionPreset = .inputPriority
+      captureIsSixtyFps = true
+      return
+    }
+    do {
+      try device.lockForConfiguration()
+      device.activeFormat = format
+      device.activeVideoMinFrameDuration = frameDuration
+      device.activeVideoMaxFrameDuration = frameDuration
+      device.unlockForConfiguration()
+      // The documented pairing for a manually-set device format:
+      // the session defers to the input's format instead of steering
+      // by a dimensional preset.
+      session.sessionPreset = .inputPriority
+      captureIsSixtyFps = true
+    } catch {
+      // Leave the preset defaults — capture still works, just at
+      // whatever format the session preset picks.
+      captureIsSixtyFps = false
+    }
+  }
+
   /// (Re)builds inputs/outputs to match `configuration`. Idempotent;
   /// safe to call whenever the session is stopped or running (but not
   /// mid-capture — callers guard that).
@@ -1694,10 +1914,18 @@ private final class CaptureCoordinator: NSObject,
     session.beginConfiguration()
     // The app (expo-audio) owns the audio session category.
     session.automaticallyConfiguresApplicationAudioSession = false
-    if session.canSetSessionPreset(.hd1920x1080) {
-      session.sessionPreset = .hd1920x1080
-    } else if session.canSetSessionPreset(.high) {
-      session.sessionPreset = .high
+    // Once a device has been switched to a 60fps format the session
+    // preset is .inputPriority (set by applySixtyFpsFormatLocked) —
+    // re-assigning a dimensional preset here could make the session
+    // re-pick the input's (30fps) format at commit time and silently
+    // undo the 60fps default, so the preset is only steered while no
+    // 60fps format is in force.
+    if !captureIsSixtyFps {
+      if session.canSetSessionPreset(.hd1920x1080) {
+        session.sessionPreset = .hd1920x1080
+      } else if session.canSetSessionPreset(.high) {
+        session.sessionPreset = .high
+      }
     }
 
     if configuredPosition != configuration.facing || videoInput == nil {
@@ -1718,6 +1946,7 @@ private final class CaptureCoordinator: NSObject,
             videoInput = input
             videoDevice = device
             configuredPosition = configuration.facing
+            applySixtyFpsFormatLocked(to: device)
           } else {
             deviceError = compositorError("The capture session rejected the camera input.")
           }
@@ -1826,6 +2055,106 @@ private final class CaptureCoordinator: NSObject,
     device.unlockForConfiguration()
   }
 
+  // MARK: Session recovery (interruptions / runtime errors / foreground)
+
+  override init() {
+    super.init()
+    registerSessionObservers()
+  }
+
+  /// The coordinator never observed the session's lifecycle
+  /// notifications, so an interruption during launch (expo-audio
+  /// activating the audio session, system churn while the app
+  /// auto-navigates into Record) left the session "running" but
+  /// delivering nothing — the preview froze on a still frame until
+  /// pressing record happened to call startRunning again. These
+  /// observers close that hole. Every callback hops onto the capture
+  /// queue and funnels into recoverSessionLocked, which stays behind
+  /// the same shouldRun gate as everything else — a hidden screen
+  /// never starts the camera.
+  private func registerSessionObservers() {
+    let center = NotificationCenter.default
+    sessionObserverTokens.append(
+      center.addObserver(
+        forName: .AVCaptureSessionInterruptionEnded,
+        object: session,
+        queue: nil
+      ) { [weak self] _ in
+        self?.queue.async { self?.recoverSessionLocked() }
+      }
+    )
+    sessionObserverTokens.append(
+      center.addObserver(
+        forName: .AVCaptureSessionRuntimeError,
+        object: session,
+        queue: nil
+      ) { [weak self] notification in
+        let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
+        self?.queue.async { self?.handleRuntimeErrorLocked(error) }
+      }
+    )
+    sessionObserverTokens.append(
+      center.addObserver(
+        forName: UIApplication.didBecomeActiveNotification,
+        object: nil,
+        queue: nil
+      ) { [weak self] _ in
+        self?.queue.async { self?.recoverSessionLocked() }
+      }
+    )
+  }
+
+  /// Shared recovery for interruptions ending, runtime errors and
+  /// foreground returns. The unconditional startRunning() after the
+  /// update is the point — across an interruption `session.isRunning`
+  /// stays true while nothing is delivered, so the update's
+  /// `if !isRunning` check alone leaves a frozen session frozen.
+  /// startRunning() is the documented post-interruption recovery,
+  /// and a no-op on a session that is already running healthily.
+  private func recoverSessionLocked() {
+    let shouldRun =
+      !activePreviewViews.isEmpty || state == .preparing || state == .recording
+    guard shouldRun else { return }
+    updateSessionRunningLocked()
+    session.startRunning()
+  }
+
+  /// Runtime errors are treated as recoverable: drop the configured
+  /// flag so the next update reconfigures, then recover. For a media
+  /// services reset every pre-reset capture object is dead, so the
+  /// stale input/output references are dropped too — otherwise the
+  /// reconfigure would trust them and rebuild nothing.
+  private func handleRuntimeErrorLocked(_ error: NSError?) {
+    sessionConfigured = false
+    // captureIsSixtyFps is deliberately NOT cleared here: after a
+    // plain runtime error the device keeps its 60fps format, and
+    // after a reset the reconfigure re-derives the flag via
+    // applySixtyFpsFormatLocked when the inputs are rebuilt.
+    if let error,
+      error.domain == AVFoundationErrorDomain,
+      error.code == AVFoundationError.mediaServicesWereReset.rawValue
+    {
+      if let oldInput = videoInput {
+        session.removeInput(oldInput)
+      }
+      if let oldInput = audioInput {
+        session.removeInput(oldInput)
+      }
+      if session.outputs.contains(where: { $0 === videoOutput }) {
+        session.removeOutput(videoOutput)
+      }
+      if session.outputs.contains(where: { $0 === audioOutput }) {
+        session.removeOutput(audioOutput)
+      }
+      videoInput = nil
+      audioInput = nil
+      videoDevice = nil
+      configuredPosition = nil
+      outputsConfigured = false
+    }
+    recoverSessionLocked()
+  }
+
   private func updateSessionRunningLocked() {
     let shouldRun =
       !activePreviewViews.isEmpty || state == .preparing || state == .recording
@@ -1842,6 +2171,61 @@ private final class CaptureCoordinator: NSObject,
   }
 
   // MARK: Capture lifecycle
+
+  /// Pre-warms the standing song player for `songUri` (nil tears it
+  /// down). Fire-and-forget by design: the queue work is enqueued
+  /// and this returns — the preroll completes asynchronously, and a
+  /// record press that beats it still works (the item is simply
+  /// less warm). No permission is needed and nothing plays.
+  func prepareSong(songUri: String?) async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      queue.async { [weak self] in
+        self?.prepareSongLocked(songUri: songUri)
+        continuation.resume()
+      }
+    }
+  }
+
+  private func prepareSongLocked(songUri: String?) {
+    guard let songUri, !songUri.isEmpty else {
+      // No track: tear the standing player down. If it happens to be
+      // the active take's player (track cleared mid-take), the take
+      // keeps its own references and finishes normally — only the
+      // standing reference is dropped.
+      if let standing = warmedPlayer, standing !== songPlayer {
+        standing.pause()
+      }
+      warmedPlayer = nil
+      warmedItem = nil
+      warmedURL = nil
+      return
+    }
+    let url = MvmtCompositorEngine.resolveURL(songUri)
+    if warmedURL == url, let standing = warmedPlayer {
+      // Already standing for this song — just keep it warm. (Unless
+      // it is mid-take right now: a rate-0 preroll must never touch
+      // the playing player.)
+      if standing !== songPlayer {
+        standing.preroll(atRate: 0, completionHandler: nil)
+      }
+      return
+    }
+    // Replace the standing player. Same mid-take caveat as the
+    // teardown above: an old standing player that is mid-take is
+    // left playing for its take; only the standing reference moves.
+    if let old = warmedPlayer, old !== songPlayer {
+      old.pause()
+    }
+    let item = AVPlayerItem(url: url)
+    let player = AVPlayer(playerItem: item)
+    warmedItem = item
+    warmedPlayer = player
+    warmedURL = url
+    // Load + preroll PAUSED at rate 0: the item becomes
+    // ready-to-play without ever starting playback, and the audio
+    // session category is never touched (the app owns it).
+    player.preroll(atRate: 0, completionHandler: nil)
+  }
 
   func start(_ args: CaptureStartArgsRecord) async throws {
     try await ensurePermission(for: .video)
@@ -1920,6 +2304,8 @@ private final class CaptureCoordinator: NSObject,
     finishedError = nil
     firstFrameSongPosition = nil
     firstVideoPTS = nil
+    songSeekStartSeconds = 0
+    activeSongURL = nil
     writerStarted = false
     videoWriterInput = nil
     audioWriterInput = nil
@@ -1988,13 +2374,28 @@ private final class CaptureCoordinator: NSObject,
   private func preparePlayerLocked(songUri: String?, songStartSeconds: Double) {
     songPlayer = nil
     songItem = nil
+    activeSongURL = nil
+    songSeekStartSeconds = max(0, songStartSeconds)
     guard let songUri, !songUri.isEmpty else {
       // No song clock to wait for — arm immediately.
       state = .recording
       return
     }
-    let item = AVPlayerItem(url: MvmtCompositorEngine.resolveURL(songUri))
-    let player = AVPlayer(playerItem: item)
+    let url = MvmtCompositorEngine.resolveURL(songUri)
+    activeSongURL = url
+    let item: AVPlayerItem
+    let player: AVPlayer
+    if warmedURL == url, let standing = warmedPlayer, let standingItem = warmedItem {
+      // ADOPT the pre-warmed standing player: the cold costs (asset
+      // open, item load, preroll) were paid when the Record screen
+      // was focused, not inside this record press. The seek + play
+      // below is exactly the fresh-player path.
+      item = standingItem
+      player = standing
+    } else {
+      item = AVPlayerItem(url: url)
+      player = AVPlayer(playerItem: item)
+    }
     songItem = item
     songPlayer = player
 
@@ -2024,17 +2425,54 @@ private final class CaptureCoordinator: NSObject,
     queue.asyncAfter(deadline: .now() + 5, execute: armTimeout)
   }
 
-  /// THE measurement: convert the first appended frame's host-clock
-  /// PTS into a song position.
+  /// The anchor algebra shared by the first-frame estimate and the
+  /// finish-time refinement: the song's position at the first frame
+  /// is the item's position at some anchor instant, shifted by how
+  /// far the first frame's PTS sits from that same instant — both
+  /// read on the SAME clock (the capture session's master clock; see
+  /// sessionNowLocked).
   ///
-  /// An anchor pair sampled in this same callback: the item's current
-  /// position and host-now; the frame's song position is the item
-  /// position shifted by (framePTS − hostNow). (An earlier revision
-  /// preferred AVPlayerItem.time(forHostTime:) — that API does not
-  /// exist in the current SDK, confirmed by CI; the anchor pair is
-  /// the measurement.) Only used when the item is actually playing
-  /// (rate ≠ 0); a paused/failed player yields nil — the position is
-  /// never fabricated.
+  /// Why the anchor must be LATE (refineSongPositionAtFinishLocked):
+  /// at the first frame the player may still be prerolling — play()
+  /// was called milliseconds earlier on a cold, zero-tolerance-seeked
+  /// item, so currentTime() can sit clamped at the seek target while
+  /// real time flows (timeControlStatus is
+  /// .waitingToPlayAtSpecifiedRate; `rate` reads 1.0 throughout, so
+  /// it does NOT prove the item is advancing). A pair sampled then
+  /// bakes the entire preroll stall into the stored position — on
+  /// Jaizon's iPhone ≈0.5s, heard as the video sitting uniformly
+  /// behind the song on every take. Once playback is provably
+  /// advancing, the item position grows 1:1 with the session clock,
+  /// so a pair sampled at finish projects back to the first frame
+  /// exactly and the stall term vanishes; using the session's master
+  /// clock for both PTS and "now" (with an audio input present that
+  /// clock may be the audio device's clock, not the host clock)
+  /// removes the cross-clock term as well.
+  static func anchoredSongPosition(
+    anchorPosSeconds: Double,
+    anchorClockSeconds: Double,
+    firstFramePTSSeconds: Double
+  ) -> Double {
+    anchorPosSeconds + (firstFramePTSSeconds - anchorClockSeconds)
+  }
+
+  /// "Now" on the capture session's own master clock — the clock the
+  /// sample-buffer PTS live on. Falls back to the host clock only if
+  /// the session has no master clock of its own.
+  private func sessionNowLocked() -> CMTime {
+    CMClockGetTime(session.masterClock ?? CMClockGetHostTimeClock())
+  }
+
+  /// PROVISIONAL measurement, taken in the first frame's callback:
+  /// an anchor pair — the item's current position and session-clock
+  /// now; the frame's song position is the item position shifted by
+  /// (framePTS − now). This pair is sampled milliseconds after
+  /// play(), when the item may not be advancing yet (see
+  /// anchoredSongPosition), so beginFinishLocked OVERRIDES it with
+  /// the late anchor whenever that is available; it remains the
+  /// fallback when it is not. Only used when the item is actually
+  /// playing (rate ≠ 0); a paused/failed player yields nil — the
+  /// position is never fabricated.
   private func measureFirstFrameLocked(pts: CMTime) {
     guard let item = songItem else {
       firstFrameSongPosition = nil
@@ -2049,13 +2487,61 @@ private final class CaptureCoordinator: NSObject,
       firstFrameSongPosition = nil
       return
     }
-    let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
-    let delta = CMTimeGetSeconds(CMTimeSubtract(pts, hostNow))
+    let now = sessionNowLocked()
+    let position = Self.anchoredSongPosition(
+      anchorPosSeconds: CMTimeGetSeconds(itemNow),
+      anchorClockSeconds: CMTimeGetSeconds(now),
+      firstFramePTSSeconds: CMTimeGetSeconds(pts)
+    )
+    firstFrameSongPosition = position.isFinite ? position : nil
+  }
+
+  /// THE authoritative measurement, sampled at finish — before the
+  /// player pauses — once playback is provably advancing. Projects
+  /// the item's current position back to the first frame's PTS on
+  /// the session clock and overrides the provisional first-frame
+  /// value. Silently keeps the fallback whenever the late anchor is
+  /// unavailable: no song/item, no first frame yet, the player not
+  /// playing (item ended or paused early — e.g. the song is shorter
+  /// than the take, where the clamped end position would corrupt
+  /// the projection), or the item never advanced past the seek
+  /// target (preroll never completed, so there is nothing honest
+  /// to project from).
+  private func refineSongPositionAtFinishLocked() {
+    guard
+      let item = songItem,
+      let player = songPlayer,
+      let firstPTS = firstVideoPTS
+    else { return }
+    // Primary gate: the player reports itself playing.
+    // timeControlStatus lags on some OS versions, so a non-zero rate
+    // also counts — the advance check below is the real proof.
+    guard player.timeControlStatus == .playing || player.rate != 0 else { return }
+    let itemNow = item.currentTime()
+    guard itemNow.isValid, itemNow.isNumeric else { return }
     let itemSeconds = CMTimeGetSeconds(itemNow)
-    if delta.isFinite, itemSeconds.isFinite {
-      firstFrameSongPosition = itemSeconds + delta
-    } else {
-      firstFrameSongPosition = nil
+    // The item must have genuinely advanced beyond the seek target —
+    // a position still clamped AT the target is the preroll
+    // signature this refinement exists to escape.
+    guard itemSeconds.isFinite, itemSeconds > songSeekStartSeconds else { return }
+    // If the item has reached (or passed) its own end it may have
+    // stopped advancing while the clock ran on — a projection from a
+    // clamped end position would be just as wrong as the preroll.
+    let itemDuration = item.duration
+    if itemDuration.isValid, itemDuration.isNumeric {
+      let durationSeconds = CMTimeGetSeconds(itemDuration)
+      if durationSeconds.isFinite, itemSeconds >= durationSeconds - 0.05 {
+        return
+      }
+    }
+    let now = sessionNowLocked()
+    let candidate = Self.anchoredSongPosition(
+      anchorPosSeconds: itemSeconds,
+      anchorClockSeconds: CMTimeGetSeconds(now),
+      firstFramePTSSeconds: CMTimeGetSeconds(firstPTS)
+    )
+    if candidate.isFinite {
+      firstFrameSongPosition = candidate
     }
   }
 
@@ -2076,7 +2562,7 @@ private final class CaptureCoordinator: NSObject,
       return false
     }
     let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
-    let videoSettings: [String: Any] = [
+    var videoSettings: [String: Any] = [
       AVVideoCodecKey: AVVideoCodecType.h264,
       AVVideoWidthKey: Int(dimensions.width),
       AVVideoHeightKey: Int(dimensions.height),
@@ -2085,6 +2571,11 @@ private final class CaptureCoordinator: NSObject,
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
       ],
     ]
+    if captureIsSixtyFps {
+      // Harmless metadata that lets the encoder size its queues for
+      // the real cadence when the session is running a 60fps format.
+      videoSettings[AVVideoExpectedSourceFrameRateKey] = 60
+    }
     let videoInput = AVAssetWriterInput(
       mediaType: .video,
       outputSettings: videoSettings,
@@ -2227,6 +2718,10 @@ private final class CaptureCoordinator: NSObject,
     startTimeoutItem = nil
     seekArmItem?.cancel()
     seekArmItem = nil
+    // Authoritative sync measurement BEFORE the song player pauses:
+    // re-anchor the first-frame position from the provably-advancing
+    // player (see refineSongPositionAtFinishLocked).
+    refineSongPositionAtFinishLocked()
     songPlayer?.pause()
     if session.isRunning {
       session.stopRunning()
@@ -2324,9 +2819,34 @@ private final class CaptureCoordinator: NSObject,
   }
 
   private func cleanupCaptureLocked() {
-    songPlayer?.pause()
+    // Song player teardown, with the pre-warm rules (this is the
+    // ONLY place the active player is released — finish and abort
+    // both funnel through here):
+    // - The finished player IS the standing player (adopted at
+    //   prepare, or promoted by an earlier take): the standing slot
+    //   already holds it — paused, loaded, warm for the next take.
+    // - No competing standing player (none set, or a stale one for
+    //   this same song): PROMOTE the finished player to standing —
+    //   it just played the song, so it is definitionally warm. This
+    //   is what makes takes after the first fast even when
+    //   prepareSong was never called.
+    // - A DIFFERENT song is already standing (the track changed,
+    //   possibly mid-take): the finished player is discarded.
+    let finishedPlayer = songPlayer
+    let finishedItem = songItem
+    let finishedURL = activeSongURL
     songPlayer = nil
     songItem = nil
+    activeSongURL = nil
+    finishedPlayer?.pause()
+    if let finishedPlayer, let finishedItem, let finishedURL,
+      finishedPlayer !== warmedPlayer,
+      warmedURL == nil || warmedURL == finishedURL
+    {
+      warmedPlayer = finishedPlayer
+      warmedItem = finishedItem
+      warmedURL = finishedURL
+    }
     writer = nil
     videoWriterInput = nil
     audioWriterInput = nil
@@ -2517,6 +3037,10 @@ public class MvmtCompositorModule: Module {
 
     AsyncFunction("stopCapture") { () -> CaptureResultRecord in
       try await CaptureCoordinator.shared.stop()
+    }
+
+    AsyncFunction("prepareSong") { (songUri: String?) in
+      await CaptureCoordinator.shared.prepareSong(songUri: songUri)
     }
 
     AsyncFunction("createPreview") { (request: CompositeRequestRecord) -> String in

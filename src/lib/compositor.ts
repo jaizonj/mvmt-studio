@@ -19,6 +19,7 @@ export {
   isCaptureAvailable,
   isCompositorAvailable,
   measureTakeSync,
+  prepareSong,
   releasePreview,
   renderVideo,
   seekPreview,

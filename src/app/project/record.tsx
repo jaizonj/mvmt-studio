@@ -28,6 +28,7 @@ import {
   isCaptureAvailable,
   isCompositorAvailable,
   measureTakeSync,
+  prepareSong,
   startCapture,
   stopCapture,
   type CompositeRequest,
@@ -299,6 +300,17 @@ export default function CameraScreen() {
   // the song position at the first real frame). When it isn't (Expo
   // Go), the expo-camera path below runs exactly as before.
   const useNativeCapture = isCaptureAvailable();
+  // Pre-warm the native song player while this screen is up: the
+  // module builds a standing, prerolled player for the current
+  // track so pressing record adopts it instead of paying the cold
+  // load inside the take (Jaizon: the first takes of a session
+  // lagged and messed up until the app "caught up"). No-op on the
+  // expo-camera path and in Expo Go.
+  useEffect(() => {
+    if (!isFocused || !useNativeCapture) return;
+    void prepareSong(track?.uri ?? null);
+  }, [isFocused, track?.uri, useNativeCapture]);
+
 
   // Track playback — the sync master clock for takes.
   const player = useAudioPlayer(track?.uri ?? null);
@@ -525,13 +537,14 @@ export default function CameraScreen() {
   }, []);
 
   // Forward navigation: the takes live on this screen's left rail now
-  // (no separate Takes screen). Next goes to the Editor — or straight
-  // to Export when a cut already exists. Gated on the first take.
+  // (no separate Takes screen). Next ALWAYS goes to the Editor — the
+  // shuffle screen — never straight to Export, even when a cut already
+  // exists: landing on the cut first is how you re-shuffle or edit it
+  // (Jaizon, 2026-11-09). Gated on the first take.
   const goForward = useCallback(() => {
     if (takes.length === 0) return flashNotice('Record a take first');
-    if (studio.edl) return router.push('/project/export');
     router.push('/project/editor');
-  }, [flashNotice, takes.length, studio.edl]);
+  }, [flashNotice, takes.length]);
 
   const openRailPreview = useCallback((take: Take) => {
     setRailPreviewId(take.id);
@@ -861,13 +874,12 @@ export default function CameraScreen() {
     stopAtRef.current = null;
     stopRequestedRef.current = false;
     setElapsed(0);
-    const deadlineMs = lengthSeconds !== null ? recordStartRef.current + lengthSeconds * 1000 : null;
     elapsedTimerRef.current = setInterval(() => {
       if (recordSessionRef.current !== session) return;
       const elapsedNow = (Date.now() - recordStartRef.current) / 1000;
       setElapsed(lengthSeconds !== null ? Math.min(elapsedNow, lengthSeconds) : elapsedNow);
       if (stopRequestedRef.current) return;
-      if (deadlineMs !== null && Date.now() >= deadlineMs) {
+      if (lengthSeconds !== null && Date.now() >= recordStartRef.current + lengthSeconds * 1000) {
         stopRequestedRef.current = true;
         stopAtRef.current = Date.now();
         if (useNativeCapture) {
@@ -903,6 +915,16 @@ export default function CameraScreen() {
           // stop / deadline still ends the take.
           maxDurationSeconds: lengthSeconds !== null ? Math.max(1, lengthSeconds + 1) : 3600,
         });
+        // The take's length clock runs from the FIRST REAL FRAME
+        // (startCapture resolves when it is appended), not from the
+        // tap: on a cold start the module can spend a beat arming
+        // (seek + preroll), and that warm-up must not eat the
+        // take's length — Jaizon's cold takes were stopping early.
+        // The deadline interval reads recordStartRef live, and the
+        // landing duration is measured from the same epoch.
+        if (recordSessionRef.current === session) {
+          recordStartRef.current = Date.now();
+        }
       } catch {
         if (recordSessionRef.current === session) {
           if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
@@ -1223,10 +1245,20 @@ export default function CameraScreen() {
         </View>
       ) : null}
 
-      {/* Bottom control bar — takes review | record | shuffle (next stages).
-          Both side actions follow the flow and are gated on having a take. */}
+      {/* Bottom control bar — projects | record | next. The left
+          button is the way OUT: this screen is pushed over the tabs
+          and a cold launch lands here directly, so without it there
+          was no route back to switch projects (Jaizon, 2026-11-09).
+          Next follows the flow and is gated on having a take. */}
       <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, spacing.md) }]}>
-        <View style={styles.sideButtonSpacer} />
+        <Pressable
+          style={styles.sideButton}
+          onPress={() => router.back()}
+          accessibilityRole="button"
+          accessibilityLabel="Back to projects">
+          <Ionicons name="chevron-back" size={26} color="#FFFFFF" />
+          <Text style={styles.sideButtonLabel}>Projects</Text>
+        </Pressable>
         <RecordButton recording={recording} onPress={handleRecordPress} />
         <Pressable
           style={styles.sideButton}
@@ -1718,7 +1750,7 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   timerChipText: { color: colors.label, fontSize: 13, fontWeight: '700' },
-  sideButtonSpacer: { width: 64 },
+
   takeRail: { position: 'absolute', left: spacing.md, width: 60 },
   takeRailContent: { gap: spacing.md, alignItems: 'center', paddingVertical: spacing.xs },
   // Collapsed takes rail: a slim pull-tab hugging the left edge —

@@ -50,6 +50,7 @@ export function createEmptyProject(name: string): Project {
     edl: null,
     lastShuffleSequence: null,
     shuffleFrequency: 'normal',
+    watermarkEnabled: true,
   };
 }
 
@@ -94,6 +95,11 @@ interface StudioState {
 
   shuffleFrequency: ShuffleFrequency;
   setShuffleFrequency: (v: ShuffleFrequency) => void;
+
+  /** Effective watermark flag for the active project — stored values
+   *  win; projects saved before the flag existed read as ON. */
+  watermarkEnabled: boolean;
+  setWatermarkEnabled: (enabled: boolean) => void;
 
   // ---- Global camera + settings preferences ----
   facing: CameraType;
@@ -319,6 +325,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchActiveProject],
   );
 
+  // The persisted field is optional (older projects predate it); the
+  // effective value defaults to ON when it was never set.
+  const watermarkEnabled = activeProject?.watermarkEnabled ?? true;
+
+  const setWatermarkEnabled = useCallback(
+    (enabled: boolean) => patchActiveProject({ watermarkEnabled: enabled }),
+    [patchActiveProject],
+  );
+
   const addTake = useCallback(
     (take: Take) => {
       const current = activeProjectRef.current;
@@ -384,6 +399,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setTrackSections,
       shuffleFrequency,
       setShuffleFrequency,
+      watermarkEnabled,
+      setWatermarkEnabled,
       resolution,
       setResolution,
       frameRate,
@@ -438,6 +455,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       trackSections,
       shuffleFrequency,
       setShuffleFrequency,
+      watermarkEnabled,
+      setWatermarkEnabled,
       resolution,
       frameRate,
       gridOverlay,

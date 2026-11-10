@@ -10,6 +10,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   View,
   useWindowDimensions,
@@ -41,6 +42,7 @@ import {
 } from '../../lib/edl';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import { buildEdlFromShuffle, validateAgainstAssets } from '../../lib/shuffleEdl';
+import { resolveWatermarkUri } from '../../lib/watermark';
 import { useStudio } from '../../store/StudioContext';
 import type { ShuffleFrequency, Take } from '../../types';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
@@ -48,8 +50,8 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../../th
 /**
  * Editor — workspace stage 3, the centrepiece (design system §3.5).
  *
- * One screen, ONE timeline, no modes (simplification pass v2): the
- * canonical frame-based EDL (src/lib/edl.ts). The timeline is directly
+ * One screen, ONE timeline: the canonical frame-based EDL
+ * (src/lib/edl.ts). The timeline is directly
  * interactive by default — tap a cut to select it, swap its take from
  * the chips below, drag its ends to trim; the shuffle (the
  * shuffle→EDL bridge) lives in its own section underneath. Every
@@ -57,11 +59,18 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../../th
  * invariant there), validates against measured asset durations and
  * records an undo snapshot.
  *
- * Layout: a FIXED header, then ONE vertical ScrollView holding the
- * preview, transport, timeline, selected-cut panel and shuffle
- * section — every control is reachable by scrolling on any iPhone
- * (the previous fixed-flex layout clipped the lower panels on real
- * devices).
+ * Layout (Edit mode): a FIXED header, then ONE vertical ScrollView
+ * holding the preview, transport, timeline, selected-cut panel and
+ * shuffle section — every control is reachable by scrolling on any
+ * iPhone (the previous fixed-flex layout clipped the lower panels on
+ * real devices).
+ *
+ * 2026-11-09 (Jaizon): the screen has two faces over the same logic.
+ * It OPENS on a clean shuffle landing — a preview of the
+ * already-shuffled cut plus Reshuffle / Edit / Continue and nothing
+ * else (auto-shuffling on open when no edit exists yet) — and the
+ * editing layout above is Edit mode, one tap deeper. The watermark
+ * toggle sits at the bottom of Edit mode's scroll content.
  *
  * Preview is the native composition (NativePreview) built from the
  * SAME edlToCompositeRequest the exporter consumes — what plays here
@@ -132,6 +141,12 @@ function EditorWorkspace() {
   const storedEdl = studio.edl;
   const { width: winW, height: winH } = useWindowDimensions();
 
+  // Two faces, one workspace (Jaizon, 2026-11-09): the screen OPENS
+  // on the shuffle landing — preview of the already-shuffled cut,
+  // Reshuffle, Edit, Continue, nothing else — and the full editing
+  // surface lives one tap deeper in 'edit'. All state/logic below is
+  // shared; only the presentation branches.
+  const [mode, setMode] = useState<'shuffle' | 'edit'>('shuffle');
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [paused, setPaused] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -347,6 +362,43 @@ function EditorWorkspace() {
     setSweepKey((k) => k + 1);
   };
 
+  // ---- Open on a shuffled cut --------------------------------------
+  // The shuffle landing must always open on a finished cut (Jaizon,
+  // 2026-11-09): when the project has no edit yet, the first shuffle
+  // is generated automatically — exactly once per mount, and
+  // EditorScreen remounts per project, so the guard is per project.
+  // A stored edit is shown as-is; undoing back to no edit must not
+  // trigger a surprise re-shuffle, so the guard is consumed either way.
+  const autoShuffledRef = useRef(false);
+  const handleShuffleRef = useRef(handleShuffle);
+  useEffect(() => {
+    handleShuffleRef.current = handleShuffle;
+  });
+  useEffect(() => {
+    if (autoShuffledRef.current) return;
+    if (storedEdl) {
+      autoShuffledRef.current = true;
+      return;
+    }
+    if (takes.length === 0) return; // takes haven't landed yet — wait
+    if (!canShuffle) {
+      autoShuffledRef.current = true;
+      return;
+    }
+    // Deferred by a frame: generating the cut commits state (local
+    // UI state + the store), and doing that synchronously inside the
+    // effect would cascade renders on mount. One frame is invisible
+    // — the landing still opens on the finished, auto-playing cut.
+    // The guard is consumed inside the callback, so if this effect
+    // re-runs first (a dep settled), the pending frame is cancelled
+    // and a fresh one is scheduled instead of doubling up.
+    const frame = requestAnimationFrame(() => {
+      autoShuffledRef.current = true;
+      handleShuffleRef.current();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [storedEdl, takes.length, canShuffle]);
+
   // ---- Selection & take swap ------------------------------------------
   const selected = edl?.segments.find((s) => s.id === selectedSegmentId) ?? null;
   const selectedIndex = selected && edl ? edl.segments.findIndex((s) => s.id === selected.id) : -1;
@@ -450,14 +502,35 @@ function EditorWorkspace() {
 
   // ---- Preview ---------------------------------------------------------
   const takeUriById = useCallback((id: string) => takes.find((t) => t.id === id)?.uri, [takes]);
+
+  // Watermark: the flag lives on the project (toggled in Edit mode
+  // below); the logo's file URI is resolved once via the shared cache
+  // in src/lib/watermark.ts. The preview request carries both, so the
+  // preview stamps exactly what the export will (preview == export).
+  const watermarkOn = studio.watermarkEnabled;
+  const [watermarkUri, setWatermarkUri] = useState<string | null>(null);
+  useEffect(() => {
+    if (!watermarkOn) return;
+    let alive = true;
+    void resolveWatermarkUri().then((uri) => {
+      if (alive) setWatermarkUri(uri);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [watermarkOn]);
+
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
     try {
-      return edlToCompositeRequest(edl, takeUriById);
+      return edlToCompositeRequest(edl, takeUriById, {
+        watermarkEnabled: watermarkOn,
+        watermarkImageUri: watermarkOn ? watermarkUri : null,
+      });
     } catch {
       return null;
     }
-  }, [edl, takeUriById]);
+  }, [edl, takeUriById, watermarkOn, watermarkUri]);
   const previewKey = previewRequest ? `${JSON.stringify(previewRequest)}#${previewNonce}` : '';
 
   const handleProgress = useCallback((pos: number, playing: boolean) => {
@@ -548,21 +621,197 @@ function EditorWorkspace() {
       ? track.name
       : 'No song loaded';
 
+  // The preview frame + transport, shared verbatim by the shuffle
+  // landing and Edit mode — one NativePreview wiring, so both faces
+  // of this screen play the identical composition.
+  const previewAndTransport = (
+    <>
+    {/* Preview — the native composition, exactly as it exports. */}
+    <View style={styles.previewArea}>
+      <View style={[styles.previewFrame, { width: previewWidth, height: previewHeight }]}>
+        {previewRequest ? (
+          <>
+            <NativePreview
+              ref={previewRef}
+              request={previewRequest}
+              requestKey={previewKey}
+              paused={paused}
+              onProgress={handleProgress}
+              onStatus={handleStatus}
+              style={StyleSheet.absoluteFill}
+            />
+            {sweepKey > 0 ? <SweepOverlay key={sweepKey} width={previewWidth} /> : null}
+            {previewStatus === 'loading' ? (
+              <View style={styles.previewOverlay} pointerEvents="none">
+                <ActivityIndicator color={colors.label} />
+                <Text style={styles.previewOverlayText}>Preparing your cut…</Text>
+              </View>
+            ) : null}
+            {previewStatus === 'error' ? (
+              <View style={styles.previewOverlay}>
+                <Text style={styles.previewOverlayText}>The preview could not be prepared.</Text>
+                <Pressable
+                  style={styles.retryButton}
+                  onPress={() => setPreviewNonce((n) => n + 1)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Try preparing the preview again">
+                  <Text style={styles.retryButtonText}>Try again</Text>
+                </Pressable>
+              </View>
+            ) : null}
+          </>
+        ) : (
+          <View style={styles.previewPlaceholder}>
+            <Ionicons name="film-outline" size={34} color={colors.labelSecondary} />
+            <Text style={styles.previewPlaceholderText}>No cut yet</Text>
+          </View>
+        )}
+      </View>
+    </View>
+
+    {/* Transport — display only; the engine owns playback. */}
+    <View style={styles.transport}>
+      <Pressable
+        onPress={togglePlay}
+        disabled={!previewRequest}
+        hitSlop={6}
+        accessibilityRole="button"
+        accessibilityLabel={paused ? 'Play preview' : 'Pause preview'}
+        accessibilityState={{ disabled: !previewRequest }}
+        style={[styles.playButton, !previewRequest && styles.historyButtonDisabled]}>
+        <Ionicons name={paused ? 'play' : 'pause'} size={20} color={colors.label} />
+      </Pressable>
+      <Text style={styles.transportTime}>{formatTime(Math.min(positionSeconds, totalSeconds))}</Text>
+      <View style={styles.progressTrack}>
+        <View
+          style={[
+            styles.progressFill,
+            { width: `${totalSeconds > 0 ? Math.min(100, Math.max(0, (positionSeconds / totalSeconds) * 100)) : 0}%` },
+          ]}
+        />
+      </View>
+      <Text style={styles.transportTime}>{formatTime(totalSeconds)}</Text>
+    </View>
+    </>
+  );
+
+  // ---- Shuffle landing ----------------------------------------------
+  // The screen Record's Next lands on (Jaizon, 2026-11-09): the
+  // preview of the already-shuffled cut, Reshuffle, Edit, Continue —
+  // and nothing else. No timeline, no selection, no chips.
+  if (mode === 'shuffle') {
+    return (
+      <View style={styles.root}>
+        <View style={[styles.header, { paddingTop: insets.top + spacing.md }]}>
+          <View style={styles.headerRow}>
+            <Pressable
+              onPress={() => router.back()}
+              hitSlop={10}
+              accessibilityRole="button"
+              accessibilityLabel="Back to Record"
+              style={styles.backButton}>
+              <Ionicons name="chevron-back" size={26} color={colors.accent} />
+              <Text style={styles.backText}>Record</Text>
+            </Pressable>
+          </View>
+          <Text style={styles.largeTitle} numberOfLines={1}>
+            Your cut
+          </Text>
+          <Text style={styles.headerSubtitle} numberOfLines={1}>
+            {headerSubtitle}
+          </Text>
+        </View>
+
+        {takes.length === 0 ? (
+          <View style={[styles.section, styles.emptyCard]}>
+            <Ionicons name="videocam-outline" size={30} color={colors.labelSecondary} />
+            <Text style={styles.emptyTitle}>Record some takes first</Text>
+            <Text style={styles.emptyBody}>
+              Your shuffled cut appears here once you have recorded some takes to cut together.
+            </Text>
+            <Pressable
+              style={styles.emptyPrimaryButton}
+              onPress={() => router.back()}
+              accessibilityRole="button">
+              <Ionicons name="videocam-outline" size={18} color={colors.onAccent} />
+              <Text style={styles.emptyPrimaryButtonText}>Back to Record</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <ScrollView
+            style={styles.scroll}
+            contentContainerStyle={[
+              styles.scrollContent,
+              { paddingBottom: Math.max(insets.bottom, spacing.md) + spacing.xl },
+            ]}
+            showsVerticalScrollIndicator={false}>
+            {previewAndTransport}
+
+            <View style={styles.section}>
+              <View style={styles.panel}>
+                <View style={styles.actionRow}>
+                  <Pressable
+                    style={[styles.actionButton, !canShuffle && styles.actionButtonDisabled]}
+                    onPress={handleShuffle}
+                    disabled={!canShuffle}
+                    accessibilityRole="button"
+                    accessibilityLabel="Reshuffle for a different arrangement">
+                    <Ionicons name="shuffle" size={19} color={canShuffle ? colors.label : colors.labelTertiary} />
+                    <Text style={[styles.actionButtonText, !canShuffle && styles.actionButtonTextDisabled]}>
+                      Reshuffle
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.actionButton}
+                    onPress={() => setMode('edit')}
+                    accessibilityRole="button"
+                    accessibilityLabel="Edit the cut">
+                    <Ionicons name="create-outline" size={19} color={colors.label} />
+                    <Text style={styles.actionButtonText}>Edit</Text>
+                  </Pressable>
+                </View>
+                {!canShuffle ? (
+                  <Text style={styles.caption}>
+                    Shuffle needs at least 2 takes — record one more to mix between takes.
+                  </Text>
+                ) : shuffleNote ? (
+                  <Text style={styles.caption}>{shuffleNote}</Text>
+                ) : null}
+                <Pressable
+                  style={[styles.continueButton, !hasCut && styles.continueButtonDisabled]}
+                  onPress={() => hasCut && router.push('/project/export')}
+                  disabled={!hasCut}
+                  accessibilityRole="button"
+                  accessibilityLabel={hasCut ? 'Continue to Export' : 'Continue — make a cut first'}
+                  accessibilityState={{ disabled: !hasCut }}>
+                  <Text style={[styles.continueButtonText, !hasCut && styles.continueButtonTextDisabled]}>
+                    Continue
+                  </Text>
+                  <Ionicons name="arrow-forward" size={18} color={hasCut ? colors.onAccent : colors.labelTertiary} />
+                </Pressable>
+              </View>
+            </View>
+          </ScrollView>
+        )}
+      </View>
+    );
+  }
+
   return (
     <View style={styles.root}>
-      {/* Header band (design system §2.3): back, project name, subtitle
-          — plus this stage's undo/redo and the Export action. FIXED:
-          it lives outside the scroll area. */}
+      {/* Edit-mode header band: back to the shuffle landing, the
+          "Edit" title — plus this stage's undo/redo and the Export
+          action. FIXED: it lives outside the scroll area. */}
       <View style={[styles.header, { paddingTop: insets.top + spacing.md }]}>
         <View style={styles.headerRow}>
           <Pressable
-            onPress={() => router.back()}
+            onPress={() => setMode('shuffle')}
             hitSlop={10}
             accessibilityRole="button"
-            accessibilityLabel="Back to Record"
+            accessibilityLabel="Back to your cut"
             style={styles.backButton}>
             <Ionicons name="chevron-back" size={26} color={colors.accent} />
-            <Text style={styles.backText}>Record</Text>
+            <Text style={styles.backText}>Your cut</Text>
           </Pressable>
           <View style={styles.headerActions}>
             <Pressable
@@ -598,7 +847,7 @@ function EditorWorkspace() {
           </View>
         </View>
         <Text style={styles.largeTitle} numberOfLines={1}>
-          {activeProject?.name ?? 'Editor'}
+          Edit
         </Text>
         <Text style={styles.headerSubtitle} numberOfLines={1}>
           {headerSubtitle}
@@ -629,72 +878,7 @@ function EditorWorkspace() {
             { paddingBottom: Math.max(insets.bottom, spacing.md) + spacing.xl },
           ]}
           showsVerticalScrollIndicator={false}>
-          {/* Preview — the native composition, exactly as it exports. */}
-          <View style={styles.previewArea}>
-            <View style={[styles.previewFrame, { width: previewWidth, height: previewHeight }]}>
-              {previewRequest ? (
-                <>
-                  <NativePreview
-                    ref={previewRef}
-                    request={previewRequest}
-                    requestKey={previewKey}
-                    paused={paused}
-                    onProgress={handleProgress}
-                    onStatus={handleStatus}
-                    style={StyleSheet.absoluteFill}
-                  />
-                  {sweepKey > 0 ? <SweepOverlay key={sweepKey} width={previewWidth} /> : null}
-                  {previewStatus === 'loading' ? (
-                    <View style={styles.previewOverlay} pointerEvents="none">
-                      <ActivityIndicator color={colors.label} />
-                      <Text style={styles.previewOverlayText}>Preparing your cut…</Text>
-                    </View>
-                  ) : null}
-                  {previewStatus === 'error' ? (
-                    <View style={styles.previewOverlay}>
-                      <Text style={styles.previewOverlayText}>The preview could not be prepared.</Text>
-                      <Pressable
-                        style={styles.retryButton}
-                        onPress={() => setPreviewNonce((n) => n + 1)}
-                        accessibilityRole="button"
-                        accessibilityLabel="Try preparing the preview again">
-                        <Text style={styles.retryButtonText}>Try again</Text>
-                      </Pressable>
-                    </View>
-                  ) : null}
-                </>
-              ) : (
-                <View style={styles.previewPlaceholder}>
-                  <Ionicons name="film-outline" size={34} color={colors.labelSecondary} />
-                  <Text style={styles.previewPlaceholderText}>No cut yet</Text>
-                </View>
-              )}
-            </View>
-          </View>
-
-          {/* Transport — display only; the engine owns playback. */}
-          <View style={styles.transport}>
-            <Pressable
-              onPress={togglePlay}
-              disabled={!previewRequest}
-              hitSlop={6}
-              accessibilityRole="button"
-              accessibilityLabel={paused ? 'Play preview' : 'Pause preview'}
-              accessibilityState={{ disabled: !previewRequest }}
-              style={[styles.playButton, !previewRequest && styles.historyButtonDisabled]}>
-              <Ionicons name={paused ? 'play' : 'pause'} size={20} color={colors.label} />
-            </Pressable>
-            <Text style={styles.transportTime}>{formatTime(Math.min(positionSeconds, totalSeconds))}</Text>
-            <View style={styles.progressTrack}>
-              <View
-                style={[
-                  styles.progressFill,
-                  { width: `${totalSeconds > 0 ? Math.min(100, Math.max(0, (positionSeconds / totalSeconds) * 100)) : 0}%` },
-                ]}
-              />
-            </View>
-            <Text style={styles.transportTime}>{formatTime(totalSeconds)}</Text>
-          </View>
+          {previewAndTransport}
 
           {/* Timeline — the editing surface, directly interactive:
               tap a cut to select it, drag its ends to trim, drag the
@@ -816,6 +1000,27 @@ function EditorWorkspace() {
               <Text style={styles.caption}>{frequencyCaption} Applies to the next shuffle.</Text>
             </View>
           </View>
+
+          {/* Watermark — the MVMT studio logo stamped on the video
+              (preview and export alike). A project-level output
+              choice, so it lives here in Edit, not in Settings. */}
+          <View style={styles.section}>
+            <View style={styles.panel}>
+              <View style={styles.watermarkRow}>
+                <View style={styles.watermarkText}>
+                  <Text style={styles.cutTitle}>Watermark</Text>
+                  <Text style={styles.caption}>MVMT studio logo on the video</Text>
+                </View>
+                <Switch
+                  value={watermarkOn}
+                  onValueChange={studio.setWatermarkEnabled}
+                  trackColor={{ true: colors.accent, false: colors.elevated }}
+                  thumbColor={watermarkOn ? colors.onAccent : colors.label}
+                  accessibilityLabel="Watermark"
+                />
+              </View>
+            </View>
+          </View>
         </ScrollView>
       )}
     </View>
@@ -933,6 +1138,34 @@ const styles = StyleSheet.create({
   shuffleButtonText: { color: colors.onAccent, ...typeScale.headline },
   shuffleButtonTextDisabled: { color: colors.labelTertiary },
   caption: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 18 },
+  actionRow: { flexDirection: 'row', gap: spacing.sm },
+  actionButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    paddingVertical: 13,
+  },
+  actionButtonDisabled: { opacity: 0.5 },
+  actionButtonText: { color: colors.label, ...typeScale.headline },
+  actionButtonTextDisabled: { color: colors.labelTertiary },
+  continueButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: colors.accent,
+    borderRadius: radius.md,
+    paddingVertical: 14,
+  },
+  continueButtonDisabled: { backgroundColor: colors.elevated },
+  continueButtonText: { color: colors.onAccent, ...typeScale.headline },
+  continueButtonTextDisabled: { color: colors.labelTertiary },
+  watermarkRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md },
+  watermarkText: { flex: 1, gap: 2 },
   cutTitle: { ...typeScale.headline, color: colors.label },
   chipScroll: { marginHorizontal: -spacing.xs },
   chipRow: { flexDirection: 'row', gap: spacing.sm, paddingHorizontal: spacing.xs, paddingVertical: 2 },

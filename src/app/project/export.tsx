@@ -26,6 +26,7 @@ import {
 } from '../../lib/edl';
 import { saveToPhotoLibrary, shareFile } from '../../lib/media';
 import { validateAgainstAssets } from '../../lib/shuffleEdl';
+import { resolveWatermarkUri } from '../../lib/watermark';
 import { useStudio } from '../../store/StudioContext';
 import type { ExportQualityPref } from '../../types';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
@@ -77,7 +78,7 @@ interface ValidatedCut {
 export default function ExportScreen() {
   const insets = useSafeAreaInsets();
   const studio = useStudio();
-  const { activeProject, takes, edl, exportQuality, setExportQuality } = studio;
+  const { activeProject, takes, edl, exportQuality, setExportQuality, watermarkEnabled } = studio;
 
   const engineAvailable = isCompositorAvailable();
   const noTakes = takes.length === 0;
@@ -132,11 +133,30 @@ export default function ExportScreen() {
   const cut: ValidatedCut | null =
     nativeCut && nativeCut.sig === edlSig ? nativeCut : fallbackCut;
 
+  // Watermark: the project's flag (toggled on the Edit screen) plus
+  // the logo's resolved file URI (shared cache, src/lib/watermark.ts)
+  // ride on the ONE request below — so the final preview shows the
+  // stamp the render will carry.
+  const [watermarkUri, setWatermarkUri] = useState<string | null>(null);
+  useEffect(() => {
+    if (!watermarkEnabled) return;
+    let alive = true;
+    void resolveWatermarkUri().then((uri) => {
+      if (alive) setWatermarkUri(uri);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [watermarkEnabled]);
+
   // ---- The ONE request: preview and render consume exactly this.
   const request = useMemo<CompositeRequest | null>(() => {
     if (!cut || cut.edl.segments.length === 0) return null;
     try {
-      const base = edlToCompositeRequest(cut.edl, takeUri);
+      const base = edlToCompositeRequest(cut.edl, takeUri, {
+        watermarkEnabled,
+        watermarkImageUri: watermarkEnabled ? watermarkUri : null,
+      });
       const canvas = QUALITY_CANVAS[exportQuality] ?? cut.edl.canvas;
       // The canvas override is applied HERE, on the single shared
       // request, so the preview the user approves is framed identically
@@ -145,7 +165,7 @@ export default function ExportScreen() {
     } catch {
       return null;
     }
-  }, [cut, takeUri, exportQuality]);
+  }, [cut, takeUri, exportQuality, watermarkEnabled, watermarkUri]);
 
   const requestKey = useMemo(() => (request ? JSON.stringify(request) : ''), [request]);
   const totalSeconds = cut ? edlDurationSeconds(cut.edl) : 0;

@@ -204,7 +204,13 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
 export function edlToCompositeRequest(
   edl: Edl,
   takeUri: (takeId: string) => string | undefined,
-  options: { includeTakeAudio?: boolean } = {},
+  options: {
+    includeTakeAudio?: boolean;
+    /** Stamp the MVMT studio logo watermark on the composition. */
+    watermarkEnabled?: boolean;
+    /** On-device file URI of the watermark image (see src/lib/watermark.ts). */
+    watermarkImageUri?: string | null;
+  } = {},
 ): CompositeRequest {
   const clips = edl.segments.map((segment) => {
     const uri = takeUri(segment.takeId);
@@ -225,6 +231,12 @@ export function edlToCompositeRequest(
     canvasWidth: edl.canvas.width,
     canvasHeight: edl.canvas.height,
     frameRate: edl.fps,
+    // Watermark: passed through untouched — the native engine decides
+    // how to stamp it. Only the Editor preview and the Export render
+    // set these; other callers (e.g. the Record screen's per-take
+    // calibration preview) omit them and stay unwatermarked.
+    watermarkEnabled: options.watermarkEnabled ?? false,
+    watermarkImageUri: options.watermarkImageUri ?? null,
   };
 }
 

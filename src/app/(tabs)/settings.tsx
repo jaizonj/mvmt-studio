@@ -1,4 +1,5 @@
 import type { VideoQuality } from 'expo-camera';
+import { Image } from 'expo-image';
 import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -148,6 +149,16 @@ export default function SettingsScreen() {
           renders with the native engine — preview and export are the same composition.
         </Text>
       </GroupCard>
+
+      {/* Brand mark — the lockup as a quiet footer under About. */}
+      <View style={styles.brandFooter}>
+        <Image
+          source={require('../../../assets/logo-lockup.png')}
+          style={styles.brandLogo}
+          contentFit="contain"
+          accessibilityLabel="MVMT Studio"
+        />
+      </View>
     </ScrollView>
   );
 }
@@ -240,6 +251,8 @@ const styles = StyleSheet.create({
   stepButtonText: { color: colors.label, fontSize: 18, fontWeight: '700' },
   stepValue: { ...typeScale.headline, color: colors.label, minWidth: 64, textAlign: 'center', fontVariant: ['tabular-nums'] },
   infoRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', minHeight: 32 },
+  brandFooter: { alignItems: 'center', marginTop: spacing.xxl },
+  brandLogo: { width: 110, aspectRatio: 363 / 175, opacity: 0.85 },
   infoValue: { ...typeScale.subhead, color: colors.labelSecondary },
   aboutText: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 18 },
 });
