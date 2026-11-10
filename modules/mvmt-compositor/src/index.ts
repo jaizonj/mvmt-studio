@@ -267,6 +267,7 @@ interface NativeMvmtCompositorModule {
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
   prepareSong(songUri: string | null): Promise<void>;
+  setCaptureQuality(quality: string): Promise<void>;
   createPreview(request: CompositeRequest): Promise<string>;
   setPreviewPaused(previewId: string, paused: boolean): Promise<void>;
   seekPreview(previewId: string, seconds: number): Promise<void>;
@@ -471,6 +472,35 @@ export async function prepareSong(songUri: string | null): Promise<void> {
     return;
   }
   return nativeModule.prepareSong(songUri ?? null);
+}
+
+/**
+ * Capture quality for the native recorder, chosen in Settings:
+ * - `'1080p30'` — 1920×1080 at 30fps via session-preset steering (the
+ *   default; no device format is forced).
+ * - `'1080p60'` — 1920×1080 at 60fps via a ranked exact-dimension
+ *   device format.
+ * - `'4k60'` — 3840×2160 at 60fps, same mechanism.
+ * Qualities whose format the current camera doesn't offer fall back
+ * to the preset path natively — recording never breaks over a
+ * preference. A change made mid-capture applies from the next take.
+ */
+export type CaptureQuality = '1080p30' | '1080p60' | '4k60';
+
+/**
+ * Sets the native recorder's capture quality. The value is stored on
+ * the capture coordinator's configuration and the session is
+ * reconfigured in place when it is already configured.
+ *
+ * Best-effort like `prepareSong`: silently no-ops in Expo Go and in
+ * older builds without the function — capture then runs at the
+ * native default ('1080p30' preset steering).
+ */
+export async function setCaptureQuality(quality: CaptureQuality): Promise<void> {
+  if (!nativeModule || typeof nativeModule.setCaptureQuality !== 'function') {
+    return;
+  }
+  return nativeModule.setCaptureQuality(quality);
 }
 
 type NativeCaptureViewComponent = ComponentType<CapturePreviewProps>;

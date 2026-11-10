@@ -54,6 +54,15 @@ export function createEmptyProject(name: string): Project {
   };
 }
 
+/**
+ * Native recorder quality (Settings → Capture quality). '1080p30' is
+ * the default: session-preset steering, no forced device format.
+ * The 60fps options make the native engine pin an exact-dimension
+ * 60fps device format (with a silent preset fallback when a camera
+ * doesn't offer one).
+ */
+export type CaptureQuality = '1080p30' | '1080p60' | '4k60';
+
 interface StudioState {
   // ---- Projects ----
   projects: Project[];
@@ -116,6 +125,8 @@ interface StudioState {
   setResolution: (v: VideoQuality) => void;
   frameRate: FrameRatePref;
   setFrameRate: (v: FrameRatePref) => void;
+  captureQuality: CaptureQuality;
+  setCaptureQuality: (v: CaptureQuality) => void;
   gridOverlay: boolean;
   setGridOverlay: (v: boolean | ((current: boolean) => boolean)) => void;
   levelGuide: boolean;
@@ -151,6 +162,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [countdown, setCountdown] = useState<CountdownSeconds>(0);
   const [resolution, setResolution] = useState<VideoQuality>('1080p');
   const [frameRate, setFrameRate] = useState<FrameRatePref>(30);
+  const [captureQuality, setCaptureQuality] = useState<CaptureQuality>('1080p30');
   const [gridOverlay, setGridOverlay] = useState(false);
   const [levelGuide, setLevelGuide] = useState(false);
   const [audioOffsetMs, setAudioOffsetMsState] = useState(0);
@@ -405,6 +417,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setResolution,
       frameRate,
       setFrameRate,
+      captureQuality,
+      setCaptureQuality,
       gridOverlay,
       setGridOverlay,
       levelGuide,
@@ -459,6 +473,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setWatermarkEnabled,
       resolution,
       frameRate,
+      captureQuality,
       gridOverlay,
       levelGuide,
       audioOffsetMs,

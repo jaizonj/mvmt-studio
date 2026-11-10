@@ -201,6 +201,34 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
  * Audio policy: master song only, unless `includeTakeAudio` is set —
  * takes are muted by default (Overhaul directive §2.5).
  */
+/**
+ * The output canvas a cut should render at: the largest recorded
+ * frame among the takes (their measured display sizes), so a project
+ * shot at 4K exports at 4K instead of silently downscaling to the
+ * 1080×1920 default. Takes without measured dimensions (expo path,
+ * legacy) simply don't vote. Never shrinks the EDL's stored canvas.
+ */
+export function canvasForTakes(
+  takes: readonly import('../types').Take[],
+): { width: number; height: number } | null {
+  let best: { width: number; height: number } | null = null;
+  for (const t of takes) {
+    if (!t.width || !t.height) continue;
+    if (!best || t.width * t.height > best.width * best.height) {
+      best = { width: t.width, height: t.height };
+    }
+  }
+  return best;
+}
+
+/** `edl` with its canvas raised to the takes' canvas when larger. */
+export function edlWithTakeCanvas(edl: Edl, takes: readonly import('../types').Take[]): Edl {
+  const canvas = canvasForTakes(takes);
+  if (!canvas) return edl;
+  if (canvas.width * canvas.height <= edl.canvas.width * edl.canvas.height) return edl;
+  return { ...edl, canvas };
+}
+
 export function edlToCompositeRequest(
   edl: Edl,
   takeUri: (takeId: string) => string | undefined,

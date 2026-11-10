@@ -30,7 +30,9 @@ import { inspectAsset, isCompositorAvailable, type PreviewStatus } from '../../l
 import {
   DEFAULT_FPS,
   edlDurationSeconds,
+  canvasForTakes,
   edlToCompositeRequest,
+  edlWithTakeCanvas,
   framesToSeconds,
   layoutSegments,
   secondsToFrames,
@@ -348,6 +350,8 @@ function EditorWorkspace() {
         activeProject?.lastShuffleSequence ?? (edl ? edl.segments.map((s) => s.takeId) : undefined),
       regionStartSeconds,
       audioUri: track?.uri ?? null,
+      // The cut renders at the takes' own size (4K takes → 4K cut).
+      ...(canvasForTakes(takes) ? { canvas: canvasForTakes(takes)! } : {}),
     });
     if (built.segments.length === 0) {
       setShuffleNote("That didn't cut — check the song is loaded, then try again.");
@@ -517,11 +521,11 @@ function EditorWorkspace() {
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
     try {
-      return edlToCompositeRequest(edl, takeUriById);
+      return edlToCompositeRequest(edlWithTakeCanvas(edl, takes), takeUriById);
     } catch {
       return null;
     }
-  }, [edl, takeUriById]);
+  }, [edl, takeUriById, takes]);
   const previewKey = previewRequest ? `${JSON.stringify(previewRequest)}#${previewNonce}` : '';
 
   const handleProgress = useCallback((pos: number, playing: boolean) => {

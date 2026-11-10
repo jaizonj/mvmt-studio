@@ -20,6 +20,7 @@ import {
 import {
   edlDurationSeconds,
   edlToCompositeRequest,
+  edlWithTakeCanvas,
   secondsToFrames,
   validateEdl,
   type AssetMeasure,
@@ -154,11 +155,15 @@ export default function ExportScreen() {
   const request = useMemo<CompositeRequest | null>(() => {
     if (!cut || cut.edl.segments.length === 0) return null;
     try {
-      const base = edlToCompositeRequest(cut.edl, takeUri, {
+      const effectiveEdl = edlWithTakeCanvas(cut.edl, takes);
+      const base = edlToCompositeRequest(effectiveEdl, takeUri, {
         watermarkEnabled,
         watermarkImageUri: watermarkEnabled ? watermarkUri : null,
       });
-      const canvas = QUALITY_CANVAS[exportQuality] ?? cut.edl.canvas;
+      // 'high' (null) renders at the cut's canvas — which follows the
+      // takes, so 4K takes export at 4K; balanced/small are explicit
+      // downscales the user picked for sharing.
+      const canvas = QUALITY_CANVAS[exportQuality] ?? effectiveEdl.canvas;
       // The canvas override is applied HERE, on the single shared
       // request, so the preview the user approves is framed identically
       // to the file the exporter writes (see header note).
@@ -166,7 +171,7 @@ export default function ExportScreen() {
     } catch {
       return null;
     }
-  }, [cut, takeUri, exportQuality, watermarkEnabled, watermarkUri]);
+  }, [cut, takeUri, takes, exportQuality, watermarkEnabled, watermarkUri]);
 
   const requestKey = useMemo(() => (request ? JSON.stringify(request) : ''), [request]);
   const totalSeconds = cut ? edlDurationSeconds(cut.edl) : 0;

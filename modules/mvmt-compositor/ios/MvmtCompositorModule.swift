@@ -1732,12 +1732,43 @@ public final class MvmtPreviewView: ExpoView {
 // cannot stomp that. The internal song player simply plays within
 // whatever session the app has configured.
 
+/// Capture quality as chosen in Settings. The raw values are the JS
+/// contract shared with the module's `setCaptureQuality` ('1080p30' |
+/// '1080p60' | '4k60'). '1080p30' is the regression-safe default: the
+/// session preset steers the device format and nothing is forced —
+/// the exact configuration verified smooth on device. The 60fps
+/// qualities force an exact-dimension device format (see
+/// applyCaptureFormatLocked).
+private enum CaptureQuality: String {
+  case p1080at30 = "1080p30"
+  case p1080at60 = "1080p60"
+  case p4kAt60 = "4k60"
+
+  /// Exact sensor dimensions for the format-forcing qualities; nil
+  /// means preset-steered (no device format is pinned).
+  var exactDimensions: (width: Int32, height: Int32)? {
+    switch self {
+    case .p1080at30: return nil
+    case .p1080at60: return (width: 1920, height: 1080)
+    case .p4kAt60: return (width: 3840, height: 2160)
+    }
+  }
+
+  var framesPerSecond: Double {
+    switch self {
+    case .p1080at30: return 30
+    case .p1080at60, .p4kAt60: return 60
+    }
+  }
+}
+
 private struct CaptureConfiguration {
   var facing: AVCaptureDevice.Position = .back
   var torch: Bool = false
   /// Expo-style zoom 0..1 (mapped to a device factor when applied).
   var zoom: Double = 0
   var mirrored: Bool = false
+  var quality: CaptureQuality = .p1080at30
 }
 
 private final class CaptureCoordinator: NSObject,
@@ -1751,24 +1782,41 @@ private final class CaptureCoordinator: NSObject,
   let session = AVCaptureSession()
 
   /// Serial queue for ALL session configuration, sample-buffer
-  /// handling and writer appends (delegate callbacks land here too),
-  /// so no capture state needs locks.
+  /// handling and writer appends, so no capture state needs locks.
+  /// Sample-buffer delegate callbacks arrive on `sampleBufferQueue`
+  /// and are forwarded onto this queue in arrival order (see the
+  /// delegate methods) — the delegate never runs handler work itself.
   private let queue = DispatchQueue(label: "au.mvmtstudio.capture")
+
+  /// DEDICATED serial queue for the capture outputs' sample-buffer
+  /// delegate. Round 3's preview crawled at ~5fps while this shared
+  /// the control queue above: every control operation (session
+  /// reconfiguration, player seeks, measurements) ran BETWEEN buffer
+  /// callbacks on the session's delivery path, and with
+  /// `alwaysDiscardsLateVideoFrames = false` the backlogged output
+  /// back-pressured the whole session — preview included. The
+  /// delegate now does exactly one thing per buffer (an async hop
+  /// onto `queue`), so delivery can never be stalled by control work;
+  /// the shared serial delegate queue also preserves the video/audio
+  /// arrival order the handlers rely on.
+  private let sampleBufferQueue = DispatchQueue(label: "au.mvmtstudio.capture.samples")
 
   // MARK: Configuration (set via the preview view's props)
 
   private var configuration = CaptureConfiguration()
   private var outputsConfigured = false
   private var sessionConfigured = false
-  /// Pinned false, permanently: Round 3 forced a 60fps device format
-  /// (activeFormat under .inputPriority) and the preview crawled at
-  /// ~5fps on device, so format forcing was removed. The session
-  /// preset steers the format again — the configuration Jaizon
-  /// verified as perfect in the pre-Round-3 build — and the preset
-  /// steering in configureSessionLocked still reads this flag.
-  /// Nothing anywhere sets a device activeFormat, frame-duration
-  /// pins, or .inputPriority.
-  private let captureIsSixtyFps = false
+  /// The quality whose format selection was last applied to the
+  /// CURRENT device (nil = nothing applied yet). configureSessionLocked
+  /// re-runs selection when this differs from `configuration.quality`
+  /// or when the input was just swapped (a facing flip hands the
+  /// session a different device that needs its own selection).
+  private var appliedFormatQuality: CaptureQuality?
+  /// Frame rate the active configuration delivers (30 on the preset
+  /// path — and after any forced-format fallback — 60 when a 60fps
+  /// format is in force). Read by startWriterLocked to scale the
+  /// encoder bitrate to the real cadence.
+  private var activeFramesPerSecond: Double = 30
   private var configuredPosition: AVCaptureDevice.Position?
   private var videoDevice: AVCaptureDevice?
   private var videoInput: AVCaptureDeviceInput?
@@ -1895,6 +1943,31 @@ private final class CaptureCoordinator: NSObject,
     }
   }
 
+  /// Applies a Settings capture-quality change ('1080p30' |
+  /// '1080p60' | '4k60'). Unknown values resolve to the '1080p30'
+  /// default rather than failing: a JS/native version skew must
+  /// never break recording. Like a facing change, a quality change
+  /// never reconfigures mid-capture — it applies from the next one.
+  func setQuality(_ qualityRawValue: String) async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      queue.async { [weak self] in
+        guard let self else {
+          continuation.resume()
+          return
+        }
+        let quality = CaptureQuality(rawValue: qualityRawValue) ?? .p1080at30
+        if self.configuration.quality != quality {
+          self.configuration.quality = quality
+          if self.state != .recording, self.state != .preparing {
+            try? self.configureSessionLocked()
+            self.updateSessionRunningLocked()
+          }
+        }
+        continuation.resume()
+      }
+    }
+  }
+
   func setMirrored(_ mirrored: Bool) {
     queue.async { [weak self] in
       guard let self, self.configuration.mirrored != mirrored else { return }
@@ -1938,30 +2011,23 @@ private final class CaptureCoordinator: NSObject,
       videoOutput.videoSettings = [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
       ]
-      // Real-time recorder: process every frame the sensor delivers
-      // rather than silently discarding late ones (a dropped frame is
-      // a timing hole in the take).
-      videoOutput.alwaysDiscardsLateVideoFrames = false
-      videoOutput.setSampleBufferDelegate(self, queue: queue)
-      audioOutput.setSampleBufferDelegate(self, queue: queue)
+      // Late-frame discarding follows the capture state: TRUE while
+      // idle (preview frames nobody records must never backlog the
+      // session — a queued idle frame is pure back-pressure), FALSE
+      // while a capture is in flight (a dropped frame is a timing
+      // hole in the take). beginCaptureLocked flips it off;
+      // cleanupCaptureLocked restores it.
+      videoOutput.alwaysDiscardsLateVideoFrames = true
+      videoOutput.setSampleBufferDelegate(self, queue: sampleBufferQueue)
+      audioOutput.setSampleBufferDelegate(self, queue: sampleBufferQueue)
       outputsConfigured = true
     }
 
     session.beginConfiguration()
     // The app (expo-audio) owns the audio session category.
     session.automaticallyConfiguresApplicationAudioSession = false
-    // Format forcing was removed after Round 3's 5fps device
-    // result: the session preset steers the device format
-    // (.hd1920x1080, else .high) — the exact configuration Jaizon
-    // verified as perfect in the pre-Round-3 build.
-    if !captureIsSixtyFps {
-      if session.canSetSessionPreset(.hd1920x1080) {
-        session.sessionPreset = .hd1920x1080
-      } else if session.canSetSessionPreset(.high) {
-        session.sessionPreset = .high
-      }
-    }
 
+    var inputSwapped = false
     if configuredPosition != configuration.facing || videoInput == nil {
       if let oldInput = videoInput {
         session.removeInput(oldInput)
@@ -1980,6 +2046,7 @@ private final class CaptureCoordinator: NSObject,
             videoInput = input
             videoDevice = device
             configuredPosition = configuration.facing
+            inputSwapped = true
           } else {
             deviceError = compositorError("The capture session rejected the camera input.")
           }
@@ -1997,6 +2064,14 @@ private final class CaptureCoordinator: NSObject,
         session.commitConfiguration()
         throw deviceError
       }
+    }
+
+    // Format selection for the configured quality — runs inside this
+    // begin/commit block when the input was just (re)added (a new
+    // device needs its own selection) or when the applied selection
+    // is stale (the quality changed under the same device).
+    if inputSwapped || appliedFormatQuality != configuration.quality {
+      applyCaptureFormatLocked()
     }
 
     if audioInput == nil, let audioDevice = AVCaptureDevice.default(for: .audio) {
@@ -2017,6 +2092,120 @@ private final class CaptureCoordinator: NSObject,
 
     applyConnectionSettingsLocked()
     applyDeviceSettingsLocked()
+  }
+
+  /// The preset-steered configuration — '1080p30', and the silent
+  /// fallback for the forcing qualities when this device offers no
+  /// qualifying format. This is the exact configuration verified
+  /// smooth on device before any format forcing existed.
+  private func applyPresetSteeringLocked() {
+    if session.canSetSessionPreset(.hd1920x1080) {
+      session.sessionPreset = .hd1920x1080
+    } else if session.canSetSessionPreset(.high) {
+      session.sessionPreset = .high
+    }
+  }
+
+  /// Applies `configuration.quality` to the current device. Runs
+  /// inside configureSessionLocked's begin/commit block.
+  ///
+  /// History that shapes this code: Round 3 forced a 60fps format
+  /// and the preview crawled at ~5fps through two picker variants;
+  /// Round 4 removed forcing entirely. Forcing is back ONLY as an
+  /// explicit Settings choice (1080p60 / 4K60), and the pipeline
+  /// cause of the crawl is fixed separately (dedicated delegate
+  /// queue + idle frame discarding), so the format itself is no
+  /// longer dragging control-queue work onto the delivery path.
+  /// Every failure here degrades to the preset path — a quality
+  /// preference must never break recording.
+  private func applyCaptureFormatLocked() {
+    let quality = configuration.quality
+    appliedFormatQuality = quality
+    activeFramesPerSecond = 30
+    guard quality.exactDimensions != nil else {
+      // '1080p30': EXACTLY the pre-quality path — preset steering,
+      // no device format pinned, no .inputPriority.
+      applyPresetSteeringLocked()
+      return
+    }
+    guard let device = videoDevice,
+      let format = Self.bestCaptureFormat(for: device, quality: quality)
+    else {
+      // No qualifying format on this device: preset path, silently.
+      applyPresetSteeringLocked()
+      return
+    }
+    // ORDER IS LOAD-BEARING: .inputPriority FIRST. Assigning
+    // activeFormat on a device feeding a session that runs a
+    // dimensional preset throws NSInvalidArgumentException (the
+    // Round 3 launch crash) — the session must defer to the input
+    // before the device format is touched.
+    session.sessionPreset = .inputPriority
+    let frameDuration = CMTime(value: 1, timescale: 60)
+    var lockError: Error?
+    var deviceLocked = false
+    let exception = avTry {
+      do {
+        try device.lockForConfiguration()
+        deviceLocked = true
+        device.activeFormat = format
+        device.activeVideoMinFrameDuration = frameDuration
+        device.activeVideoMaxFrameDuration = frameDuration
+      } catch {
+        lockError = error
+      }
+    }
+    // Unlocked OUTSIDE the guard: if a setter raised mid-block, the
+    // device must not be left locked for every later configuration.
+    if deviceLocked {
+      device.unlockForConfiguration()
+    }
+    if exception != nil || lockError != nil {
+      // The device refused the format: back to the preset path
+      // rather than a half-forced session.
+      applyPresetSteeringLocked()
+      return
+    }
+    activeFramesPerSecond = quality.framesPerSecond
+  }
+
+  /// The device format for a format-forcing quality: EXACT
+  /// dimensions, a frame-rate range covering the target fps.
+  /// Candidates are RANKED, never first-matched (the Round 3 picker
+  /// grabbed a slow-motion/10-bit variant): lowest top frame rate
+  /// that covers the target first (the everyday format tops out at
+  /// the target; slo-mo readout modes top at 120/240), then the
+  /// exact pixel format the data output consumes (420f — zero
+  /// per-frame conversion), then 420v, then anything else.
+  private static func bestCaptureFormat(
+    for device: AVCaptureDevice,
+    quality: CaptureQuality
+  ) -> AVCaptureDevice.Format? {
+    guard let dimensions = quality.exactDimensions else { return nil }
+    let targetFps = quality.framesPerSecond
+    var best: AVCaptureDevice.Format?
+    var bestRank: (Int, Int)?
+    for format in device.formats {
+      let formatDimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+      guard formatDimensions.width == dimensions.width,
+        formatDimensions.height == dimensions.height
+      else { continue }
+      // The tightest range that still covers the target fps.
+      let covering = format.videoSupportedFrameRateRanges
+        .filter { $0.minFrameRate <= targetFps && $0.maxFrameRate >= targetFps - 0.1 }
+        .min { $0.maxFrameRate < $1.maxFrameRate }
+      guard let range = covering else { continue }
+      let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+      let subtypeRank =
+        subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ? 0
+        : subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 1 : 2
+      let rank = (Int(range.maxFrameRate.rounded()), subtypeRank)
+      if let current = bestRank, rank >= current { continue }
+      best = format
+      bestRank = rank
+    }
+    return best
   }
 
   /// Portrait rotation + mirroring on the writer (data output)
@@ -2183,6 +2372,9 @@ private final class CaptureCoordinator: NSObject,
       videoDevice = nil
       configuredPosition = nil
       outputsConfigured = false
+      // The rebuilt input is a fresh device object: format selection
+      // for the configured quality must run again on it.
+      appliedFormatQuality = nil
     }
     recoverSessionLocked()
   }
@@ -2398,6 +2590,10 @@ private final class CaptureCoordinator: NSObject,
     }
 
     state = .preparing
+    // From here to cleanupCaptureLocked every delivered frame is a
+    // potential timing hole in the take: stop discarding late frames
+    // for the duration of the capture.
+    videoOutput.alwaysDiscardsLateVideoFrames = false
     startContinuation = continuation
     if !session.isRunning {
       session.startRunning()
@@ -2694,12 +2890,21 @@ private final class CaptureCoordinator: NSObject,
       return false
     }
     let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+    // Bitrate follows pixel throughput at the active frame rate:
+    // ≈0.16 bits per pixel at 1080p (≈10 Mbps at 30fps — the proven
+    // figure — and ≈20 Mbps at 60fps), easing to ≈0.09 above four
+    // megapixels, where frames compress more efficiently per pixel
+    // (≈45 Mbps at 4K60). Derived from THIS buffer's dimensions and
+    // the configured cadence, never hardcoded per quality.
+    let pixelCount = Double(dimensions.width) * Double(dimensions.height)
+    let bitsPerPixel = pixelCount > 4_000_000 ? 0.09 : 0.16
+    let averageBitRate = Int(pixelCount * activeFramesPerSecond * bitsPerPixel)
     var videoSettings: [String: Any] = [
       AVVideoCodecKey: AVVideoCodecType.h264,
       AVVideoWidthKey: Int(dimensions.width),
       AVVideoHeightKey: Int(dimensions.height),
       AVVideoCompressionPropertiesKey: [
-        AVVideoAverageBitRateKey: 10_000_000,
+        AVVideoAverageBitRateKey: averageBitRate,
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
       ],
     ]
@@ -2842,17 +3047,26 @@ private final class CaptureCoordinator: NSObject,
     input.append(sampleBuffer)
   }
 
-  // MARK: Sample buffer delegates (callbacks arrive on `queue`)
+  // MARK: Sample buffer delegates (callbacks arrive on `sampleBufferQueue`)
 
   func captureOutput(
     _ output: AVCaptureOutput,
     didOutput sampleBuffer: CMSampleBuffer,
     from connection: AVCaptureConnection
   ) {
-    if output === videoOutput {
-      handleVideoBuffer(sampleBuffer)
-    } else if output === audioOutput {
-      handleAudioBuffer(sampleBuffer)
+    // The ONLY work done on the delegate queue is this hop: buffer
+    // handling runs on the control queue exactly as it always has
+    // (the handlers read/write coordinator state directly), just no
+    // longer ON the session's delivery path. Both outputs share the
+    // one serial delegate queue and hop onto the one serial control
+    // queue, so buffers are handled in arrival order.
+    queue.async { [weak self] in
+      guard let self else { return }
+      if output === self.videoOutput {
+        self.handleVideoBuffer(sampleBuffer)
+      } else if output === self.audioOutput {
+        self.handleAudioBuffer(sampleBuffer)
+      }
     }
   }
 
@@ -2976,6 +3190,10 @@ private final class CaptureCoordinator: NSObject,
   }
 
   private func cleanupCaptureLocked() {
+    // The capture is over (finish and abort both funnel here): idle
+    // frames may be discarded late again, so the preview can never
+    // backlog the session between takes.
+    videoOutput.alwaysDiscardsLateVideoFrames = true
     // Song player teardown, with the pre-warm rules (this is the
     // ONLY place the active player is released — finish and abort
     // both funnel through here):
@@ -3198,6 +3416,10 @@ public class MvmtCompositorModule: Module {
 
     AsyncFunction("prepareSong") { (songUri: String?) in
       await CaptureCoordinator.shared.prepareSong(songUri: songUri)
+    }
+
+    AsyncFunction("setCaptureQuality") { (quality: String) in
+      await CaptureCoordinator.shared.setQuality(quality)
     }
 
     AsyncFunction("createPreview") { (request: CompositeRequestRecord) -> String in

@@ -7,7 +7,7 @@ import { SegmentedControl } from '../../components/SegmentedControl';
 import { GroupCard } from '../../components/ui/GroupCard';
 import { SectionHeader } from '../../components/ui/SectionHeader';
 import { isCompositorAvailable } from '../../lib/compositor';
-import { useStudio } from '../../store/StudioContext';
+import { useStudio, type CaptureQuality } from '../../store/StudioContext';
 import { colors, radius, spacing, type as typeScale } from '../../theme';
 import type { CountInBeats, CountdownSeconds, ExportQualityPref, FrameRatePref } from '../../types';
 
@@ -55,6 +55,20 @@ export default function SettingsScreen() {
             value={studio.frameRate}
             onChange={studio.setFrameRate}
             accessibilityLabel="Preferred frame rate"
+          />
+        </ControlBlock>
+        <ControlBlock
+          label="Capture quality"
+          hint="The native recorder's format. 60 fps and 4K takes are smoother and sharper but use much more storage.">
+          <SegmentedControl
+            options={[
+              { value: '1080p30' as CaptureQuality, label: '1080p · 30fps' },
+              { value: '1080p60' as CaptureQuality, label: '1080p · 60fps' },
+              { value: '4k60' as CaptureQuality, label: '4K · 60fps' },
+            ]}
+            value={studio.captureQuality}
+            onChange={studio.setCaptureQuality}
+            accessibilityLabel="Native capture quality"
           />
         </ControlBlock>
         <ToggleRow label="Mirror front camera" value={studio.mirror} onChange={studio.setMirror} />

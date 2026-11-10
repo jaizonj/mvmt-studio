@@ -29,6 +29,7 @@ import {
   isCompositorAvailable,
   measureTakeSync,
   prepareSong,
+  setCaptureQuality,
   startCapture,
   stopCapture,
   type CompositeRequest,
@@ -194,6 +195,7 @@ export default function CameraScreen() {
     gridOverlay,
     levelGuide,
     audioOffsetMs,
+    captureQuality,
     countInBeats,
     setCountInBeats,
     metronome,
@@ -310,6 +312,14 @@ export default function CameraScreen() {
     if (!isFocused || !useNativeCapture) return;
     void prepareSong(track?.uri ?? null);
   }, [isFocused, track?.uri, useNativeCapture]);
+
+  // Capture quality (Settings): keep the module's session
+  // configuration in step with the preference. Best-effort like
+  // prepareSong — a no-op in Expo Go / on the expo-camera path.
+  useEffect(() => {
+    if (!isFocused || !useNativeCapture) return;
+    void setCaptureQuality(captureQuality);
+  }, [isFocused, captureQuality, useNativeCapture]);
 
 
   // Track playback — the sync master clock for takes.
@@ -626,6 +636,9 @@ export default function CameraScreen() {
       nativeFirstFrameSongPositionSeconds: number | null;
       /** stopCapture's file-measured duration — null on the expo path (measured via probe instead). */
       nativeMeasuredDurationSeconds: number | null;
+      /** stopCapture's file-measured frame size — null on the expo path. */
+      nativeWidth: number | null;
+      nativeHeight: number | null;
     }) => {
       const { session } = args;
       const mine = recordSessionRef.current === session;
@@ -731,6 +744,9 @@ export default function CameraScreen() {
         // estimate, until the file-based refinement replaces it with
         // 'fileCorrelation'), or absent when nothing was measurable.
         ...(syncSource !== undefined ? { syncSource } : {}),
+        ...(args.nativeWidth !== null && args.nativeHeight !== null
+          ? { width: args.nativeWidth, height: args.nativeHeight }
+          : {}),
       });
       // FILE-BASED SYNC REFINEMENT — fire-and-forget (see
       // refineTakeSyncFromFile): re-measure this take's capture
@@ -797,6 +813,8 @@ export default function CameraScreen() {
           songEndSeconds: null,
           nativeFirstFrameSongPositionSeconds: result.firstFrameSongPositionSeconds,
           nativeMeasuredDurationSeconds: result.durationSeconds > 0 ? result.durationSeconds : null,
+          nativeWidth: result.width > 0 ? result.width : null,
+          nativeHeight: result.height > 0 ? result.height : null,
         });
       })();
     },
@@ -979,6 +997,8 @@ export default function CameraScreen() {
           songEndSeconds,
           nativeFirstFrameSongPositionSeconds: null,
           nativeMeasuredDurationSeconds: null,
+          nativeWidth: null,
+          nativeHeight: null,
         });
       })
       .catch(() => {
@@ -1024,7 +1044,21 @@ export default function CameraScreen() {
       return;
     }
     timerWasUsedRef.current = true;
-    void setAudioModeAsync({ playsInSilentMode: true, allowsRecording: false });
+    // Keep the session in RECORD mode for the whole countdown — do
+    // NOT flip allowsRecording off here (Jaizon, 2026-11-09: with the
+    // countdown on, every OTHER take recorded with the song audio
+    // wrong). This call is the ONLY session-mode change that differs
+    // between a countdown take and a plain/count-in take: it moved
+    // the shared AVAudioSession to the .playback category, tearing
+    // down the mic route under the compositor's LIVE capture session
+    // (interruption / runtime-error → the module rebuilds its inputs,
+    // flipping its configured state per flip), and beginRecording
+    // then flipped straight back and raced startCapture against that
+    // rebuild — alternate takes lost the race. The beeps never needed
+    // the flip: count-in clicks and the 'go' cue already play under
+    // .playAndRecord. Same mode beginRecording applies, so the
+    // category never changes and nothing is torn down.
+    void setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
     let remaining = countdown;
     setCountingDown(remaining);
     playCue('beep');

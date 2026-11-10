@@ -20,6 +20,10 @@ export interface Take {
   facing: CameraType;
   /** Recorded length in seconds, measured by the camera screen timer. */
   durationSeconds?: number;
+  /** Measured display size of the recorded file (native path) — the
+   * EDL canvas follows the largest take so 4K takes export at 4K. */
+  width?: number;
+  height?: number;
   /** Size of the recorded file in bytes (used by the v1 energy heuristic). */
   fileSizeBytes?: number;
   /**
