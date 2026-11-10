@@ -2212,9 +2212,9 @@ private final class CaptureCoordinator: NSObject,
       // Already standing for this song — just keep it warm. (Unless
       // it is mid-take right now: a rate-0 preroll must never touch
       // the playing player.)
-      if standing !== songPlayer {
-        standing.preroll(atRate: 0, completionHandler: nil)
-      }
+      // Deliberately NO preroll here (see the note at the player
+      // creation below): the standing item keeps loading on its own.
+      _ = standing
       return
     }
     // Replace the standing player. Same mid-take caveat as the
@@ -2228,10 +2228,18 @@ private final class CaptureCoordinator: NSObject,
     warmedItem = item
     warmedPlayer = player
     warmedURL = url
-    // Load + preroll PAUSED at rate 0: the item becomes
-    // ready-to-play without ever starting playback, and the audio
-    // session category is never touched (the app owns it).
-    player.preroll(atRate: 0, completionHandler: nil)
+    // The item is created standing and PAUSED: AVFoundation loads
+    // its asset asynchronously as soon as it is attached to a
+    // player, which is most of the warm-up — playback never starts
+    // and the audio session category is never touched (the app owns
+    // it). Deliberately NO preroll(atRate:) anywhere in this module:
+    // on Jaizon's device it threw an uncaught NSException from
+    // inside AVPlayer (cancelPendingPrerolls) at app open and
+    // aborted the process — crash log MVMTStudio-2026-11-09-183251.
+    // The residual spin-up at take start is already neutralised:
+    // the sync anchor is measured late and the length clock starts
+    // at the first frame.
+    _ = player
   }
 
   func start(_ args: CaptureStartArgsRecord) async throws {
