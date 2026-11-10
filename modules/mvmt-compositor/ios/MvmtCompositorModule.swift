@@ -1829,24 +1829,36 @@ private final class CaptureCoordinator: NSObject,
   /// whose ranges cover 60. Nil when the device cannot do 60 at all —
   /// the caller then leaves the session-preset behaviour untouched.
   private static func bestSixtyFpsFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
-    func coversSixty(_ format: AVCaptureDevice.Format) -> Bool {
-      format.videoSupportedFrameRateRanges.contains { range in
-        range.minFrameRate <= 60 && range.maxFrameRate >= 59.9
-      }
-    }
+    // The device offers SEVERAL 1920x1080 formats that "cover 60":
+    // the everyday one, slow-motion readout modes (topping out at
+    // 120/240), and 10-bit HDR variants. The first build picked the
+    // first match and the preview crawled at ~5fps on device — the
+    // wrong format makes the pipeline convert/process every frame.
+    // Rank candidates instead: prefer the LOWEST top frame rate
+    // that still covers 60 (the everyday 60 format tops out at 60;
+    // slo-mo modes top higher), then prefer the exact pixel format
+    // the data output consumes (8-bit full-range biplanar — zero
+    // per-frame conversion), then video-range, then anything else.
     var best: AVCaptureDevice.Format?
-    var bestArea: Int64 = -1
-    for format in device.formats where coversSixty(format) {
+    var bestRank: (Int, Int)?
+    for format in device.formats {
       let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-      guard dims.width > 0, dims.height > 0 else { continue }
-      if dims.width == 1920, dims.height == 1080 {
-        return format
-      }
-      let area = Int64(dims.width) * Int64(dims.height)
-      if dims.width <= 1920, dims.height <= 1080, area > bestArea {
-        best = format
-        bestArea = area
-      }
+      guard dims.width == 1920, dims.height == 1080 else { continue }
+      // A normal cadence range: reaches 60 but also goes low
+      // (low-light headroom) — take the tightest top end offered.
+      let covering = format.videoSupportedFrameRateRanges
+        .filter { $0.minFrameRate <= 30 && $0.maxFrameRate >= 59.9 }
+        .min { $0.maxFrameRate < $1.maxFrameRate }
+      guard let range = covering else { continue }
+      let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+      let subtypeRank =
+        subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ? 0
+        : subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 1 : 2
+      let rank = (Int(range.maxFrameRate.rounded()), subtypeRank)
+      if let current = bestRank, rank >= current { continue }
+      best = format
+      bestRank = rank
     }
     return best
   }
