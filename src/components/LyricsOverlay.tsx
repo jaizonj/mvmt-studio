@@ -54,9 +54,15 @@ interface UnitStyle {
   transform: ViewStyle['transform'];
 }
 
-/** Text with an optional outline: four offset copies behind the main
- *  glyph run (React Native Text has no stroke; the native renderer
- *  draws the real outline — this is its preview stand-in). */
+/** Text with an optional outline: eight offset copies behind the
+ *  main glyph run — the four cardinal directions plus the diagonals
+ *  at 0.71× (so wide strokes stay a continuous outline instead of
+ *  four separated shadows). React Native Text has no stroke; the
+ *  native renderer draws the real outline — this is its preview
+ *  stand-in. The copy distance IS the stroke width in points
+ *  (strokeWidthRatio × fontSize), so the width slider's range reads
+ *  directly: at the default font size on a phone-width stage the
+ *  ratio range 0.03–0.30 is roughly 1pt–9pt of outline. */
 function OutlinedText({
   text,
   textStyle,
@@ -70,6 +76,7 @@ function OutlinedText({
   strokeWidth: number;
   unitStyle?: UnitStyle;
 }) {
+  const diag = strokeWidth * 0.71;
   const copies =
     strokeColor && strokeWidth > 0
       ? [
@@ -77,6 +84,10 @@ function OutlinedText({
           { transform: [{ translateX: strokeWidth }, { translateY: 0 }] },
           { transform: [{ translateX: 0 }, { translateY: -strokeWidth }] },
           { transform: [{ translateX: 0 }, { translateY: strokeWidth }] },
+          { transform: [{ translateX: -diag }, { translateY: -diag }] },
+          { transform: [{ translateX: diag }, { translateY: -diag }] },
+          { transform: [{ translateX: -diag }, { translateY: diag }] },
+          { transform: [{ translateX: diag }, { translateY: diag }] },
         ]
       : [];
   return (

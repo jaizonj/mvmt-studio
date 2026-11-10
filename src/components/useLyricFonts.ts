@@ -24,6 +24,20 @@ const BUNDLED_FONT_SOURCES: Record<string, number> = {
   'Pacifico-Regular': require('../../assets/fonts/Pacifico-Regular.ttf'),
   'DancingScript-Bold': require('../../assets/fonts/DancingScript-Bold.ttf'),
   'PermanentMarker-Regular': require('../../assets/fonts/PermanentMarker-Regular.ttf'),
+  'AlfaSlabOne-Regular': require('../../assets/fonts/AlfaSlabOne-Regular.ttf'),
+  'Righteous-Regular': require('../../assets/fonts/Righteous-Regular.ttf'),
+  'Bungee-Regular': require('../../assets/fonts/Bungee-Regular.ttf'),
+  'Fredoka-SemiBold': require('../../assets/fonts/Fredoka-SemiBold.ttf'),
+  'AbrilFatface-Regular': require('../../assets/fonts/AbrilFatface-Regular.ttf'),
+  'PlayfairDisplay-Bold': require('../../assets/fonts/PlayfairDisplay-Bold.ttf'),
+  'DMSerifDisplay-Regular': require('../../assets/fonts/DMSerifDisplay-Regular.ttf'),
+  'Cinzel-Bold': require('../../assets/fonts/Cinzel-Bold.ttf'),
+  'Audiowide-Regular': require('../../assets/fonts/Audiowide-Regular.ttf'),
+  'Orbitron-Bold': require('../../assets/fonts/Orbitron-Bold.ttf'),
+  'Caveat-Bold': require('../../assets/fonts/Caveat-Bold.ttf'),
+  ShadowsIntoLight: require('../../assets/fonts/ShadowsIntoLight.ttf'),
+  'PressStart2P-Regular': require('../../assets/fonts/PressStart2P-Regular.ttf'),
+  'RubikMonoOne-Regular': require('../../assets/fonts/RubikMonoOne-Regular.ttf'),
 };
 
 export function useLyricFonts(): boolean {

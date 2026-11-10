@@ -1,5 +1,5 @@
 /**
- * Lyric animation presets — 30 CapCut-spirit styles over ONE
+ * Lyric animation presets — 50 CapCut-spirit styles over ONE
  * parametric model, so the JS preview overlay and the native export
  * renderer (CATextLayer) implement every preset from the same numbers
  * and preview == export (the lyrics feature's hard constraint).
@@ -126,6 +126,51 @@ export const LYRIC_ANIMATIONS: LyricAnimation[] = [
   preset('soft-rise', 'Soft Rise', { enterSecs: 0.7, exitSecs: 0.5, fromOpacity: 0, fromYOffsetFrac: 0.35 }),
   preset('impact', 'Impact', { enterSecs: 0.16, exitSecs: 0.2, fromOpacity: 0, fromScale: 2.4, emphasisScale: 1.02 }),
   preset('float', 'Float', { enterSecs: 0.9, exitSecs: 0.6, fromOpacity: 0, fromYOffsetFrac: 0.5, emphasisScale: 1.02 }),
+
+  // ---- Expansion set (50-preset pass) — same parametric model, new
+  // motion characters: faster/slower timings, opposite directions,
+  // scale direction flips, and word-mode interplay. ----
+  // Rise's snappy sibling: half the travel, under half the time.
+  preset('rise-fast', 'Rise Fast', { enterSecs: 0.18, exitSecs: 0.15, fromOpacity: 0, fromYOffsetFrac: 0.6 }),
+  // Drop, but slamming: more travel than Drop, slight oversize, pulse.
+  preset('drop-heavy', 'Drop Heavy', { enterSecs: 0.22, fromOpacity: 0, fromYOffsetFrac: -1.4, fromScale: 1.15, emphasisScale: 1.06 }),
+  // Half-width drifts (Slide In travels a full line width; these glide).
+  preset('slide-fade-left', 'Slide Fade Left', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: -0.5 }),
+  preset('slide-fade-right', 'Slide Fade Right', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: 0.5 }),
+  // Words rain in from above, quick stagger (Word Rise's mirror).
+  preset('word-drop', 'Word Drop', { wordMode: 'stagger', enterSecs: 0.28, fromOpacity: 0, fromYOffsetFrac: -0.9, wordStaggerSecs: 0.07 }),
+  // Each word rotates 90° into place while scaling up.
+  preset('word-spin', 'Word Spin', { wordMode: 'stagger', enterSecs: 0.35, fromOpacity: 0, fromScale: 0.5, fromRotateDeg: 90, wordStaggerSecs: 0.08 }),
+  // Karaoke with a bigger current-word pop than Karaoke (1.18 → 1.3).
+  preset('karaoke-pop', 'Karaoke Pop', { wordMode: 'karaoke', enterSecs: 0.15, fromOpacity: 0, emphasisScale: 1.3 }),
+  // Typewriter with a fast cut out (0.12s exit vs 0.25s).
+  preset('typewriter-fast', 'Typewriter Fast', { wordMode: 'typewriter', enterSecs: 0, exitSecs: 0.12, fromOpacity: 0 }),
+  // The slow cinematic zoom: starts 3.2× and settles over 0.7s
+  // (Zoom is 1.6×/0.5s; Impact is 2.4× but slams in 0.16s).
+  preset('zoom-far', 'Zoom Far', { enterSecs: 0.7, exitSecs: 0.4, fromOpacity: 0, fromScale: 3.2 }),
+  // Exit-led: pops in quick, then shrinks + fades away over 0.55s
+  // (the exit replays the from-state, so it ends small and ghosted).
+  preset('shrink-out', 'Shrink Out', { enterSecs: 0.2, exitSecs: 0.55, fromOpacity: 0, fromScale: 0.85 }),
+  // Pendulum swings from each side (Swing hangs from centre-top).
+  preset('swing-left', 'Swing Left', { enterSecs: 0.6, fromOpacity: 0, fromXOffsetFrac: -0.4, fromYOffsetFrac: -0.3, fromRotateDeg: 18 }),
+  preset('swing-right', 'Swing Right', { enterSecs: 0.6, fromOpacity: 0, fromXOffsetFrac: 0.4, fromYOffsetFrac: -0.3, fromRotateDeg: -18 }),
+  // Cascade's downward mirror: words fall in sequence from above.
+  preset('cascade-down', 'Cascade Down', { wordMode: 'stagger', enterSecs: 0.32, fromOpacity: 0, fromYOffsetFrac: -0.8, wordStaggerSecs: 0.12 }),
+  // Impact at half strength: 1.5× settle over 0.35s instead of a slam.
+  preset('impact-soft', 'Impact Soft', { enterSecs: 0.35, exitSecs: 0.25, fromOpacity: 0, fromScale: 1.5, emphasisScale: 1.03 }),
+  // Float Up: a full line-height of upward travel, quicker than Float,
+  // with a stronger breathing pulse.
+  preset('float-up', 'Float Up', { enterSecs: 0.55, exitSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 1.1, emphasisScale: 1.05 }),
+  // Roll In's mirror: rolls in from the right, opposite rotation.
+  preset('roll-down', 'Roll Down', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: 1, fromRotateDeg: 24 }),
+  // Fade stretched to a slow cinematic crossfade (1.1s in, 0.9s out).
+  preset('fade-slow', 'Fade Slow', { enterSecs: 1.1, exitSecs: 0.9, fromOpacity: 0 }),
+  // Words shrink down from 1.8× one by one (Word Pop grows from 0.4×).
+  preset('word-zoom', 'Word Zoom', { wordMode: 'stagger', enterSecs: 0.3, fromOpacity: 0, fromScale: 1.8, wordStaggerSecs: 0.08 }),
+  // Karaoke, but the whole line also rises in as the words light up.
+  preset('karaoke-rise', 'Karaoke Rise', { wordMode: 'karaoke', enterSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 0.6, emphasisScale: 1.12 }),
+  // A subtle skewed settle: slight rotation + near-full scale, no travel.
+  preset('tilt-in', 'Tilt In', { enterSecs: 0.45, fromOpacity: 0, fromScale: 0.9, fromRotateDeg: -8 }),
 ];
 
 export const DEFAULT_ANIMATION_ID = 'karaoke';

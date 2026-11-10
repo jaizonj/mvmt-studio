@@ -1,5 +1,5 @@
 /**
- * Lyric font catalog — 36 faces for the lyrics renderer. This module
+ * Lyric font catalog — 50 faces for the lyrics renderer. This module
  * is PURE DATA + lookups (the node unit tests load it transitively);
  * the useFonts loader hook lives in src/components/useLyricFonts.ts.
  *
@@ -77,6 +77,22 @@ export const LYRIC_FONTS: LyricFont[] = [
   { id: 'pacifico', displayName: 'Pacifico', family: 'Pacifico-Regular', postScriptName: 'Pacifico-Regular', kind: 'bundled' },
   { id: 'dancing-script', displayName: 'Dancing Script', family: 'DancingScript-Bold', postScriptName: 'DancingScript-Bold', kind: 'bundled' },
   { id: 'permanent-marker', displayName: 'Permanent Marker', family: 'PermanentMarker-Regular', postScriptName: 'PermanentMarker-Regular', kind: 'bundled' },
+  { id: 'alfa-slab-one', displayName: 'Alfa Slab One', family: 'AlfaSlabOne-Regular', postScriptName: 'AlfaSlabOne-Regular', kind: 'bundled' },
+  { id: 'righteous', displayName: 'Righteous', family: 'Righteous-Regular', postScriptName: 'Righteous-Regular', kind: 'bundled' },
+  { id: 'bungee', displayName: 'Bungee', family: 'Bungee-Regular', postScriptName: 'Bungee-Regular', kind: 'bundled' },
+  { id: 'fredoka-semibold', displayName: 'Fredoka', family: 'Fredoka-SemiBold', postScriptName: 'Fredoka-SemiBold', kind: 'bundled' },
+  { id: 'abril-fatface', displayName: 'Abril Fatface', family: 'AbrilFatface-Regular', postScriptName: 'AbrilFatface-Regular', kind: 'bundled' },
+  { id: 'playfair-display', displayName: 'Playfair Display', family: 'PlayfairDisplay-Bold', postScriptName: 'PlayfairDisplay-Bold', kind: 'bundled' },
+  { id: 'dm-serif-display', displayName: 'DM Serif Display', family: 'DMSerifDisplay-Regular', postScriptName: 'DMSerifDisplay-Regular', kind: 'bundled' },
+  { id: 'cinzel', displayName: 'Cinzel', family: 'Cinzel-Bold', postScriptName: 'Cinzel-Bold', kind: 'bundled' },
+  { id: 'audiowide', displayName: 'Audiowide', family: 'Audiowide-Regular', postScriptName: 'Audiowide-Regular', kind: 'bundled' },
+  { id: 'orbitron', displayName: 'Orbitron', family: 'Orbitron-Bold', postScriptName: 'Orbitron-Bold', kind: 'bundled' },
+  { id: 'caveat', displayName: 'Caveat', family: 'Caveat-Bold', postScriptName: 'Caveat-Bold', kind: 'bundled' },
+  // Shadows Into Light's PostScript name genuinely has no weight
+  // suffix in the shipped TTF (read from its name table, like all).
+  { id: 'shadows-into-light', displayName: 'Shadows Into Light', family: 'ShadowsIntoLight', postScriptName: 'ShadowsIntoLight', kind: 'bundled' },
+  { id: 'press-start-2p', displayName: 'Press Start 2P', family: 'PressStart2P-Regular', postScriptName: 'PressStart2P-Regular', kind: 'bundled' },
+  { id: 'rubik-mono-one', displayName: 'Rubik Mono One', family: 'RubikMonoOne-Regular', postScriptName: 'RubikMonoOne-Regular', kind: 'bundled' },
 ];
 
 export const DEFAULT_FONT_ID = 'avenir-next';

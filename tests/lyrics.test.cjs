@@ -61,7 +61,12 @@ test('grouping: a pause over 0.7s breaks, a shorter one does not', () => {
   assert.equal(kept[0].text, 'one two');
 });
 
-test('grouping: a line holds at most MAX_WORDS_PER_LINE words', () => {
+test('grouping: an over-cap word run splits into balanced lines under the cap', () => {
+  // ADJUSTED with the 50-style expansion: the grouper no longer fills
+  // the first line to MAX_WORDS_PER_LINE and dumps the rest — an
+  // over-cap run with no usable pause splits at its midpoint word,
+  // so 10 evenly sung words become two balanced 5-word lines, each
+  // still under the cap. (Previously: 7 + 3.)
   const tuples = Array.from({ length: MAX_WORDS_PER_LINE + 3 }, (_, i) => [
     `w${i}`,
     i * 0.3,
@@ -69,8 +74,180 @@ test('grouping: a line holds at most MAX_WORDS_PER_LINE words', () => {
   ]);
   const lines = groupWhisperSegments([seg(tuples)], FPS);
   assert.equal(lines.length, 2);
-  assert.equal(lines[0].words.length, MAX_WORDS_PER_LINE);
-  assert.equal(lines[1].words.length, 3);
+  assert.equal(lines[0].words.length, 5);
+  assert.equal(lines[1].words.length, 5);
+  for (const line of lines) assert.ok(line.words.length <= MAX_WORDS_PER_LINE);
+});
+
+test('grouping: an adaptive pause breaks once the line reaches the soft word target', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['a', 0, 0.25],
+        ['b', 0.3, 0.55],
+        ['c', 0.6, 0.85],
+        ['d', 0.9, 1.15],
+        ['e', 1.2, 1.45],
+        ['f', 1.85, 2.1], // 0.4s gap, line already holds 5 words
+        ['g', 2.15, 2.4],
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].text, 'a b c d e');
+  assert.equal(lines[1].text, 'f g');
+});
+
+test('grouping: an adaptive pause breaks on the soft duration target too', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['a', 0, 0.8],
+        ['b', 0.85, 1.65],
+        ['c', 1.7, 2.5], // line is 2.5s long with only 3 words
+        ['d', 2.9, 3.7], // 0.4s gap -> break
+        ['e', 3.75, 4.4],
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].text, 'a b c');
+  assert.equal(lines[1].text, 'd e');
+});
+
+test('grouping: a 0.4s pause does NOT break a line still under the soft target', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['a', 0, 0.3],
+        ['b', 0.35, 0.65],
+        ['c', 1.05, 1.35], // 0.4s gap, but the line is short and young
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].text, 'a b c');
+});
+
+test('grouping: a sentence-ending word closes the line (with at least 2 words in it)', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['we', 0, 0.3],
+        ['go', 0.35, 0.65],
+        ['home.', 0.7, 1.1],
+        ['now', 1.15, 1.45],
+        ['we', 1.5, 1.8],
+        ['dance', 1.85, 2.2],
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].text, 'we go home.');
+  assert.equal(lines[1].text, 'now we dance');
+
+  const kept = groupWhisperSegments(
+    [
+      seg([
+        ['Go.', 0, 0.35], // a one-word line does not break after itself
+        ['now', 0.4, 0.7],
+        ['we', 0.75, 1.05],
+        ['dance', 1.1, 1.45],
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].text, 'Go. now we dance');
+});
+
+test('grouping: an over-duration chunk splits at its largest internal pause', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['a', 0, 0.9],
+        ['b', 1.12, 2.02],
+        ['c', 2.24, 3.14],
+        ['d', 3.44, 4.34], // 0.3s gap — the largest in a 6.58s chunk
+        ['e', 4.56, 5.46],
+        ['f', 5.68, 6.58],
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].text, 'a b c');
+  assert.equal(lines[1].text, 'd e f');
+});
+
+test('grouping: the duration cap splits even two long held words', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['a', 0, 2.0],
+        ['b', 2.1, 4.2], // together 4.2s > 3.5s cap; the rescue must not re-merge them
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].text, 'a');
+  assert.equal(lines[1].text, 'b');
+});
+
+test('grouping: the character cap splits recursively until lines fit', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['aaaaaaaaaaaaaaaaaaaa', 0, 0.3], // 20 chars each, 62 joined
+        ['bbbbbbbbbbbbbbbbbbbb', 0.35, 0.65],
+        ['cccccccccccccccccccc', 0.7, 1.0],
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 3);
+  for (const line of lines) assert.ok(line.text.length <= 36);
+});
+
+test('grouping: a stranded single word is rescued into its neighbour', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['a', 0, 0.25],
+        ['b', 0.3, 0.55],
+        ['c', 0.6, 0.85],
+        ['d', 0.9, 1.15],
+        ['e', 1.2, 1.45],
+        ['f', 1.85, 2.1], // adaptive break strands it; the rescue re-homes it
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].text, 'a b c d e f');
+});
+
+test('grouping: a word stranded across a long pause stays its own line', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['a', 0, 0.25],
+        ['b', 0.3, 0.55],
+        ['c', 0.6, 0.85],
+        ['d', 0.9, 1.15],
+        ['e', 1.2, 1.45],
+        ['f', 2.35, 2.6], // 0.9s gap — too far to rescue
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1].text, 'f');
 });
 
 test('grouping: seconds become rounded frames and every span is >= 1 frame', () => {

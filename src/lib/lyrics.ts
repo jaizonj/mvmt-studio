@@ -25,9 +25,26 @@ import type { WhisperSegment } from './whisper';
  * of the song is composition frame 0).
  */
 
-/** Grouping rules (Whisper output → singable lines). */
+/** Grouping rules (Whisper output → singable lines). The grouper
+ *  "decides which lyrics are a line": natural breaks first (segment
+ *  boundaries, pauses, sentence ends), then hard caps split whatever
+ *  is still too long, then a rescue pass re-homes stranded words. */
 export const MAX_WORDS_PER_LINE = 7;
+/** A pause longer than this always breaks the line. */
 export const PAUSE_BREAK_SECONDS = 0.7;
+/** A shorter pause already breaks once the line is at/over the soft
+ *  target (this many words OR this duration) — lines should feel
+ *  singable, not maximal. */
+export const ADAPTIVE_PAUSE_SECONDS = 0.35;
+export const SOFT_TARGET_WORDS = 5;
+export const SOFT_TARGET_SECONDS = 2.2;
+/** Hard caps: a line never exceeds these (a single word always may —
+ *  it cannot be split). */
+export const MAX_LINE_SECONDS = 3.5;
+export const MAX_LINE_CHARS = 36;
+/** When a cap forces a split, an internal pause at least this long
+ *  counts as a split point (the largest one wins). */
+export const SPLIT_PAUSE_SECONDS = 0.2;
 
 let lyricIdCounter = 0;
 export function newLyricLineId(): string {
@@ -52,41 +69,156 @@ export function sortLyricLines(lines: LyricLine[]): LyricLine[] {
   return [...lines].sort((a, b) => a.startFrame - b.startFrame || a.endFrame - b.endFrame);
 }
 
+interface TimedWord {
+  text: string;
+  startSeconds: number;
+  endSeconds: number;
+}
+
+const SENTENCE_END = /[.!?]+["'”’)]?$/;
+
+function lineText(words: TimedWord[]): string {
+  return words.map((w) => w.text).join(' ');
+}
+
+function lineDurationSeconds(words: TimedWord[]): number {
+  return words.length === 0 ? 0 : words[words.length - 1].endSeconds - words[0].startSeconds;
+}
+
+/** Hard caps (words / duration / characters). A single word always
+ *  "fits" — it cannot be split further. */
+function lineFitsCaps(words: TimedWord[]): boolean {
+  if (words.length <= 1) return true;
+  return (
+    words.length <= MAX_WORDS_PER_LINE &&
+    lineDurationSeconds(words) <= MAX_LINE_SECONDS &&
+    lineText(words).length <= MAX_LINE_CHARS
+  );
+}
+
 /**
- * Group Whisper segments into lyric lines:
- * - a new segment always starts a new line;
- * - a pause of more than PAUSE_BREAK_SECONDS between words breaks;
- * - a line holds at most MAX_WORDS_PER_LINE words.
+ * Phase 1 — natural breaks inside one segment: a pause over
+ * PAUSE_BREAK_SECONDS always breaks; a pause of ADAPTIVE_PAUSE_SECONDS
+ * or more breaks once the line is at/over the soft target (words or
+ * duration); a sentence-ending word (. ! ?) closes the line when it
+ * already holds at least two words.
+ */
+function chunkSegmentWords(words: TimedWord[]): TimedWord[][] {
+  const chunks: TimedWord[][] = [];
+  let current: TimedWord[] = [];
+  for (const word of words) {
+    if (current.length > 0) {
+      const prev = current[current.length - 1];
+      const gap = word.startSeconds - prev.endSeconds;
+      const hardPause = gap > PAUSE_BREAK_SECONDS;
+      const adaptivePause =
+        gap >= ADAPTIVE_PAUSE_SECONDS &&
+        (current.length >= SOFT_TARGET_WORDS || lineDurationSeconds(current) >= SOFT_TARGET_SECONDS);
+      const sentenceBreak = current.length >= 2 && SENTENCE_END.test(prev.text);
+      if (hardPause || adaptivePause || sentenceBreak) {
+        chunks.push(current);
+        current = [];
+      }
+    }
+    current.push(word);
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Phase 2 — hard caps: a chunk still over a cap splits at its largest
+ * internal pause (pauses under SPLIT_PAUSE_SECONDS don't count; ties
+ * go to the pause closest to the chunk's middle), or at the midpoint
+ * word when the chunk has no usable pause. Recurses until every piece
+ * fits (or is a single word).
+ */
+function splitChunkToCaps(words: TimedWord[]): TimedWord[][] {
+  if (lineFitsCaps(words)) return [words];
+  let boundary = -1;
+  let bestGap = 0;
+  for (let i = 1; i < words.length; i += 1) {
+    const gap = words[i].startSeconds - words[i - 1].endSeconds;
+    if (gap < SPLIT_PAUSE_SECONDS) continue;
+    const closerToMiddle =
+      boundary === -1 || Math.abs(i - words.length / 2) < Math.abs(boundary - words.length / 2);
+    if (gap > bestGap || (gap === bestGap && closerToMiddle)) {
+      boundary = i;
+      bestGap = gap;
+    }
+  }
+  if (boundary === -1) boundary = Math.ceil(words.length / 2);
+  return [...splitChunkToCaps(words.slice(0, boundary)), ...splitChunkToCaps(words.slice(boundary))];
+}
+
+/**
+ * Phase 3 — stranded-word rescue, per segment (segment boundaries are
+ * absolute): a one-word line merges into its closer neighbour when
+ * the join is tight (gap ≤ PAUSE_BREAK_SECONDS), the join wasn't a
+ * sentence break, and the merged line stays under the hard caps.
+ * Repeats — one merge can un-strand the next line.
+ */
+function rescueStrandedLines(chunks: TimedWord[][]): TimedWord[][] {
+  const out = chunks.map((c) => [...c]);
+  let merged = true;
+  while (merged) {
+    merged = false;
+    for (let i = 0; i < out.length; i += 1) {
+      if (out[i].length !== 1) continue;
+      const word = out[i][0];
+      const prev = i > 0 ? out[i - 1] : null;
+      const next = i < out.length - 1 ? out[i + 1] : null;
+      const backGap = prev ? word.startSeconds - prev[prev.length - 1].endSeconds : null;
+      const fwdGap = next ? next[0].startSeconds - word.endSeconds : null;
+      const canBack =
+        prev !== null &&
+        backGap !== null &&
+        backGap <= PAUSE_BREAK_SECONDS &&
+        !SENTENCE_END.test(prev[prev.length - 1].text) &&
+        lineFitsCaps([...prev, word]);
+      const canFwd =
+        next !== null &&
+        fwdGap !== null &&
+        fwdGap <= PAUSE_BREAK_SECONDS &&
+        !SENTENCE_END.test(word.text) &&
+        lineFitsCaps([word, ...next]);
+      if (!canBack && !canFwd) continue;
+      const goBack = canBack && (!canFwd || (backGap as number) <= (fwdGap as number));
+      if (goBack && prev) {
+        out.splice(i - 1, 2, [...prev, word]);
+      } else if (next) {
+        out.splice(i, 2, [word, ...next]);
+      }
+      merged = true;
+      break; // rescan from the top after each merge
+    }
+  }
+  return out;
+}
+
+function lineFromWords(words: TimedWord[], fps: number): LyricLine {
+  const startFrame = secondsToFrames(words[0].startSeconds, fps);
+  const endFrame = Math.max(secondsToFrames(words[words.length - 1].endSeconds, fps), startFrame + 1);
+  const timed: LyricWord[] = words.map((w, i) => {
+    const wStart = secondsToFrames(w.startSeconds, fps);
+    // Every word spans at least one frame; the last word ends the line.
+    const wEnd = i === words.length - 1 ? endFrame : Math.max(secondsToFrames(w.endSeconds, fps), wStart + 1);
+    return { text: w.text, startFrame: wStart, endFrame: wEnd };
+  });
+  return { id: newLyricLineId(), text: lineText(words), startFrame, endFrame, words: timed };
+}
+
+/**
+ * Group Whisper segments into lyric lines. A new segment always
+ * starts a new line; inside a segment the three phases above decide
+ * the lines (natural breaks → cap splits → stranded-word rescue).
  * Seconds → frames rounds (Math.round) via the shared converters.
  * A segment without word timings becomes one line with no words.
  */
 export function groupWhisperSegments(segments: WhisperSegment[], fps: number): LyricLine[] {
   const lines: LyricLine[] = [];
-  let pending: { text: string; startSeconds: number; endSeconds: number }[] = [];
-
-  const flush = () => {
-    if (pending.length === 0) return;
-    const startFrame = secondsToFrames(pending[0].startSeconds, fps);
-    const endFrame = Math.max(secondsToFrames(pending[pending.length - 1].endSeconds, fps), startFrame + 1);
-    const words: LyricWord[] = pending.map((w, i) => {
-      const wStart = secondsToFrames(w.startSeconds, fps);
-      // Every word spans at least one frame; the last word ends the line.
-      const wEnd = i === pending.length - 1 ? endFrame : Math.max(secondsToFrames(w.endSeconds, fps), wStart + 1);
-      return { text: w.text, startFrame: wStart, endFrame: wEnd };
-    });
-    lines.push({
-      id: newLyricLineId(),
-      text: words.map((w) => w.text).join(' '),
-      startFrame,
-      endFrame,
-      words,
-    });
-    pending = [];
-  };
-
   const ordered = [...segments].sort((a, b) => a.startSeconds - b.startSeconds);
   for (const segment of ordered) {
-    flush(); // segment boundary always breaks the line
     const words = (segment.words ?? [])
       .map((w) => ({ text: w.text.trim(), startSeconds: w.startSeconds, endSeconds: w.endSeconds }))
       .filter((w) => w.text.length > 0)
@@ -104,18 +236,9 @@ export function groupWhisperSegments(segments: WhisperSegment[], fps: number): L
       }
       continue;
     }
-    let previousEnd: number | null = null;
-    for (const word of words) {
-      if (pending.length > 0) {
-        const pauseBreak = previousEnd !== null && word.startSeconds - previousEnd > PAUSE_BREAK_SECONDS;
-        if (pauseBreak || pending.length >= MAX_WORDS_PER_LINE) flush();
-      }
-      pending.push(word);
-      previousEnd = word.endSeconds;
-    }
-    flush(); // end of segment: the next segment starts a fresh line
+    const chunks = rescueStrandedLines(chunkSegmentWords(words).flatMap(splitChunkToCaps));
+    for (const chunk of chunks) lines.push(lineFromWords(chunk, fps));
   }
-  flush();
   return sortLyricLines(lines);
 }
 

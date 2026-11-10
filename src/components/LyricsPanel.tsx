@@ -34,13 +34,20 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../theme
  *
  * Detection is Whisper SMALL on-device, DETECTION ONLY (no lookup):
  * the model (~470MB) downloads on first use, then transcription runs
- * locally. Detected lines land on the SONG timeline (frames) and are
- * edited here line by line: text, ±0.1s / ±1-frame nudges, split,
- * merge, delete, a global shift, and a tap-to-sync mode that stamps
- * line starts from the playing preview. The style half (30+ fonts,
- * 30 animations, colour/stroke/pill/position) writes the project's
- * one LyricStyle; preview (LyricsOverlay) and export (native text
- * layers) render the same resolved payload.
+ * locally. The grouper (src/lib/lyrics.ts) decides the lines —
+ * pauses, sentence ends and length caps — and they land on the SONG
+ * timeline (frames), editable here.
+ *
+ * Layout: a slim header carries the title, the Detect action and its
+ * progress, and the show/hide switch; below it, two tabs.
+ * - Lines: the line-by-line editor (text, ±0.1s / ±1-frame nudges,
+ *   split, merge, delete, global shift) plus tap-to-sync.
+ * - Style: ONE shared style for ALL lines — 50 fonts, outline,
+ *   position and 50 animations. There is no per-line style by design:
+ *   the controls are grouped under an "All lines" header so it reads
+ *   as global, and every change flows through the one resolved style
+ *   into the preview overlay (all lines, immediately) and the export
+ *   payload.
  *
  * Per Jaizon: there is deliberately NO "remove downloaded model"
  * control anywhere — the model UI is state, progress and errors only.
@@ -58,6 +65,15 @@ interface LyricsPanelProps {
 }
 
 const FRAME_0_1S = Math.round(DEFAULT_FPS * 0.1); // 3 frames at 30fps
+/** Outline width range (ratio of font size). In the preview overlay
+ *  the ratio IS the outline distance in points once multiplied by
+ *  the font size — at the default lyric size on a phone-width stage
+ *  this range reads as roughly 1pt to 9pt of outline, so the whole
+ *  slider travel is visible. The export draws the same ratio as a
+ *  real text stroke. */
+const STROKE_MIN = 0.03;
+const STROKE_MAX = 0.3;
+const STROKE_DEFAULT = 0.12;
 const COLOR_SWATCHES = [
   '#F4F1E9',
   '#FFFFFF',
@@ -94,6 +110,7 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const lines = lyrics?.lines ?? [];
   const style = lyrics?.style;
 
+  const [tab, setTab] = useState<'lines' | 'style'>('lines');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [syncMode, setSyncMode] = useState(false);
   const [phase, setPhase] = useState<'idle' | 'model' | 'transcribe'>('idle');
@@ -250,24 +267,66 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
     }
   };
 
+  const applyHex = () => {
+    if (isHexColor(hexDraft)) {
+      studio.setLyricStyle({ color: hexDraft.trim().toUpperCase() });
+      setHexDraft('');
+    }
+  };
+
   // ---- Render ----------------------------------------------------------
   return (
     <View style={styles.section}>
       <View style={styles.panel}>
-        <View style={styles.titleRow}>
+        {/* Slim header: title + count, Detect (or live progress) on
+            the right, show/hide switch under it. Always visible,
+            whichever tab is open. */}
+        <View style={styles.headerRow}>
           <Text style={styles.title}>Lyrics</Text>
           {lines.length > 0 ? (
             <Text style={styles.countLabel}>
               {lines.length} line{lines.length === 1 ? '' : 's'}
             </Text>
           ) : null}
+          <View style={styles.headerSpacer} />
+          {track ? (
+            phase !== 'idle' ? (
+              <View style={styles.busyRow}>
+                <ActivityIndicator color={colors.accent} size="small" />
+                <Text style={styles.busyLabel}>
+                  {phase === 'model' ? 'Model' : 'Detecting'}
+                  {progress > 0 ? ` ${Math.round(progress * 100)}%` : ''}
+                </Text>
+              </View>
+            ) : (
+              <Pressable
+                style={styles.detectButton}
+                onPress={runDetect}
+                accessibilityRole="button"
+                accessibilityLabel={lines.length > 0 ? 'Detect lyrics again' : 'Detect lyrics'}>
+                <Ionicons name="sparkles" size={15} color={colors.onAccent} />
+                <Text style={styles.detectButtonText}>{lines.length > 0 ? 'Detect again' : 'Detect lyrics'}</Text>
+              </Pressable>
+            )
+          ) : null}
         </View>
+        {phase !== 'idle' ? (
+          <>
+            <View style={styles.progressTrack}>
+              <View style={[styles.progressFill, { width: `${Math.round(progress * 100)}%` }]} />
+            </View>
+            <Text style={styles.caption}>
+              {phase === 'model'
+                ? 'Downloading the Whisper model (~470MB) — it runs on this phone, nothing is uploaded.'
+                : 'Listening to the song and writing the lines…'}
+            </Text>
+          </>
+        ) : null}
 
         {!track ? (
           <Text style={styles.caption}>Load a song first — lyrics are detected from the track itself.</Text>
         ) : (
           <>
-            {/* Show/hide — only meaningful once a lyrics object exists. */}
             {lyrics ? (
               <View style={styles.switchRow}>
                 <Text style={styles.rowLabel}>Show lyrics on the video</Text>
@@ -280,314 +339,314 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                 />
               </View>
             ) : null}
-
-            {/* Detection card / progress / error. */}
-            {phase !== 'idle' ? (
-              <View style={styles.progressBox}>
-                <View style={styles.progressRow}>
-                  <ActivityIndicator color={colors.accent} />
-                  <Text style={styles.progressLabel}>
-                    {phase === 'model' ? 'Downloading the Whisper model…' : 'Detecting lyrics on your phone…'}
-                    {progress > 0 ? ` ${Math.round(progress * 100)}%` : ''}
-                  </Text>
-                </View>
-                <View style={styles.progressTrack}>
-                  <View style={[styles.progressFill, { width: `${Math.round(progress * 100)}%` }]} />
-                </View>
-              </View>
-            ) : (
-              <Pressable
-                style={styles.detectButton}
-                onPress={runDetect}
-                accessibilityRole="button"
-                accessibilityLabel={lines.length > 0 ? 'Detect lyrics again' : 'Detect lyrics'}>
-                <Ionicons name="sparkles" size={18} color={colors.onAccent} />
-                <Text style={styles.detectButtonText}>
-                  {lines.length > 0 ? 'Detect again' : 'Detect lyrics'}
-                </Text>
-              </Pressable>
-            )}
+            {error ? <Text style={styles.errorText}>{error}</Text> : null}
             {lines.length === 0 && phase === 'idle' ? (
               <Text style={styles.caption}>
                 Whisper Small listens to the song on this phone and writes the lines with timings — nothing is
                 uploaded. The first detection downloads the model (~470MB, Wi-Fi recommended); after that it works
-                offline. Detected lines are a draft: fix any words below.
+                offline. Detected lines are a draft: fix any words in the Lines tab.
               </Text>
             ) : null}
-            {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
-            {/* Line editor. */}
-            {lines.length > 0 ? (
+            <SegmentedControl
+              options={[
+                { value: 'lines' as const, label: 'Lines' },
+                { value: 'style' as const, label: 'Style' },
+              ]}
+              value={tab}
+              onChange={setTab}
+              accessibilityLabel="Lyrics editor tabs"
+            />
+
+            {tab === 'lines' ? (
               <>
-                <View style={styles.listBox}>
-                  {lines.map((line, index) => (
-                    <LyricLineRow
-                      key={line.id}
-                      line={line}
-                      index={index}
-                      isLast={index === lines.length - 1}
-                      selected={line.id === selectedId}
-                      playheadSongFrame={playheadSongFrame}
-                      onSelect={() => handleSelectLine(line)}
-                      onCommitText={(text) => studio.updateLyricLine(line.id, { text })}
-                      onNudge={(edge, delta) => handleNudge(line, edge, delta)}
-                      onSplit={(wordIndex) => handleSplit(line, wordIndex)}
-                      onMergeDown={() => handleMergeDown(line)}
-                      onDelete={() => handleDelete(line)}
-                    />
-                  ))}
-                </View>
+                {lines.length > 0 ? (
+                  <>
+                    <View style={styles.listBox}>
+                      {lines.map((line, index) => (
+                        <LyricLineRow
+                          key={line.id}
+                          line={line}
+                          index={index}
+                          isLast={index === lines.length - 1}
+                          selected={line.id === selectedId}
+                          playheadSongFrame={playheadSongFrame}
+                          onSelect={() => handleSelectLine(line)}
+                          onCommitText={(text) => studio.updateLyricLine(line.id, { text })}
+                          onNudge={(edge, delta) => handleNudge(line, edge, delta)}
+                          onSplit={(wordIndex) => handleSplit(line, wordIndex)}
+                          onMergeDown={() => handleMergeDown(line)}
+                          onDelete={() => handleDelete(line)}
+                        />
+                      ))}
+                    </View>
 
-                <View style={styles.toolRow}>
-                  <Pressable style={styles.toolButton} onPress={handleAddLine} accessibilityRole="button">
-                    <Ionicons name="add" size={16} color={colors.label} />
-                    <Text style={styles.toolButtonText}>Add line</Text>
-                  </Pressable>
-                  <View style={styles.shiftGroup}>
-                    <Text style={styles.shiftLabel}>Shift all</Text>
-                    <NudgeButton label="−1s" onPress={() => studio.shiftAllLyrics(-DEFAULT_FPS)} />
-                    <NudgeButton label="−0.1s" onPress={() => studio.shiftAllLyrics(-FRAME_0_1S)} />
-                    <NudgeButton label="+0.1s" onPress={() => studio.shiftAllLyrics(FRAME_0_1S)} />
-                    <NudgeButton label="+1s" onPress={() => studio.shiftAllLyrics(DEFAULT_FPS)} />
-                  </View>
-                </View>
+                    <View style={styles.toolRow}>
+                      <Pressable style={styles.toolButton} onPress={handleAddLine} accessibilityRole="button">
+                        <Ionicons name="add" size={16} color={colors.label} />
+                        <Text style={styles.toolButtonText}>Add line</Text>
+                      </Pressable>
+                      <View style={styles.shiftGroup}>
+                        <Text style={styles.shiftLabel}>Shift all</Text>
+                        <NudgeButton label="−1s" onPress={() => studio.shiftAllLyrics(-DEFAULT_FPS)} />
+                        <NudgeButton label="−0.1s" onPress={() => studio.shiftAllLyrics(-FRAME_0_1S)} />
+                        <NudgeButton label="+0.1s" onPress={() => studio.shiftAllLyrics(FRAME_0_1S)} />
+                        <NudgeButton label="+1s" onPress={() => studio.shiftAllLyrics(DEFAULT_FPS)} />
+                      </View>
+                    </View>
 
-                {/* Tap-to-sync. */}
-                <View style={styles.switchRow}>
-                  <View style={styles.switchText}>
-                    <Text style={styles.rowLabel}>Tap-to-sync</Text>
-                    <Text style={styles.caption}>
-                      Play the cut, then tap the big button the moment each line starts — it stamps the selected
-                      line and moves to the next.
-                    </Text>
-                  </View>
-                  <Switch
-                    value={syncMode}
-                    onValueChange={setSyncMode}
-                    trackColor={{ true: colors.accent, false: colors.elevated }}
-                    thumbColor={syncMode ? colors.onAccent : colors.label}
-                    accessibilityLabel="Tap-to-sync mode"
-                  />
-                </View>
-                {syncMode ? (
-                  <View style={styles.syncRow}>
-                    <Pressable
-                      style={styles.syncPlayButton}
-                      onPress={() => (isPlaying ? onPause() : onPlay())}
-                      accessibilityRole="button"
-                      accessibilityLabel={isPlaying ? 'Pause preview' : 'Play preview'}>
-                      <Ionicons name={isPlaying ? 'pause' : 'play'} size={20} color={colors.label} />
-                    </Pressable>
-                    <Pressable
-                      style={styles.tapButton}
-                      onPress={handleTapSync}
-                      accessibilityRole="button"
-                      accessibilityLabel="Stamp the selected line at the playhead">
-                      <Text style={styles.tapButtonText}>
-                        {selected ? `TAP — “${truncate(selected.text, 18)}” starts here` : 'TAP — pick the line'}
-                      </Text>
-                    </Pressable>
-                  </View>
-                ) : null}
-              </>
-            ) : lyrics ? (
-              <Pressable style={styles.toolButton} onPress={handleAddLine} accessibilityRole="button">
-                <Ionicons name="add" size={16} color={colors.label} />
-                <Text style={styles.toolButtonText}>Add a line by hand</Text>
-              </Pressable>
-            ) : null}
-
-            {/* Style. */}
-            {style ? (
-              <View style={styles.styleBox}>
-                <Text style={styles.panelLabel}>Style</Text>
-
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
-                  <View style={styles.chipRow}>
-                    {LYRIC_FONTS.map((font) => {
-                      const isCurrent = style.fontId === font.id;
-                      return (
+                    {/* Tap-to-sync. */}
+                    <View style={styles.switchRow}>
+                      <View style={styles.switchText}>
+                        <Text style={styles.rowLabel}>Tap-to-sync</Text>
+                        <Text style={styles.caption}>
+                          Play the cut, then tap the big button the moment each line starts — it stamps the
+                          selected line and moves to the next.
+                        </Text>
+                      </View>
+                      <Switch
+                        value={syncMode}
+                        onValueChange={setSyncMode}
+                        trackColor={{ true: colors.accent, false: colors.elevated }}
+                        thumbColor={syncMode ? colors.onAccent : colors.label}
+                        accessibilityLabel="Tap-to-sync mode"
+                      />
+                    </View>
+                    {syncMode ? (
+                      <View style={styles.syncRow}>
                         <Pressable
-                          key={font.id}
-                          onPress={() => studio.setLyricStyle({ fontId: font.id })}
+                          style={styles.syncPlayButton}
+                          onPress={() => (isPlaying ? onPause() : onPlay())}
                           accessibilityRole="button"
-                          accessibilityState={{ selected: isCurrent }}
-                          accessibilityLabel={`Font ${font.displayName}`}
-                          style={[styles.fontChip, isCurrent && styles.chipCurrent]}>
-                          <Text
-                            style={{
-                              fontFamily: font.family,
-                              fontWeight: style.bold && font.kind === 'system' ? '700' : '400',
-                              fontSize: 15,
-                              color: isCurrent ? colors.accent : colors.label,
-                            }}>
-                            {font.displayName}
+                          accessibilityLabel={isPlaying ? 'Pause preview' : 'Play preview'}>
+                          <Ionicons name={isPlaying ? 'pause' : 'play'} size={20} color={colors.label} />
+                        </Pressable>
+                        <Pressable
+                          style={styles.tapButton}
+                          onPress={handleTapSync}
+                          accessibilityRole="button"
+                          accessibilityLabel="Stamp the selected line at the playhead">
+                          <Text style={styles.tapButtonText}>
+                            {selected ? `TAP — “${truncate(selected.text, 18)}” starts here` : 'TAP — pick the line'}
                           </Text>
                         </Pressable>
-                      );
-                    })}
-                  </View>
-                </ScrollView>
-
-                <View style={styles.switchRow}>
-                  <Text style={styles.rowLabel}>Bold</Text>
-                  <Switch
-                    value={style.bold}
-                    onValueChange={(v) => studio.setLyricStyle({ bold: v })}
-                    trackColor={{ true: colors.accent, false: colors.elevated }}
-                    thumbColor={style.bold ? colors.onAccent : colors.label}
-                    accessibilityLabel="Bold lyrics"
-                  />
-                </View>
-
-                <Text style={styles.fieldLabel}>Size</Text>
-                <Slider
-                  value={sizeDraft ?? style.sizeRatio}
-                  minimumValue={0.04}
-                  maximumValue={0.16}
-                  step={0.005}
-                  onValueChange={setSizeDraft}
-                  onSlidingComplete={(v) => {
-                    studio.setLyricStyle({ sizeRatio: v });
-                    setSizeDraft(null);
-                  }}
-                  minimumTrackTintColor={colors.accent}
-                  maximumTrackTintColor={colors.elevated}
-                  thumbTintColor={colors.label}
-                  accessibilityLabel="Lyric size"
-                />
-
-                <Text style={styles.fieldLabel}>Colour</Text>
-                <SwatchRow
-                  swatches={COLOR_SWATCHES}
-                  value={style.color}
-                  onPick={(c) => studio.setLyricStyle({ color: c })}
-                />
-                <View style={styles.hexRow}>
-                  <TextInput
-                    value={hexDraft}
-                    onChangeText={setHexDraft}
-                    placeholder="#RRGGBB"
-                    placeholderTextColor={colors.labelTertiary}
-                    autoCapitalize="characters"
-                    autoCorrect={false}
-                    style={styles.hexInput}
-                    onSubmitEditing={() => {
-                      if (isHexColor(hexDraft)) {
-                        studio.setLyricStyle({ color: hexDraft.trim().toUpperCase() });
-                        setHexDraft('');
-                      }
-                    }}
-                    accessibilityLabel="Custom lyric colour, hex"
-                  />
-                  <Pressable
-                    style={styles.hexApply}
-                    onPress={() => {
-                      if (isHexColor(hexDraft)) {
-                        studio.setLyricStyle({ color: hexDraft.trim().toUpperCase() });
-                        setHexDraft('');
-                      }
-                    }}
-                    accessibilityRole="button">
-                    <Text style={styles.hexApplyText}>Apply</Text>
+                      </View>
+                    ) : null}
+                  </>
+                ) : lyrics ? (
+                  <Pressable style={styles.toolButton} onPress={handleAddLine} accessibilityRole="button">
+                    <Ionicons name="add" size={16} color={colors.label} />
+                    <Text style={styles.toolButtonText}>Add a line by hand</Text>
                   </Pressable>
-                </View>
+                ) : (
+                  <Text style={styles.caption}>
+                    No lines yet — tap Detect lyrics above, or switch to Style once lines exist.
+                  </Text>
+                )}
+              </>
+            ) : (
+              /* ---- Style tab: ONE style for ALL lines. ---- */
+              <>
+                {!style ? (
+                  <Text style={styles.caption}>
+                    No style yet — detect lyrics or add a line first, then set the look here.
+                  </Text>
+                ) : (
+                  <View style={styles.styleBox}>
+                    <Text style={styles.groupHeader}>All lines</Text>
+                    <Text style={styles.caption}>
+                      One style for the whole song. Font, outline, position and animation apply to every line at
+                      once — watch the preview above change as you pick.
+                    </Text>
 
-                <View style={styles.switchRow}>
-                  <Text style={styles.rowLabel}>Outline</Text>
-                  <Switch
-                    value={!!style.strokeColor}
-                    onValueChange={(v) =>
-                      studio.setLyricStyle(
-                        v
-                          ? { strokeColor: '#000000', strokeWidthRatio: style.strokeWidthRatio ?? 0.12 }
-                          : { strokeColor: undefined },
-                      )
-                    }
-                    trackColor={{ true: colors.accent, false: colors.elevated }}
-                    thumbColor={style.strokeColor ? colors.onAccent : colors.label}
-                    accessibilityLabel="Lyric outline"
-                  />
-                </View>
-                {style.strokeColor ? (
-                  <>
-                    <SwatchRow
-                      swatches={COLOR_SWATCHES}
-                      value={style.strokeColor}
-                      onPick={(c) => studio.setLyricStyle({ strokeColor: c })}
-                    />
+                    <Text style={styles.fieldLabel}>Font</Text>
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
+                      <View style={styles.chipRow}>
+                        {LYRIC_FONTS.map((font) => {
+                          const isCurrent = style.fontId === font.id;
+                          return (
+                            <Pressable
+                              key={font.id}
+                              onPress={() => studio.setLyricStyle({ fontId: font.id })}
+                              accessibilityRole="button"
+                              accessibilityState={{ selected: isCurrent }}
+                              accessibilityLabel={`Font ${font.displayName}`}
+                              style={[styles.fontChip, isCurrent && styles.chipCurrent]}>
+                              <Text
+                                style={{
+                                  fontFamily: font.family,
+                                  fontWeight: style.bold && font.kind === 'system' ? '700' : '400',
+                                  fontSize: 15,
+                                  color: isCurrent ? colors.accent : colors.label,
+                                }}>
+                                {font.displayName}
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                    </ScrollView>
+
+                    <Text style={styles.fieldLabel}>Text</Text>
+                    <View style={styles.sliderLabelRow}>
+                      <Text style={styles.sliderLabel}>Size</Text>
+                      <Text style={styles.sliderValue}>{Math.round(style.sizeRatio * 100)}%</Text>
+                    </View>
                     <Slider
-                      value={strokeDraft ?? style.strokeWidthRatio ?? 0.12}
-                      minimumValue={0.02}
-                      maximumValue={0.25}
-                      step={0.01}
-                      onValueChange={setStrokeDraft}
+                      value={sizeDraft ?? style.sizeRatio}
+                      minimumValue={0.04}
+                      maximumValue={0.16}
+                      step={0.005}
+                      onValueChange={setSizeDraft}
                       onSlidingComplete={(v) => {
-                        studio.setLyricStyle({ strokeWidthRatio: v });
-                        setStrokeDraft(null);
+                        studio.setLyricStyle({ sizeRatio: v });
+                        setSizeDraft(null);
                       }}
                       minimumTrackTintColor={colors.accent}
                       maximumTrackTintColor={colors.elevated}
                       thumbTintColor={colors.label}
-                      accessibilityLabel="Outline width"
+                      accessibilityLabel="Lyric size"
                     />
-                  </>
-                ) : null}
 
-                <Text style={styles.fieldLabel}>Background</Text>
-                <SegmentedControl
-                  options={[
-                    { value: 'none' as const, label: 'None' },
-                    { value: 'pill' as const, label: 'Pill' },
-                  ]}
-                  value={style.background}
-                  onChange={(v) => studio.setLyricStyle({ background: v })}
-                  accessibilityLabel="Lyric background"
-                />
-                {style.background === 'pill' ? (
-                  <SwatchRow
-                    swatches={PILL_SWATCHES}
-                    value={style.backgroundColor ?? 'rgba(10,10,12,0.55)'}
-                    onPick={(c) => studio.setLyricStyle({ backgroundColor: c })}
-                  />
-                ) : null}
-
-                <Text style={styles.fieldLabel}>Position</Text>
-                <SegmentedControl
-                  options={[
-                    { value: 'top' as const, label: 'Top' },
-                    { value: 'center' as const, label: 'Center' },
-                    { value: 'bottom' as const, label: 'Bottom' },
-                  ]}
-                  value={style.position}
-                  onChange={(v) => studio.setLyricStyle({ position: v })}
-                  accessibilityLabel="Lyric position"
-                />
-
-                <Text style={styles.fieldLabel}>Animation</Text>
-                <View style={styles.animationGrid}>
-                  {LYRIC_ANIMATIONS.map((animation) => {
-                    const isCurrent = style.animationId === animation.id;
-                    return (
-                      <Pressable
-                        key={animation.id}
-                        onPress={() => previewAnimation(animation.id)}
-                        accessibilityRole="button"
-                        accessibilityState={{ selected: isCurrent }}
-                        accessibilityLabel={`Animation ${animation.name}`}
-                        style={[styles.animationChip, isCurrent && styles.chipCurrent]}>
-                        <Text style={[styles.animationChipText, isCurrent && styles.animationChipTextCurrent]}>
-                          {animation.name}
-                        </Text>
+                    <Text style={styles.sliderLabel}>Colour</Text>
+                    <SwatchRow
+                      swatches={COLOR_SWATCHES}
+                      value={style.color}
+                      onPick={(c) => studio.setLyricStyle({ color: c })}
+                    />
+                    <View style={styles.hexRow}>
+                      <TextInput
+                        value={hexDraft}
+                        onChangeText={setHexDraft}
+                        placeholder="#RRGGBB"
+                        placeholderTextColor={colors.labelTertiary}
+                        autoCapitalize="characters"
+                        autoCorrect={false}
+                        style={styles.hexInput}
+                        onSubmitEditing={applyHex}
+                        accessibilityLabel="Custom lyric colour, hex"
+                      />
+                      <Pressable style={styles.hexApply} onPress={applyHex} accessibilityRole="button">
+                        <Text style={styles.hexApplyText}>Apply</Text>
                       </Pressable>
-                    );
-                  })}
-                </View>
-                <Text style={styles.caption}>
-                  Tap an animation to preview it on the current line in the player above.
-                </Text>
-              </View>
-            ) : null}
+                    </View>
+
+                    <View style={styles.switchRow}>
+                      <Text style={styles.rowLabel}>Bold</Text>
+                      <Switch
+                        value={style.bold}
+                        onValueChange={(v) => studio.setLyricStyle({ bold: v })}
+                        trackColor={{ true: colors.accent, false: colors.elevated }}
+                        thumbColor={style.bold ? colors.onAccent : colors.label}
+                        accessibilityLabel="Bold lyrics"
+                      />
+                    </View>
+
+                    {/* Outline — a global, all-lines setting. */}
+                    <View style={styles.switchRow}>
+                      <Text style={styles.rowLabel}>Outline (all lines)</Text>
+                      <Switch
+                        value={!!style.strokeColor}
+                        onValueChange={(v) =>
+                          studio.setLyricStyle(
+                            v
+                              ? { strokeColor: '#000000', strokeWidthRatio: style.strokeWidthRatio ?? STROKE_DEFAULT }
+                              : { strokeColor: undefined },
+                          )
+                        }
+                        trackColor={{ true: colors.accent, false: colors.elevated }}
+                        thumbColor={style.strokeColor ? colors.onAccent : colors.label}
+                        accessibilityLabel="Lyric outline for all lines"
+                      />
+                    </View>
+                    {style.strokeColor ? (
+                      <>
+                        <SwatchRow
+                          swatches={COLOR_SWATCHES}
+                          value={style.strokeColor}
+                          onPick={(c) => studio.setLyricStyle({ strokeColor: c })}
+                        />
+                        <View style={styles.sliderLabelRow}>
+                          <Text style={styles.sliderLabel}>Outline width</Text>
+                          <Text style={styles.sliderValue}>
+                            {(strokeDraft ?? style.strokeWidthRatio ?? STROKE_DEFAULT).toFixed(2)}
+                          </Text>
+                        </View>
+                        <Slider
+                          value={strokeDraft ?? style.strokeWidthRatio ?? STROKE_DEFAULT}
+                          minimumValue={STROKE_MIN}
+                          maximumValue={STROKE_MAX}
+                          step={0.01}
+                          onValueChange={setStrokeDraft}
+                          onSlidingComplete={(v) => {
+                            studio.setLyricStyle({ strokeWidthRatio: v });
+                            setStrokeDraft(null);
+                          }}
+                          minimumTrackTintColor={colors.accent}
+                          maximumTrackTintColor={colors.elevated}
+                          thumbTintColor={colors.label}
+                          accessibilityLabel="Outline width for all lines"
+                        />
+                      </>
+                    ) : null}
+
+                    <Text style={styles.sliderLabel}>Background</Text>
+                    <SegmentedControl
+                      options={[
+                        { value: 'none' as const, label: 'None' },
+                        { value: 'pill' as const, label: 'Pill' },
+                      ]}
+                      value={style.background}
+                      onChange={(v) => studio.setLyricStyle({ background: v })}
+                      accessibilityLabel="Lyric background"
+                    />
+                    {style.background === 'pill' ? (
+                      <SwatchRow
+                        swatches={PILL_SWATCHES}
+                        value={style.backgroundColor ?? 'rgba(10,10,12,0.55)'}
+                        onPick={(c) => studio.setLyricStyle({ backgroundColor: c })}
+                      />
+                    ) : null}
+
+                    {/* Position — also global: it moves every line. */}
+                    <Text style={styles.sliderLabel}>Position (all lines)</Text>
+                    <SegmentedControl
+                      options={[
+                        { value: 'top' as const, label: 'Top' },
+                        { value: 'center' as const, label: 'Center' },
+                        { value: 'bottom' as const, label: 'Bottom' },
+                      ]}
+                      value={style.position}
+                      onChange={(v) => studio.setLyricStyle({ position: v })}
+                      accessibilityLabel="Lyric position for all lines"
+                    />
+
+                    <Text style={styles.fieldLabel}>Animation</Text>
+                    <View style={styles.animationGrid}>
+                      {LYRIC_ANIMATIONS.map((animation) => {
+                        const isCurrent = style.animationId === animation.id;
+                        return (
+                          <Pressable
+                            key={animation.id}
+                            onPress={() => previewAnimation(animation.id)}
+                            accessibilityRole="button"
+                            accessibilityState={{ selected: isCurrent }}
+                            accessibilityLabel={`Animation ${animation.name}`}
+                            style={[styles.animationChip, isCurrent && styles.chipCurrent]}>
+                            <Text style={[styles.animationChipText, isCurrent && styles.animationChipTextCurrent]}>
+                              {animation.name}
+                            </Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                    <Text style={styles.caption}>
+                      Tap an animation to preview it on the current line in the player above.
+                    </Text>
+                  </View>
+                )}
+              </>
+            )}
           </>
         )}
       </View>
@@ -646,9 +705,11 @@ function SwatchRow({
   );
 }
 
-/** One editable lyric line. The text field commits on blur/submit;
- *  selecting the row seeks the preview to the line (the panel's job);
- *  the expanded controls appear on the selected row. */
+/** One editable lyric line: a compact header (tabular timing, now
+ *  dot, chevron), the text field on top, and — when selected — one
+ *  grouped controls block: Start/End nudge rows, then a single icon
+ *  row for split / merge / delete. Selecting the row seeks the
+ *  preview to the line (the panel's job). */
 function LyricLineRow({
   line,
   index,
@@ -698,7 +759,7 @@ function LyricLineRow({
           {formatTime(framesToSeconds(line.endFrame, DEFAULT_FPS))}
         </Text>
         {isCurrent ? <View style={styles.nowDot} /> : null}
-        <Ionicons name={selected ? 'chevron-up' : 'chevron-down'} size={15} color={colors.labelTertiary} />
+        <Ionicons name={selected ? 'chevron-up' : 'chevron-down'} size={14} color={colors.labelTertiary} />
       </Pressable>
       <TextInput
         value={text}
@@ -748,7 +809,7 @@ function LyricLineRow({
           </View>
           <Text style={styles.caption}>
             {line.words
-              ? 'Word timings attached — karaoke-style animations use them. Editing the words keeps the timings only if the word count stays the same.'
+              ? 'Word timings attached — karaoke animations use them. Editing keeps them only if the word count stays the same.'
               : 'No word timings on this line — word animations fall back to whole-line.'}
           </Text>
         </View>
@@ -760,9 +821,12 @@ function LyricLineRow({
 const styles = StyleSheet.create({
   section: { paddingHorizontal: spacing.xl, marginTop: spacing.md },
   panel: { gap: spacing.sm },
-  titleRow: { flexDirection: 'row', alignItems: 'baseline', gap: spacing.sm },
+  headerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  headerSpacer: { flex: 1 },
   title: { ...typeScale.headline, color: colors.label, fontSize: 19 },
-  countLabel: { ...typeScale.footnote, color: colors.labelSecondary },
+  countLabel: { ...typeScale.footnote, color: colors.labelSecondary, fontVariant: ['tabular-nums'] },
+  busyRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  busyLabel: { ...typeScale.caption, color: colors.labelSecondary, fontVariant: ['tabular-nums'] },
   caption: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 18 },
   errorText: { ...typeScale.footnote, color: colors.danger, lineHeight: 18 },
   rowLabel: { ...typeScale.subhead, color: colors.label, flex: 1 },
@@ -771,48 +835,48 @@ const styles = StyleSheet.create({
   detectButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
+    gap: 6,
     backgroundColor: colors.accent,
-    borderRadius: radius.md,
-    paddingVertical: 13,
+    borderRadius: radius.pill,
+    paddingHorizontal: 13,
+    paddingVertical: 8,
   },
-  detectButtonText: { color: colors.onAccent, ...typeScale.headline },
-  progressBox: { gap: spacing.sm, backgroundColor: colors.card, borderRadius: radius.md, padding: spacing.md },
-  progressRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  progressLabel: { ...typeScale.footnote, color: colors.label, flex: 1 },
-  progressTrack: { height: 5, borderRadius: radius.pill, backgroundColor: colors.elevated, overflow: 'hidden' },
+  detectButtonText: { color: colors.onAccent, ...typeScale.subhead, fontWeight: '600' },
+  progressTrack: { height: 4, borderRadius: radius.pill, backgroundColor: colors.elevated, overflow: 'hidden' },
   progressFill: { height: '100%', backgroundColor: colors.accent, borderRadius: radius.pill },
   listBox: { gap: spacing.sm },
   lineRow: {
     backgroundColor: colors.card,
     borderRadius: radius.md,
-    padding: spacing.md,
-    gap: spacing.xs,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    gap: 6,
     borderWidth: 1,
     borderColor: 'transparent',
   },
-  lineRowSelected: { borderColor: colors.accent },
-  lineHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  lineRowSelected: { borderColor: colors.accent, backgroundColor: colors.elevated },
+  lineHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, minHeight: 18 },
   lineTime: { ...typeScale.caption, color: colors.labelSecondary, fontVariant: ['tabular-nums'], flex: 1 },
   lineTimeCurrent: { color: colors.accent },
   nowDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: colors.accent },
   lineInput: {
     ...typeScale.body,
     color: colors.label,
-    backgroundColor: colors.elevated,
+    // Darker than both row surfaces (card, and elevated when the row
+    // is selected) so the field always reads as an inset.
+    backgroundColor: colors.base,
     borderRadius: radius.sm,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
   },
-  lineControls: { gap: spacing.sm, marginTop: spacing.xs },
+  lineControls: { gap: spacing.sm, marginTop: 2 },
   nudgeGroup: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
   nudgeLabel: { ...typeScale.caption, color: colors.labelSecondary, width: 34 },
   nudgeButton: {
-    backgroundColor: colors.elevated,
+    backgroundColor: colors.card,
     borderRadius: radius.sm,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
   },
   nudgeButtonText: { ...typeScale.caption, color: colors.label, fontVariant: ['tabular-nums'] },
   lineActions: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
@@ -820,7 +884,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    backgroundColor: colors.elevated,
+    backgroundColor: colors.card,
     borderRadius: radius.pill,
     paddingHorizontal: 11,
     paddingVertical: 7,
@@ -861,9 +925,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   tapButtonText: { color: colors.onAccent, ...typeScale.headline, textAlign: 'center', paddingHorizontal: spacing.sm },
-  styleBox: { gap: spacing.sm, marginTop: spacing.sm },
-  panelLabel: { ...typeScale.headline, color: colors.label },
-  fieldLabel: { ...typeScale.caption, color: colors.labelSecondary, marginTop: spacing.xs },
+  styleBox: { gap: spacing.sm },
+  groupHeader: { ...typeScale.headline, color: colors.label },
+  fieldLabel: {
+    ...typeScale.caption,
+    color: colors.labelSecondary,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginTop: spacing.sm,
+  },
+  sliderLabelRow: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
+  sliderLabel: { ...typeScale.subhead, color: colors.label },
+  sliderValue: { ...typeScale.caption, color: colors.labelSecondary, fontVariant: ['tabular-nums'] },
   chipScroll: { marginHorizontal: -spacing.xs },
   chipRow: { flexDirection: 'row', gap: spacing.sm, paddingHorizontal: spacing.xs, paddingVertical: 2 },
   fontChip: {

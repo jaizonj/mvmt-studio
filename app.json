@@ -86,7 +86,21 @@
             "./assets/fonts/LuckiestGuy-Regular.ttf",
             "./assets/fonts/Pacifico-Regular.ttf",
             "./assets/fonts/DancingScript-Bold.ttf",
-            "./assets/fonts/PermanentMarker-Regular.ttf"
+            "./assets/fonts/PermanentMarker-Regular.ttf",
+            "./assets/fonts/AlfaSlabOne-Regular.ttf",
+            "./assets/fonts/Righteous-Regular.ttf",
+            "./assets/fonts/Bungee-Regular.ttf",
+            "./assets/fonts/Fredoka-SemiBold.ttf",
+            "./assets/fonts/AbrilFatface-Regular.ttf",
+            "./assets/fonts/PlayfairDisplay-Bold.ttf",
+            "./assets/fonts/DMSerifDisplay-Regular.ttf",
+            "./assets/fonts/Cinzel-Bold.ttf",
+            "./assets/fonts/Audiowide-Regular.ttf",
+            "./assets/fonts/Orbitron-Bold.ttf",
+            "./assets/fonts/Caveat-Bold.ttf",
+            "./assets/fonts/ShadowsIntoLight.ttf",
+            "./assets/fonts/PressStart2P-Regular.ttf",
+            "./assets/fonts/RubikMonoOne-Regular.ttf"
           ]
         }
       ]
