@@ -1579,7 +1579,7 @@ private final class PreviewStore {
   private func attachObservers(_ entry: PreviewEntry) {
     emitStatus(entry, status: "loading")
 
-    entry.statusObservation = entry.item.observe(\.status, options: [.new]) { [weak self, weak entry] item, _ in
+    entry.statusObservation = entry.item.observe(\.status, options: [.new, .initial]) { [weak self, weak entry] item, _ in
       guard let self, let entry else { return }
       switch item.status {
       case .readyToPlay:
@@ -2697,7 +2697,19 @@ private final class CaptureCoordinator: NSObject,
       seekArmItem = nil
       state = .recording
     default:
-      songStatusObservation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
+      // .initial is load-bearing (Jaizon, 2026-11-10: the first-take
+      // bug came BACK intermittently after the readiness gate shipped):
+      // without it, an item that turns .readyToPlay in the gap between
+      // the status switch above and this registration never notifies —
+      // the seek is never issued, the 5s arm timeout plays the item
+      // from 0, and the take starts at the top of the song instead of
+      // the picked part. Fresh standing items (first take of a
+      // session, first take after a track change) are exactly the ones
+      // still loading here, which is why the bug was intermittent and
+      // first-take-shaped. .initial delivers the current status
+      // synchronously at registration; the closure's guards make a
+      // duplicate delivery harmless.
+      songStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] observedItem, _ in
         guard let self else { return }
         // Status changes arrive on an arbitrary thread — hop onto
         // the capture queue like every other capture callback.

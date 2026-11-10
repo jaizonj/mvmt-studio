@@ -503,7 +503,7 @@ export default function ExportScreen() {
                   </View>
                 </View>
                 <Text style={styles.qualityCaption}>
-                  {request.canvasWidth} × {request.canvasHeight} · {cut?.edl.fps ?? 30} fps · Portrait · Song only —
+                  {request.canvasWidth} × {request.canvasHeight} · {request.frameRate} fps · Portrait · Song only —
                   your takes&apos; camera sound is off · {QUALITY_CAPTIONS[exportQuality]}
                 </Text>
               </View>

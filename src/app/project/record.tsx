@@ -1062,21 +1062,16 @@ export default function CameraScreen() {
       return;
     }
     timerWasUsedRef.current = true;
-    // Keep the session in RECORD mode for the whole countdown — do
-    // NOT flip allowsRecording off here (Jaizon, 2026-11-09: with the
-    // countdown on, every OTHER take recorded with the song audio
-    // wrong). This call is the ONLY session-mode change that differs
-    // between a countdown take and a plain/count-in take: it moved
-    // the shared AVAudioSession to the .playback category, tearing
-    // down the mic route under the compositor's LIVE capture session
-    // (interruption / runtime-error → the module rebuilds its inputs,
-    // flipping its configured state per flip), and beginRecording
-    // then flipped straight back and raced startCapture against that
-    // rebuild — alternate takes lost the race. The beeps never needed
-    // the flip: count-in clicks and the 'go' cue already play under
-    // .playAndRecord. Same mode beginRecording applies, so the
-    // category never changes and nothing is torn down.
-    void setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
+    // The countdown path must not touch the audio session AT ALL
+    // (Jaizon, 2026-11-09/10: countdown takes recorded with the song
+    // audio wrong, persisting across two builds). History: this
+    // function first flipped the session to playback-only for the
+    // beeps (tearing down the mic route under the live capture
+    // session), then — last build — re-applied record mode here,
+    // which was still one session mutation more than a plain take
+    // makes. beginRecording sets record mode itself before every
+    // capture; the beeps and clicks play fine under whatever mode is
+    // already active, so there is nothing for the countdown to set.
     let remaining = countdown;
     setCountingDown(remaining);
     playCue('beep');
