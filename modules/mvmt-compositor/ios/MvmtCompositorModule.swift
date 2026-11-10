@@ -1876,16 +1876,20 @@ private final class CaptureCoordinator: NSObject,
       captureIsSixtyFps = true
       return
     }
+    // ORDER IS LOAD-BEARING: the session preset must be
+    // .inputPriority BEFORE activeFormat is assigned. Setting
+    // activeFormat on a device that is an input to a session
+    // running a dimensional preset throws NSInvalidArgumentException
+    // — the launch crash on the first build that touched
+    // activeFormat (the input is added to the session before this
+    // runs, and the session was steering by preset until now).
+    session.sessionPreset = .inputPriority
     do {
       try device.lockForConfiguration()
       device.activeFormat = format
       device.activeVideoMinFrameDuration = frameDuration
       device.activeVideoMaxFrameDuration = frameDuration
       device.unlockForConfiguration()
-      // The documented pairing for a manually-set device format:
-      // the session defers to the input's format instead of steering
-      // by a dimensional preset.
-      session.sessionPreset = .inputPriority
       captureIsSixtyFps = true
     } catch {
       // Leave the preset defaults — capture still works, just at
