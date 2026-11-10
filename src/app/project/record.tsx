@@ -1,5 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import * as Brightness from 'expo-brightness';
 import { router, useFocusEffect } from 'expo-router';
@@ -320,6 +321,23 @@ export default function CameraScreen() {
     if (!isFocused || !useNativeCapture) return;
     void setCaptureQuality(captureQuality);
   }, [isFocused, captureQuality, useNativeCapture]);
+
+  // Keep the screen awake through the whole capture flow (Jaizon:
+  // "it falls asleep while recording") — from the countdown through
+  // the take. Released the moment neither is active, and on unmount.
+  useEffect(() => {
+    if (recording || countingDown !== null) {
+      void activateKeepAwakeAsync('mvmt-record');
+    } else {
+      void deactivateKeepAwake('mvmt-record');
+    }
+  }, [recording, countingDown]);
+  useEffect(
+    () => () => {
+      void deactivateKeepAwake('mvmt-record');
+    },
+    [],
+  );
 
 
   // Track playback — the sync master clock for takes.

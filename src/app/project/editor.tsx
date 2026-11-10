@@ -5,6 +5,7 @@ import { router } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   Easing,
   Pressable,
@@ -842,9 +843,32 @@ function EditorWorkspace() {
             </Pressable>
           </View>
         </View>
-        <Text style={styles.largeTitle} numberOfLines={1}>
-          Edit
-        </Text>
+        <View style={styles.titleRow}>
+          <Text style={styles.largeTitle} numberOfLines={1}>
+            Edit
+          </Text>
+          {activeProject ? (
+            <Pressable
+              onPress={() =>
+                Alert.prompt(
+                  'Rename project',
+                  undefined,
+                  (name) => studio.renameProject(activeProject.id, name ?? ''),
+                  'plain-text',
+                  activeProject.name,
+                )
+              }
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel={`Rename project ${activeProject.name}`}
+              style={styles.renameChip}>
+              <Text style={styles.renameText} numberOfLines={1}>
+                {activeProject.name}
+              </Text>
+              <Ionicons name="pencil-outline" size={14} color={colors.labelSecondary} />
+            </Pressable>
+          ) : null}
+        </View>
         <Text style={styles.headerSubtitle} numberOfLines={1}>
           {headerSubtitle}
         </Text>
@@ -1054,6 +1078,9 @@ const styles = StyleSheet.create({
   exportButtonText: { color: colors.onAccent, fontSize: 15, fontWeight: '700' },
   exportButtonTextDisabled: { color: colors.labelTertiary },
   largeTitle: { ...typeScale.largeTitle, color: colors.label, marginTop: spacing.xs },
+  titleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md },
+  renameChip: { flexDirection: 'row', alignItems: 'center', gap: 5, flexShrink: 1, paddingVertical: 4 },
+  renameText: { ...typeScale.subhead, color: colors.labelSecondary, flexShrink: 1 },
   headerSubtitle: { ...typeScale.subhead, color: colors.labelSecondary, marginTop: 2 },
   section: { paddingHorizontal: spacing.xl, marginTop: spacing.md },
   previewArea: { alignItems: 'center', marginTop: spacing.sm },

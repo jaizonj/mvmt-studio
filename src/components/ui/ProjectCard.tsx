@@ -35,6 +35,7 @@ interface ProjectCardProps {
   /** hero = Studio Continue (tall portrait media); list = Studio Recent / Projects. */
   variant?: 'hero' | 'list';
   onPress: () => void;
+  onLongPress?: () => void;
   onRename?: () => void;
   onDelete?: () => void;
   isActive?: boolean;
@@ -46,7 +47,7 @@ interface ProjectCardProps {
  * designed graphite placeholder when the project has no takes yet.
  * Pressed state is the shared cardPressed surface.
  */
-export function ProjectCard({ project, variant = 'list', onPress, onRename, onDelete, isActive }: ProjectCardProps) {
+export function ProjectCard({ project, variant = 'list', onPress, onLongPress, onRename, onDelete, isActive }: ProjectCardProps) {
   const hero = variant === 'hero';
   const firstTake = project.takes[0];
   const thumbUri = firstTake?.uri;
@@ -74,6 +75,7 @@ export function ProjectCard({ project, variant = 'list', onPress, onRename, onDe
   return (
     <Pressable
       onPress={onPress}
+      onLongPress={onLongPress}
       accessibilityRole="button"
       accessibilityLabel={`${project.name}. ${metaLine}. ${stateLine}`}
       style={({ pressed }) => [styles.card, hero && styles.cardHero, pressed && styles.cardPressed]}>

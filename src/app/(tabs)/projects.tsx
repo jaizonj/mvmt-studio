@@ -67,6 +67,7 @@ export default function ProjectsScreen() {
               project={project}
               isActive={project.id === activeProjectId}
               onPress={() => open(project)}
+              onLongPress={() => rename(project)}
               onRename={() => rename(project)}
               onDelete={() => remove(project)}
             />
