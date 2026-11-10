@@ -2132,7 +2132,10 @@ private final class CaptureCoordinator: NSObject,
     // applySixtyFpsFormatLocked when the inputs are rebuilt.
     if let error,
       error.domain == AVFoundationErrorDomain,
-      error.code == AVFoundationError.mediaServicesWereReset.rawValue
+      // AVFoundationErrorMediaServicesWereReset (-11819) — the named
+      // Swift enum isn't exposed in the current SDK, so compare the
+      // code directly (CI caught this).
+      error.code == -11819
     {
       if let oldInput = videoInput {
         session.removeInput(oldInput)
