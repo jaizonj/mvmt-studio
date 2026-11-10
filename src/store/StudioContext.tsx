@@ -2,7 +2,7 @@ import type { CameraType, VideoQuality } from 'expo-camera';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import type { Edl } from '../lib/edl';
-import { retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
+import { cleanDetectedLyrics, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { loadProjects, saveProjects } from '../lib/persistence';
 import type {
   AudioRegion,
@@ -40,6 +40,26 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${idCounter}`;
 }
 const nextProjectId = () => nextId('project');
+
+/**
+ * Clean lyrics saved by earlier builds at load time: Whisper bracket
+ * tokens ([_BEG_], [_TT_500]) and back-to-back echo-repeat lines are
+ * removed from every stored project (the shared cleanup in
+ * src/lib/lyrics.ts — the same pass fresh detections get). Only a
+ * project whose lyrics actually change gets a new object, so the
+ * debounced persist writes the cleaned state back exactly when
+ * there was something to clean; the pass is idempotent.
+ */
+function cleanStoredLyrics(projects: Project[]): Project[] {
+  return projects.map((project) => {
+    const lyrics = project.lyrics;
+    if (!lyrics) return project;
+    const lines = cleanDetectedLyrics(lyrics.lines);
+    const changed =
+      lines.length !== lyrics.lines.length || lines.some((line, i) => line !== lyrics.lines[i]);
+    return changed ? { ...project, lyrics: { ...lyrics, lines } } : project;
+  });
+}
 
 export function createEmptyProject(name: string): Project {
   const now = Date.now();
@@ -215,7 +235,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       const loaded = await loadProjects();
       if (!alive) return;
       if (loaded && loaded.projects.length > 0) {
-        setProjects(loaded.projects);
+        setProjects(cleanStoredLyrics(loaded.projects));
         setActiveProjectId(
           loaded.activeProjectId && loaded.projects.some((p) => p.id === loaded.activeProjectId)
             ? loaded.activeProjectId

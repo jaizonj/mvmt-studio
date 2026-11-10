@@ -196,6 +196,83 @@ function rescueStrandedLines(chunks: TimedWord[][]): TimedWord[][] {
   return out;
 }
 
+// ---- Detection cleanup --------------------------------------------------
+
+/** Whisper bracket tokens — [_BEG_], [_TT_500], …: the special /
+ *  timestamp marker family. The native engine filters these tokens
+ *  out before assembly; the JS side strips them again so segments
+ *  from any source — and lyrics saved before the native filter
+ *  existed — come out clean. */
+const WHISPER_BRACKET_TOKEN = /\[_[^\]]*\]/g;
+
+/** Remove every whisper bracket token from a text fragment. */
+export function stripWhisperBracketTokens(text: string): string {
+  return text.replace(WHISPER_BRACKET_TOKEN, '');
+}
+
+/** Bracket-strip + whitespace-normalise a word or line text. */
+function cleanLyricText(text: string): string {
+  return stripWhisperBracketTokens(text).replace(/\s+/g, ' ').trim();
+}
+
+/** Dedup key: case, punctuation and spacing don't make a line a
+ *  different line. */
+function normalizeLineTextForDedup(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Clean detected (or previously saved) lyric lines:
+ * - bracket tokens are stripped from every word and every line
+ *   text; words that become empty drop out, and a timed line's text
+ *   is rebuilt from its kept words;
+ * - lines whose text is empty after cleaning disappear entirely
+ *   (a [_BEG_]-only line is the canonical case);
+ * - CONSECUTIVE duplicate lines (same normalized text) collapse to
+ *   the first occurrence — back-to-back repeats in a row are the
+ *   delay/echo artefacts detection produces (Jaizon's ruling),
+ *   while a repeat that returns later (a chorus) is real and KEPT.
+ * Lines that need no change keep their object identity, so callers
+ * can tell whether anything was cleaned.
+ */
+export function cleanDetectedLyrics(lines: LyricLine[]): LyricLine[] {
+  const cleaned: LyricLine[] = [];
+  for (const line of lines) {
+    let next: LyricLine;
+    if (line.words && line.words.length > 0) {
+      let changed = false;
+      const words: LyricWord[] = [];
+      for (const word of line.words) {
+        const text = cleanLyricText(word.text);
+        if (text.length === 0) {
+          changed = true;
+          continue;
+        }
+        if (text !== word.text) changed = true;
+        words.push(text === word.text ? word : { ...word, text });
+      }
+      const text = words.map((w) => w.text).join(' ');
+      if (text.length === 0) continue;
+      if (text !== line.text) changed = true;
+      next = changed ? { ...line, text, words } : line;
+    } else {
+      const text = cleanLyricText(line.text);
+      if (text.length === 0) continue;
+      next = text === line.text ? line : { ...line, text };
+    }
+    const prev = cleaned[cleaned.length - 1];
+    if (prev && normalizeLineTextForDedup(prev.text) === normalizeLineTextForDedup(next.text)) {
+      continue; // consecutive echo repeat — the first occurrence wins
+    }
+    cleaned.push(next);
+  }
+  return cleaned;
+}
+
 function lineFromWords(words: TimedWord[], fps: number): LyricLine {
   const startFrame = secondsToFrames(words[0].startSeconds, fps);
   const endFrame = Math.max(secondsToFrames(words[words.length - 1].endSeconds, fps), startFrame + 1);
@@ -219,12 +296,15 @@ export function groupWhisperSegments(segments: WhisperSegment[], fps: number): L
   const lines: LyricLine[] = [];
   const ordered = [...segments].sort((a, b) => a.startSeconds - b.startSeconds);
   for (const segment of ordered) {
+    // Sanitize at import: bracket tokens are stripped from every
+    // word (and the segment text below) and emptied words drop out
+    // before grouping, so junk can never form a line of its own.
     const words = (segment.words ?? [])
-      .map((w) => ({ text: w.text.trim(), startSeconds: w.startSeconds, endSeconds: w.endSeconds }))
+      .map((w) => ({ text: cleanLyricText(w.text), startSeconds: w.startSeconds, endSeconds: w.endSeconds }))
       .filter((w) => w.text.length > 0)
       .sort((a, b) => a.startSeconds - b.startSeconds);
     if (words.length === 0) {
-      const text = segment.text.trim();
+      const text = cleanLyricText(segment.text);
       if (text.length > 0) {
         const startFrame = secondsToFrames(segment.startSeconds, fps);
         lines.push({
@@ -239,7 +319,9 @@ export function groupWhisperSegments(segments: WhisperSegment[], fps: number): L
     const chunks = rescueStrandedLines(chunkSegmentWords(words).flatMap(splitChunkToCaps));
     for (const chunk of chunks) lines.push(lineFromWords(chunk, fps));
   }
-  return sortLyricLines(lines);
+  // Final pass: drop anything that cleaned to empty and collapse
+  // back-to-back echo repeats across segment boundaries.
+  return cleanDetectedLyrics(sortLyricLines(lines));
 }
 
 // ---- Song ↔ timeline frame mapping -----------------------------------

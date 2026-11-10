@@ -10,6 +10,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   groupWhisperSegments,
+  cleanDetectedLyrics,
   songFrameToTimelineFrame,
   timelineFrameToSongFrame,
   lineAtSongFrame,
@@ -279,6 +280,95 @@ test('grouping: output is sorted by start frame', () => {
     lines.map((l) => l.text),
     ['early', 'late'],
   );
+});
+
+// ---- Detection cleanup (Whisper junk tokens + echo repeats) --------------
+
+test('cleanup: a [_BEG_]-only segment produces no line at all', () => {
+  const lines = groupWhisperSegments(
+    [
+      // The screenshot's case: the begin marker as its own
+      // zero-length "line", plus a bare timestamp-token segment.
+      { text: '[_BEG_]', startSeconds: 103, endSeconds: 103, words: [w('[_BEG_]', 103, 103)] },
+      { text: '[_TT_500]', startSeconds: 104, endSeconds: 104, words: [] },
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 0);
+});
+
+test('cleanup: a bracket token glued to a word is stripped, the word stays', () => {
+  // The screenshot's other case: "me?[_TT_500]".
+  const lines = groupWhisperSegments(
+    [seg([['Hello,', 0, 0.5], ['see', 0.55, 0.9], ['me?[_TT_500]', 0.95, 1.5]])],
+    FPS,
+  );
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].text, 'Hello, see me?');
+  assert.equal(lines[0].words[2].text, 'me?');
+});
+
+test('cleanup: back-to-back identical lines collapse to the first (echo repeats)', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([['hello', 0, 0.4], ['world', 0.45, 0.9]]),
+      seg([['hello', 1.2, 1.6], ['world', 1.65, 2.1]]),
+      seg([['hello', 2.4, 2.8], ['world', 2.85, 3.3]]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].startFrame, 0); // the FIRST occurrence survives
+});
+
+test('cleanup: a repeat that returns later (a chorus) is kept', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([['hello', 0, 0.4], ['world', 0.45, 0.9]]),
+      seg([['something', 1.2, 1.7], ['else', 1.75, 2.1]]),
+      seg([['hello', 3.0, 3.4], ['world', 3.45, 3.9]]),
+    ],
+    FPS,
+  );
+  assert.deepEqual(
+    lines.map((l) => l.text),
+    ['hello world', 'something else', 'hello world'],
+  );
+});
+
+test('cleanup: cleanDetectedLyrics strips saved junk and collapses normalized duplicates', () => {
+  const line = (id, text, s, words) => ({
+    id,
+    text,
+    startFrame: s,
+    endFrame: s + 30,
+    ...(words ? { words } : {}),
+  });
+  const saved = [
+    line('a', '[_BEG_]', 0, [{ text: '[_BEG_]', startFrame: 0, endFrame: 0 }]),
+    line('b', 'me?[_TT_500]', 30, [{ text: 'me?[_TT_500]', startFrame: 30, endFrame: 60 }]),
+    line('c', 'Hello, World!', 60),
+    line('d', 'hello world', 90), // same line modulo case/punctuation, consecutive — drops
+    line('e', 'a different line', 120),
+    line('f', 'Hello, World!', 150), // chorus return — kept
+  ];
+  const cleaned = cleanDetectedLyrics(saved);
+  assert.deepEqual(
+    cleaned.map((l) => l.text),
+    ['me?', 'Hello, World!', 'a different line', 'Hello, World!'],
+  );
+  assert.equal(cleaned[0].words[0].text, 'me?');
+});
+
+test('cleanup: cleanDetectedLyrics is idempotent and leaves clean lines untouched', () => {
+  const saved = [
+    { id: 'a', text: 'clean line', startFrame: 0, endFrame: 30 },
+    { id: 'b', text: 'another one', startFrame: 30, endFrame: 60 },
+  ];
+  const once = cleanDetectedLyrics(saved);
+  assert.equal(once[0], saved[0]); // identity preserved — nothing needed changing
+  assert.equal(once[1], saved[1]);
+  assert.deepEqual(cleanDetectedLyrics(once), once);
 });
 
 // ---- Frame mapping ------------------------------------------------------

@@ -170,32 +170,48 @@ final class WhisperEngine {
   /// editor pins lines to.
   private static func readSegments(ctx: OpaquePointer) -> [WhisperSegment] {
     var segments: [WhisperSegment] = []
+    // Every special token in the vocab — control markers
+    // (<|endoftext|>, <|startoftranscript|>, languages, …), the
+    // [_BEG_] begin marker and the [_TT_n] timestamp family — has an
+    // id at or above EOT; every real lyric token sits below it. The
+    // id check is therefore the authoritative special-token filter.
+    let eotToken = whisper_token_eot(ctx)
     let segmentCount = whisper_full_n_segments(ctx)
     for index in 0..<segmentCount {
-      let segmentText = String(cString: whisper_full_get_segment_text(ctx, index))
-        .trimmingCharacters(in: .whitespacesAndNewlines)
       let segmentStart = Double(whisper_full_get_segment_t0(ctx, index)) / 100
       let segmentEnd = Double(whisper_full_get_segment_t1(ctx, index)) / 100
 
       var tokens: [(text: String, start: Double, end: Double)] = []
+      // The segment's text is REBUILT from kept tokens only:
+      // whisper_full_get_segment_text can carry bracket tokens
+      // (a segment whose text read "me?[_TT_500]" shipped exactly
+      // that into the lyrics), so it is never used directly.
+      var keptText = ""
       let tokenCount = whisper_full_n_tokens(ctx, index)
       for tokenIndex in 0..<tokenCount {
+        let tokenId = whisper_full_get_token_id(ctx, index, tokenIndex)
         let text = String(cString: whisper_full_get_token_text(ctx, index, tokenIndex))
-        // Special tokens (<|startoftranscript|>, timestamps, …) are
-        // not words and never reach the lyrics.
-        if text.hasPrefix("<|") {
+        // Special tokens are not words and never reach the lyrics.
+        // Belt and braces, any one of these excludes the token:
+        // - id >= EOT (the vocab-level check above),
+        // - the "[_" text prefix (the [_BEG_] / [_TT_n] family,
+        //   caught even if a future vocab renumbers them),
+        // - the legacy "<|" prefix for the <|…|> marker family.
+        if tokenId >= eotToken || text.hasPrefix("[_") || text.hasPrefix("<|") {
           continue
         }
         let data = whisper_full_get_token_data(ctx, index, tokenIndex)
         let start = Double(data.t_dtw >= 0 ? data.t_dtw : data.t0) / 100
         let end = Double(data.t1) / 100
         tokens.append((text: text, start: start, end: end))
+        keptText += text
       }
 
       let words = assembleWords(tokens: tokens)
-      let text = segmentText.isEmpty
+      let rebuiltText = keptText.trimmingCharacters(in: .whitespacesAndNewlines)
+      let text = rebuiltText.isEmpty
         ? words.map(\.text).joined(separator: " ")
-        : segmentText
+        : rebuiltText
       if text.isEmpty && words.isEmpty {
         continue
       }
