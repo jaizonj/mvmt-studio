@@ -72,7 +72,24 @@
         }
       ],
       "expo-sharing",
-      "expo-image"
+      "expo-image",
+      [
+        "expo-font",
+        {
+          "fonts": [
+            "./assets/fonts/Anton-Regular.ttf",
+            "./assets/fonts/BebasNeue-Regular.ttf",
+            "./assets/fonts/Oswald-SemiBold.ttf",
+            "./assets/fonts/Montserrat-ExtraBold.ttf",
+            "./assets/fonts/ArchivoBlack-Regular.ttf",
+            "./assets/fonts/Bangers-Regular.ttf",
+            "./assets/fonts/LuckiestGuy-Regular.ttf",
+            "./assets/fonts/Pacifico-Regular.ttf",
+            "./assets/fonts/DancingScript-Bold.ttf",
+            "./assets/fonts/PermanentMarker-Regular.ttf"
+          ]
+        }
+      ]
     ],
     "scheme": "mvmtstudio",
     "slug": "mvmt-studio",

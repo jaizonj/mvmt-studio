@@ -69,6 +69,130 @@ struct CompositeRequestRecord: Record {
   /// without the watermark rather than failing the render.
   @Field
   var watermarkImageUri: String? = nil
+
+  /// Timed lyrics to burn into EXPORT renders: line/word timings in
+  /// composition seconds plus a fully-resolved style. The JS side
+  /// maps its font/animation presets onto these primitives, so the
+  /// engine stays catalog-free. Export-only, like the watermark —
+  /// previews never carry the animation tool, so the field is inert
+  /// there (the JS overlay shows the lyrics instead). Any lyric
+  /// problem degrades to rendering without lyrics, never a failure.
+  @Field
+  var lyrics: LyricsRecord? = nil
+}
+
+struct LyricWordRecord: Record {
+  @Field
+  var text: String
+
+  @Field
+  var startSeconds: Double
+
+  @Field
+  var endSeconds: Double
+}
+
+struct LyricLineRecord: Record {
+  @Field
+  var text: String
+
+  /// Composition seconds.
+  @Field
+  var startSeconds: Double
+
+  /// Composition seconds.
+  @Field
+  var endSeconds: Double
+
+  /// Per-word timings for the word-level animation modes
+  /// ('stagger' / 'karaoke' / 'typewriter'). Nil/empty = the line
+  /// renders and animates as a whole.
+  @Field
+  var words: [LyricWordRecord]? = nil
+}
+
+struct LyricAnimationRecord: Record {
+  @Field
+  var enterSecs: Double = 0
+
+  @Field
+  var exitSecs: Double = 0
+
+  /// Opacity the enter starts from / the exit ends at (0...1).
+  @Field
+  var fromOpacity: Double = 0
+
+  /// Enter start offset, as a fraction of the line's height.
+  @Field
+  var fromYOffsetFrac: Double = 0
+
+  /// Enter start offset, as a fraction of the line's width
+  /// (horizontal slide presets; the JS catalog resolves it and the
+  /// preview overlay applies the same fraction of the same width).
+  @Field
+  var fromXOffsetFrac: Double = 0
+
+  @Field
+  var fromScale: Double = 1
+
+  @Field
+  var fromRotateDeg: Double = 0
+
+  /// 'none' | 'stagger' | 'karaoke' | 'typewriter'
+  @Field
+  var wordMode: String = "none"
+
+  @Field
+  var wordStaggerSecs: Double = 0.05
+
+  /// Mid-line scale pulse target; <= 1 = no pulse.
+  @Field
+  var emphasisScale: Double = 1
+}
+
+struct LyricStyleRecord: Record {
+  /// PostScript name of the font to render with.
+  @Field
+  var postScriptName: String
+
+  /// Font size as a fraction of the canvas WIDTH.
+  @Field
+  var sizeRatio: Double
+
+  @Field
+  var colorHex: String
+
+  @Field
+  var strokeColorHex: String? = nil
+
+  /// Stroke thickness as a fraction of the font size.
+  @Field
+  var strokeWidthRatio: Double? = nil
+
+  /// 'none' | 'pill'
+  @Field
+  var background: String = "none"
+
+  @Field
+  var backgroundColorHex: String? = nil
+
+  /// 'top' | 'center' | 'bottom'
+  @Field
+  var position: String = "bottom"
+
+  @Field
+  var bold: Bool = false
+
+  @Field
+  var animation: LyricAnimationRecord
+}
+
+struct LyricsRecord: Record {
+  @Field
+  var lines: [LyricLineRecord]
+
+  @Field
+  var style: LyricStyleRecord
 }
 
 struct CompositeResultRecord: Record {
@@ -289,7 +413,8 @@ private struct BuiltComposition {
 // ONE builder — buildComposition — powers BOTH export (render) and
 // native preview (PreviewStore.create), so what you preview is what
 // renders. Nothing else in the app builds compositions. ONE carve-out:
-// the watermark animation tool is attached for EXPORT builds only
+// the CoreAnimation tool (watermark + burned-in lyrics) is attached
+// for EXPORT builds only
 // (the forExport flag) — assigning a videoComposition that carries an
 // animation tool to a preview player item throws on device
 // (crash log MVMTStudio-2026-11-09-220942); the app overlays the logo
@@ -526,12 +651,13 @@ private enum MvmtCompositorEngine {
     // overlays the logo in previews at the JS layer instead, so the
     // request's watermark fields have no effect on a preview build.
     // A missing/unloadable image degrades to no watermark: a render
-    // must never fail over branding.
+    // must never fail over branding. Timed lyrics (request.lyrics)
+    // burn in through the SAME tool's layer tree — created for the
+    // lyrics alone when the watermark is off — and degrade the same
+    // way: any lyric problem renders without them.
     if forExport,
-      request.watermarkEnabled == true,
-      let watermarkUri = request.watermarkImageUri, !watermarkUri.isEmpty,
-      let tool = makeWatermarkAnimationTool(
-        imageURL: resolveURL(watermarkUri),
+      let tool = makeAnimationTool(
+        request: request,
         renderSize: canvasSize,
         durationSeconds: CMTimeGetSeconds(totalDuration)
       )
@@ -547,25 +673,20 @@ private enum MvmtCompositorEngine {
     )
   }
 
-  /// Builds the watermark CoreAnimation tool: a parent layer holding
-  /// the full-frame video layer plus the logo layer above it. The
-  /// logo (27% of the render width, aspect preserved, 85% opacity)
-  /// starts in the TOP-LEFT corner and flips to the BOTTOM-RIGHT
-  /// every 5 seconds for the whole composition — discrete keyframes,
-  /// so it teleports rather than sliding. CALayer coordinates are
-  /// bottom-left origin, so "top-left" means y near the frame's top.
-  /// Returns nil when the image cannot be loaded or the geometry is
-  /// unusable — callers treat nil as "render without a watermark".
-  private static func makeWatermarkAnimationTool(
-    imageURL: URL,
+  /// Builds the export CoreAnimation tool when the request carries
+  /// a watermark and/or lyrics: a parent layer holding the full-frame
+  /// video layer, the watermark layer (when enabled and its image
+  /// loads) and one layer subtree per lyric line. Returns nil when
+  /// neither produced anything — the composition then renders bare,
+  /// exactly as a request without overlays always has.
+  private static func makeAnimationTool(
+    request: CompositeRequestRecord,
     renderSize: CGSize,
     durationSeconds: Double
   ) -> AVVideoCompositionCoreAnimationTool? {
     guard
       renderSize.width > 0, renderSize.height > 0,
-      durationSeconds.isFinite, durationSeconds > 0,
-      let image = UIImage(contentsOfFile: imageURL.path),
-      let cgImage = image.cgImage, cgImage.width > 0, cgImage.height > 0
+      durationSeconds.isFinite, durationSeconds > 0
     else {
       return nil
     }
@@ -575,6 +696,58 @@ private enum MvmtCompositorEngine {
     let videoLayer = CALayer()
     videoLayer.frame = parentLayer.bounds
     parentLayer.addSublayer(videoLayer)
+
+    var hasOverlay = false
+    if request.watermarkEnabled == true,
+      let watermarkUri = request.watermarkImageUri, !watermarkUri.isEmpty,
+      addWatermarkLayer(
+        to: parentLayer,
+        imageURL: resolveURL(watermarkUri),
+        renderSize: renderSize,
+        durationSeconds: durationSeconds
+      )
+    {
+      hasOverlay = true
+    }
+
+    if let lyrics = request.lyrics, !lyrics.lines.isEmpty,
+      addLyricLayers(
+        to: parentLayer,
+        lyrics: lyrics,
+        renderSize: renderSize,
+        durationSeconds: durationSeconds
+      )
+    {
+      hasOverlay = true
+    }
+
+    guard hasOverlay else { return nil }
+    return AVVideoCompositionCoreAnimationTool(
+      postProcessingAsVideoLayer: videoLayer,
+      in: parentLayer
+    )
+  }
+
+  /// Adds the watermark layer to the tool's parent layer: the logo
+  /// lockup (27% of the render width, aspect preserved, 85% opacity)
+  /// starts in the TOP-LEFT corner and flips to the BOTTOM-RIGHT
+  /// every 5 seconds for the whole composition — discrete keyframes,
+  /// so it teleports rather than sliding. CALayer coordinates are
+  /// bottom-left origin, so "top-left" means y near the frame's top.
+  /// Returns false when the image cannot be loaded — callers treat
+  /// that as "render without a watermark".
+  private static func addWatermarkLayer(
+    to parentLayer: CALayer,
+    imageURL: URL,
+    renderSize: CGSize,
+    durationSeconds: Double
+  ) -> Bool {
+    guard
+      let image = UIImage(contentsOfFile: imageURL.path),
+      let cgImage = image.cgImage, cgImage.width > 0, cgImage.height > 0
+    else {
+      return false
+    }
 
     let watermarkWidth = renderSize.width * 0.27
     let watermarkHeight = watermarkWidth * CGFloat(cgImage.height) / CGFloat(cgImage.width)
@@ -617,11 +790,761 @@ private enum MvmtCompositorEngine {
       watermarkLayer.add(flip, forKey: "cornerFlip")
     }
     parentLayer.addSublayer(watermarkLayer)
+    return true
+  }
 
-    return AVVideoCompositionCoreAnimationTool(
-      postProcessingAsVideoLayer: videoLayer,
-      in: parentLayer
+  // MARK: Lyrics burn-in (export only)
+  //
+  // The JS side resolves its font/animation presets into the plain
+  // parameter model on LyricsRecord (see the records at the top of
+  // this file) — this section is ONE generic applier, no catalogs.
+  // Text is rendered ONCE per line (or per word) into an image with
+  // NSAttributedString — which supports stroke + fill in a single
+  // pass, unlike CATextLayer — and shown through image-backed
+  // CALayers; every animation the parameter model needs (opacity,
+  // offset, scale, rotation) is a LAYER animation, so the image
+  // backing costs nothing. Layer hierarchy per line:
+  //
+  //   gate layer   — discrete opacity keyframes spanning the WHOLE
+  //                  composition: 0 outside [start, end], 1 inside.
+  //                  This is the visibility guarantee: whatever the
+  //                  enter/exit animations hold outside their own
+  //                  window, the line can never linger or pre-show.
+  //   inner layer  — the line's enter/exit/emphasis keyframes (the
+  //                  enter is skipped for the per-word modes that
+  //                  animate their own entrances).
+  //   pill layer (optional) + text/word image layers, inside inner.
+  //
+  // All times are composition seconds; animation beginTimes follow
+  // the watermark convention (AVCoreAnimationBeginTimeAtZero + t).
+  // Robustness: every value arriving from JS is sanitised (NaN /
+  // out-of-range input becomes a safe default), every render step
+  // is optional, and any failure drops that line — lyrics must
+  // never fail an export.
+
+  /// NaN/inf-safe Double: lyric parameters cross the JS bridge and
+  /// feed CAKeyframeAnimation keyTimes, which RAISE on invalid
+  /// values — sanitise everything at the boundary.
+  private static func lyricFinite(_ value: Double, _ fallback: Double) -> Double {
+    value.isFinite ? value : fallback
+  }
+
+  private static func lyricClamp(_ value: Double, _ lower: Double, _ upper: Double) -> Double {
+    min(max(value, lower), upper)
+  }
+
+  /// Parses "#RRGGBB" / "#RRGGBBAA" (the '#' is optional). Nil when
+  /// unparseable — callers substitute their own default.
+  private static func lyricColor(_ hex: String?) -> UIColor? {
+    guard var text = hex?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+      return nil
+    }
+    if text.hasPrefix("#") {
+      text.removeFirst()
+    }
+    guard text.count == 6 || text.count == 8, let value = UInt64(text, radix: 16) else {
+      return nil
+    }
+    let red: Double
+    let green: Double
+    let blue: Double
+    let alpha: Double
+    if text.count == 6 {
+      red = Double((value >> 16) & 0xFF) / 255
+      green = Double((value >> 8) & 0xFF) / 255
+      blue = Double(value & 0xFF) / 255
+      alpha = 1
+    } else {
+      red = Double((value >> 24) & 0xFF) / 255
+      green = Double((value >> 16) & 0xFF) / 255
+      blue = Double((value >> 8) & 0xFF) / 255
+      alpha = Double(value & 0xFF) / 255
+    }
+    return UIColor(red: CGFloat(red), green: CGFloat(green), blue: CGFloat(blue), alpha: CGFloat(alpha))
+  }
+
+  /// CAKeyframeAnimation raises an NSException on non-monotonic
+  /// keyTimes (this module's crash species) — sanitise a stop list
+  /// into fractions that start at 0, end at 1 and strictly increase,
+  /// or return nil when that is impossible. A stop whose fraction
+  /// collides with its predecessor is nudged 0.0005 later; a stop
+  /// that cannot fit before 1.0 is dropped (its neighbours still
+  /// describe a valid animation).
+  private static func lyricSanitizedStops<T>(_ stops: [(Double, T)]) -> [(Double, T)]? {
+    guard stops.count >= 2 else { return nil }
+    var out: [(Double, T)] = []
+    for (rawFraction, value) in stops {
+      var fraction = rawFraction.isFinite ? min(max(rawFraction, 0), 1) : 0
+      if let last = out.last {
+        if fraction <= last.0 {
+          fraction = last.0 + 0.0005
+        }
+        if fraction > 1 {
+          continue
+        }
+      }
+      out.append((fraction, value))
+    }
+    guard out.count >= 2, let first = out.first, first.0 == 0 else { return nil }
+    if let last = out.last, last.0 < 1 {
+      out.append((1, last.1))
+    }
+    for index in 1..<out.count where out[index].0 <= out[index - 1].0 {
+      return nil
+    }
+    return out
+  }
+
+  /// Resolves the style's font at a point size. Unknown PostScript
+  /// names fall back to the system font. Bold handling is
+  /// deterministic: when the named font's own face is not bold, its
+  /// descriptor is asked for the bold trait (CoreText picks the
+  /// family's bold face, or synthesises weight at render); if the
+  /// result STILL is not a bold face, lyricTextImage lays a hair of
+  /// same-colour stroke as a weight approximation, so `bold` always
+  /// has a visible effect.
+  private static func lyricFont(postScriptName: String, size: CGFloat, bold: Bool) -> UIFont {
+    guard let named = UIFont(name: postScriptName, size: size) else {
+      return UIFont.systemFont(ofSize: size, weight: bold ? .bold : .regular)
+    }
+    guard bold, !named.fontDescriptor.symbolicTraits.contains(.traitBold) else {
+      return named
+    }
+    let traits = named.fontDescriptor.symbolicTraits.union(.traitBold)
+    if let boldDescriptor = named.fontDescriptor.withSymbolicTraits(traits) {
+      return UIFont(descriptor: boldDescriptor, size: size)
+    }
+    return named
+  }
+
+  /// Renders one string (a whole line, or a single word) into an
+  /// image with the font/fill/stroke baked in, at `scale`× its
+  /// display size. Returns the image and the DISPLAY size (canvas
+  /// points). Nil when the string measures empty or the bitmap
+  /// cannot be made — callers drop that piece.
+  private static func lyricTextImage(
+    _ text: String,
+    font: UIFont,
+    fillColor: UIColor,
+    strokeColor: UIColor?,
+    strokeFractionOfFont: Double,
+    boldStrokeFallback: Bool,
+    pad: CGFloat,
+    scale: CGFloat
+  ) -> (image: CGImage, displaySize: CGSize)? {
+    var strokeFraction = max(0, strokeFractionOfFont)
+    var effectiveStrokeColor = strokeColor
+    if boldStrokeFallback {
+      if effectiveStrokeColor == nil {
+        effectiveStrokeColor = fillColor
+      }
+      if strokeFraction <= 0 {
+        strokeFraction = 0.03
+      }
+    }
+
+    var attributes: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .foregroundColor: fillColor,
+    ]
+    if let stroke = effectiveStrokeColor, strokeFraction > 0 {
+      attributes[.strokeColor] = stroke
+      // NSAttributedString stroke width is a PERCENT of the font
+      // size; negative draws stroke AND fill (positive = hollow).
+      attributes[.strokeWidth] = NSNumber(value: -strokeFraction * 100)
+    }
+    let attributed = NSAttributedString(string: text, attributes: attributes)
+    let textSize = attributed.size()
+    guard textSize.width > 0, textSize.height > 0 else { return nil }
+
+    // `pad` (caller-supplied) leaves room for the stroke's
+    // overhang around the measured text.
+    let displaySize = CGSize(width: textSize.width + pad * 2, height: textSize.height + pad * 2)
+    // Bitmap guard: never attempt an absurd allocation.
+    guard displaySize.width * scale <= 8192, displaySize.height * scale <= 8192 else { return nil }
+
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = scale
+    format.opaque = false
+    let renderer = UIGraphicsImageRenderer(size: displaySize, format: format)
+    let image = renderer.image { _ in
+      attributed.draw(at: CGPoint(x: pad, y: pad))
+    }
+    guard let cgImage = image.cgImage else { return nil }
+    return (cgImage, displaySize)
+  }
+
+  /// Bitmap scale for lyric text images: 2× the display size for
+  /// crispness, capped so the bitmap never exceeds the canvas' own
+  /// pixel size.
+  private static func lyricRenderScale(displaySize: CGSize, renderSize: CGSize) -> CGFloat {
+    var scale: CGFloat = 2
+    if displaySize.width > 0 {
+      scale = min(scale, renderSize.width / displaySize.width)
+    }
+    if displaySize.height > 0 {
+      scale = min(scale, renderSize.height / displaySize.height)
+    }
+    return max(scale, 1)
+  }
+
+  /// The enter "from" transform shared by the line and word
+  /// appliers: x/y offsets (fractions × line width/height, CALayer
+  /// y-up), then rotation, then scale.
+  private static func lyricFromTransform(
+    _ animation: LyricAnimationRecord,
+    lineHeight: CGFloat,
+    lineWidth: CGFloat
+  ) -> CATransform3D {
+    let scale = CGFloat(lyricClamp(lyricFinite(animation.fromScale, 1), 0.05, 20))
+    let yOffset = CGFloat(lyricFinite(animation.fromYOffsetFrac, 0)) * lineHeight
+    let xOffset = CGFloat(lyricFinite(animation.fromXOffsetFrac, 0)) * lineWidth
+    let rotation = CGFloat(lyricFinite(animation.fromRotateDeg, 0)) * .pi / 180
+    return CATransform3DConcat(
+      CATransform3DMakeTranslation(xOffset, yOffset, 0),
+      CATransform3DConcat(
+        CATransform3DMakeRotation(rotation, 0, 0, 1),
+        CATransform3DMakeScale(scale, scale, 1)
+      )
     )
+  }
+
+  /// Per-segment timing for the line keyframes: easeOut for the
+  /// first (enter) segment, easeIn for the last (exit), easeInOut
+  /// between.
+  private static func lyricTimingFunctions(count: Int) -> [CAMediaTimingFunction] {
+    guard count >= 2 else { return [] }
+    return (0..<(count - 1)).map { index in
+      if index == 0 {
+        return CAMediaTimingFunction(name: .easeOut)
+      }
+      if index == count - 2 {
+        return CAMediaTimingFunction(name: .easeIn)
+      }
+      return CAMediaTimingFunction(name: .easeInEaseOut)
+    }
+  }
+
+  /// The visibility window: discrete opacity over the WHOLE
+  /// composition timeline — 0 before the line starts, 1 during,
+  /// 0 after it ends. Model opacity is 0, so even if this animation
+  /// cannot be built the line simply never appears.
+  private static func addLyricGateAnimation(
+    to layer: CALayer,
+    start: Double,
+    end: Double,
+    totalDuration: Double
+  ) {
+    var stops: [(Double, Double)] = [(0, start <= 0 ? 1 : 0)]
+    if start > 0 {
+      stops.append((start / totalDuration, 1))
+    }
+    if end < totalDuration {
+      stops.append((end / totalDuration, 0))
+    }
+    stops.append((1, stops.last?.1 ?? 0))
+    guard let clean = lyricSanitizedStops(stops) else { return }
+    let gate = CAKeyframeAnimation(keyPath: "opacity")
+    gate.values = clean.map { NSNumber(value: $0.1) }
+    gate.keyTimes = clean.map { NSNumber(value: $0.0) }
+    gate.duration = totalDuration
+    gate.beginTime = AVCoreAnimationBeginTimeAtZero
+    gate.calculationMode = .discrete
+    gate.fillMode = .both
+    gate.isRemovedOnCompletion = false
+    layer.add(gate, forKey: "lyricWindow")
+  }
+
+  /// Enter / exit / emphasis keyframes for one line, on its inner
+  /// layer. Enter: opacity fromOpacity→1, y-offset→0, scale→1,
+  /// rotation→0 over enterSecs (easeOut). Exit mirrors it over the
+  /// last exitSecs (easeIn), ending exactly at the line's end.
+  /// Emphasis (emphasisScale > 1) pulses the scale mid-line. When
+  /// applyEnter is false (the per-word modes animate their own
+  /// entrances) the line starts at its resting state and only the
+  /// exit + emphasis are applied.
+  private static func addLyricLineAnimations(
+    to layer: CALayer,
+    animation: LyricAnimationRecord,
+    applyEnter: Bool,
+    start: Double,
+    lineDuration: Double,
+    lineHeight: CGFloat,
+    lineWidth: CGFloat
+  ) {
+    let enter = max(0, lyricFinite(animation.enterSecs, 0))
+    let exit = max(0, lyricFinite(animation.exitSecs, 0))
+    let fromOpacity = lyricClamp(lyricFinite(animation.fromOpacity, 0), 0, 1)
+    let emphasisScale = CGFloat(lyricClamp(lyricFinite(animation.emphasisScale, 1), 1, 20))
+    let fromTransform = lyricFromTransform(animation, lineHeight: lineHeight, lineWidth: lineWidth)
+    let identity = CATransform3DIdentity
+
+    let enterFraction = enter > 0 ? min(enter / lineDuration, 1) : 0
+    let exitStartFraction = exit > 0 ? max(1 - exit / lineDuration, enterFraction) : 1
+
+    var opacityStops: [(Double, Double)] = []
+    var transformStops: [(Double, CATransform3D)] = []
+    if applyEnter, enter > 0 {
+      opacityStops.append((0, fromOpacity))
+      transformStops.append((0, fromTransform))
+      opacityStops.append((enterFraction, 1))
+      transformStops.append((enterFraction, identity))
+    } else {
+      opacityStops.append((0, 1))
+      transformStops.append((0, identity))
+    }
+
+    // Emphasis pulse, only when a hold region exists to pulse in:
+    // hold at rest, swell to emphasisScale at the line's midpoint,
+    // settle back — a pulse, not a slow zoom.
+    if emphasisScale > 1, exitStartFraction > enterFraction {
+      let span = exitStartFraction - enterFraction
+      let mid = (enterFraction + exitStartFraction) / 2
+      let halfWidth = max(0.02, min(0.08, span * 0.2))
+      let rise = mid - halfWidth
+      if rise > (transformStops.last?.0 ?? 0) {
+        opacityStops.append((rise, 1))
+        transformStops.append((rise, identity))
+      }
+      opacityStops.append((mid, 1))
+      transformStops.append((mid, CATransform3DMakeScale(emphasisScale, emphasisScale, 1)))
+      let back = min(exitStartFraction, mid + halfWidth)
+      if back > mid {
+        opacityStops.append((back, 1))
+        transformStops.append((back, identity))
+      }
+    }
+
+    if exitStartFraction < 1, let lastFraction = transformStops.last?.0, exitStartFraction > lastFraction {
+      opacityStops.append((exitStartFraction, 1))
+      transformStops.append((exitStartFraction, identity))
+    }
+    opacityStops.append((1, exit > 0 ? fromOpacity : 1))
+    transformStops.append((1, exit > 0 ? fromTransform : identity))
+
+    guard
+      let cleanOpacity = lyricSanitizedStops(opacityStops),
+      let cleanTransform = lyricSanitizedStops(transformStops),
+      cleanOpacity.count >= 2, cleanTransform.count >= 2
+    else { return }
+
+    let opacityAnimation = CAKeyframeAnimation(keyPath: "opacity")
+    opacityAnimation.values = cleanOpacity.map { NSNumber(value: $0.1) }
+    opacityAnimation.keyTimes = cleanOpacity.map { NSNumber(value: $0.0) }
+    opacityAnimation.duration = lineDuration
+    opacityAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    opacityAnimation.timingFunctions = lyricTimingFunctions(count: cleanOpacity.count)
+    opacityAnimation.fillMode = .both
+    opacityAnimation.isRemovedOnCompletion = false
+    layer.add(opacityAnimation, forKey: "lyricOpacity")
+
+    let transformAnimation = CAKeyframeAnimation(keyPath: "transform")
+    transformAnimation.values = cleanTransform.map { NSValue(caTransform3D: $0.1) }
+    transformAnimation.keyTimes = cleanTransform.map { NSNumber(value: $0.0) }
+    transformAnimation.duration = lineDuration
+    transformAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + start
+    transformAnimation.timingFunctions = lyricTimingFunctions(count: cleanTransform.count)
+    transformAnimation.fillMode = .both
+    transformAnimation.isRemovedOnCompletion = false
+    layer.add(transformAnimation, forKey: "lyricTransform")
+  }
+
+  /// Per-word entrance for the 'stagger' mode: the word runs the
+  /// line's enter animation (opacity + transform from the style's
+  /// from-values), beginning at its staggered start time.
+  private static func addLyricWordEnterAnimation(
+    to layer: CALayer,
+    animation: LyricAnimationRecord,
+    wordBegin: Double,
+    lineEnd: Double,
+    lineHeight: CGFloat,
+    lineWidth: CGFloat
+  ) {
+    let enter = max(0, lyricFinite(animation.enterSecs, 0))
+    let available = lineEnd - wordBegin
+    guard enter > 0, available > 0.02 else {
+      // No room (or no enter) — the word is simply present.
+      layer.opacity = 1
+      return
+    }
+    layer.opacity = 0
+    let duration = min(enter, available)
+    let fromOpacity = lyricClamp(lyricFinite(animation.fromOpacity, 0), 0, 1)
+
+    let opacityAnimation = CABasicAnimation(keyPath: "opacity")
+    opacityAnimation.fromValue = NSNumber(value: fromOpacity)
+    opacityAnimation.toValue = NSNumber(value: 1.0)
+    opacityAnimation.duration = duration
+    opacityAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + wordBegin
+    opacityAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    opacityAnimation.fillMode = .both
+    opacityAnimation.isRemovedOnCompletion = false
+    layer.add(opacityAnimation, forKey: "lyricWordOpacity")
+
+    let transformAnimation = CABasicAnimation(keyPath: "transform")
+    transformAnimation.fromValue = NSValue(caTransform3D: lyricFromTransform(animation, lineHeight: lineHeight, lineWidth: lineWidth))
+    transformAnimation.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+    transformAnimation.duration = duration
+    transformAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + wordBegin
+    transformAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    transformAnimation.fillMode = .both
+    transformAnimation.isRemovedOnCompletion = false
+    layer.add(transformAnimation, forKey: "lyricWordTransform")
+  }
+
+  /// Discrete appearance at a word's start — 'typewriter' words and
+  /// karaoke highlights: opacity 0 until the word begins, 1 after.
+  private static func addLyricWordPopAnimation(
+    to layer: CALayer,
+    wordStart: Double,
+    lineStart: Double,
+    lineDuration: Double
+  ) {
+    let fraction = lineDuration > 0
+      ? lyricClamp((wordStart - lineStart) / lineDuration, 0, 1)
+      : 0
+    guard fraction > 0.0005 else {
+      layer.opacity = 1
+      return
+    }
+    guard fraction < 0.9995 else {
+      // Starts at the line's very end — never visibly appears, and
+      // a keyTime duplicated at 1.0 is not worth the risk.
+      layer.opacity = 0
+      return
+    }
+    layer.opacity = 0
+    let pop = CAKeyframeAnimation(keyPath: "opacity")
+    pop.values = [NSNumber(value: 0), NSNumber(value: 1), NSNumber(value: 1)]
+    pop.keyTimes = [NSNumber(value: 0), NSNumber(value: fraction), NSNumber(value: 1)]
+    pop.duration = lineDuration
+    pop.beginTime = AVCoreAnimationBeginTimeAtZero + lineStart
+    pop.calculationMode = .discrete
+    pop.fillMode = .both
+    pop.isRemovedOnCompletion = false
+    layer.add(pop, forKey: "lyricWordPop")
+  }
+
+  /// Builds every lyric line's layer subtree. Returns true when at
+  /// least one line was added.
+  private static func addLyricLayers(
+    to parentLayer: CALayer,
+    lyrics: LyricsRecord,
+    renderSize: CGSize,
+    durationSeconds: Double
+  ) -> Bool {
+    let style = lyrics.style
+    let fillColor = lyricColor(style.colorHex) ?? .white
+    let strokeColor = lyricColor(style.strokeColorHex)
+    let strokeFraction = max(0, lyricFinite(style.strokeWidthRatio ?? 0, 0))
+    // Font size = sizeRatio × canvas width (contract), clamped.
+    let sizeRatio = lyricClamp(lyricFinite(style.sizeRatio, 0.045), 0.005, 0.5)
+    let baseFontSize = CGFloat(sizeRatio) * renderSize.width
+    guard baseFontSize >= 4 else { return false }
+
+    var added = false
+    for line in lyrics.lines {
+      if let lineLayer = makeLyricLineLayer(
+        line: line,
+        style: style,
+        fillColor: fillColor,
+        strokeColor: strokeColor,
+        strokeFraction: strokeFraction,
+        baseFontSize: baseFontSize,
+        renderSize: renderSize,
+        durationSeconds: durationSeconds
+      ) {
+        parentLayer.addSublayer(lineLayer)
+        added = true
+      }
+    }
+    return added
+  }
+
+  /// Builds one line's gate-layer subtree (see the section header
+  /// for the hierarchy), or nil when the line cannot be rendered.
+  private static func makeLyricLineLayer(
+    line: LyricLineRecord,
+    style: LyricStyleRecord,
+    fillColor: UIColor,
+    strokeColor: UIColor?,
+    strokeFraction: Double,
+    baseFontSize: CGFloat,
+    renderSize: CGSize,
+    durationSeconds: Double
+  ) -> CALayer? {
+    let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return nil }
+
+    // The line's window on the composition timeline, sanitised.
+    let start = lyricClamp(lyricFinite(line.startSeconds, 0), 0, durationSeconds)
+    let end = max(lyricFinite(line.endSeconds, 0), start + 0.05)
+    let lineDuration = end - start
+
+    let animation = style.animation
+    let wordMode = ["stagger", "karaoke", "typewriter"].contains(animation.wordMode)
+      ? animation.wordMode
+      : "none"
+
+    // Font, shrunk to fit 92% of the canvas width.
+    let maxTextWidth = renderSize.width * 0.92
+    var font = lyricFont(postScriptName: style.postScriptName, size: baseFontSize, bold: style.bold)
+    let initialMeasure: [NSAttributedString.Key: Any] = [.font: font]
+    let measured = NSAttributedString(string: text, attributes: initialMeasure).size()
+    guard measured.width > 0, measured.height > 0 else { return nil }
+    if measured.width > maxTextWidth {
+      let scaledSize = baseFontSize * (maxTextWidth / measured.width)
+      font = lyricFont(postScriptName: style.postScriptName, size: scaledSize, bold: style.bold)
+    }
+    let boldFallback = style.bold && !font.fontDescriptor.symbolicTraits.contains(.traitBold)
+    let measureAttributes: [NSAttributedString.Key: Any] = [.font: font]
+
+    // Word timings for the word modes. A word whose own window is
+    // unusable (missing / zero-length) gets an even slice of the
+    // line instead.
+    var words: [(text: String, start: Double, end: Double)] = []
+    if wordMode != "none", let rawWords = line.words {
+      let usable = rawWords.filter {
+        !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      }
+      if !usable.isEmpty {
+        let slot = lineDuration / Double(usable.count)
+        words = usable.enumerated().map { index, word in
+          let wordStart = lyricFinite(word.startSeconds, 0)
+          let wordEnd = lyricFinite(word.endSeconds, 0)
+          if wordEnd > wordStart {
+            return (text: word.text, start: wordStart, end: wordEnd)
+          }
+          return (
+            text: word.text,
+            start: start + slot * Double(index),
+            end: start + slot * Double(index + 1)
+          )
+        }
+      }
+    }
+    let useWords = !words.isEmpty
+
+    // Image padding around the measured text (room for the
+    // stroke's overhang): generous for a whole line, tighter per
+    // word — per-word pads ADD UP across a line, so word renders
+    // keep them small to stay near the shrink-to-fit width. (The
+    // bold-fallback stroke, 0.03 of the font size at most, needs
+    // 0.015 — covered by both floors.)
+    let linePad = font.pointSize * CGFloat(max(strokeFraction, 0.05)) + 2
+    let wordPad = font.pointSize * CGFloat(max(strokeFraction, 0.02)) + 1
+
+    // Bitmap scale from the estimated whole-line display size.
+    let estimatedSize = CGSize(
+      width: measured.width + linePad * 2,
+      height: measured.height + linePad * 2
+    )
+    let renderScale = lyricRenderScale(displaySize: estimatedSize, renderSize: renderSize)
+
+    // ---- Content: one image for the line, or one per word ----
+    var contentSize = CGSize.zero
+    var singleLayer: CALayer?
+    var wordEntries: [(
+      layer: CALayer, highlight: CALayer?, centerX: CGFloat, wordStart: Double, index: Int
+    )] = []
+
+    if useWords {
+      let spaceWidth = NSAttributedString(string: " ", attributes: measureAttributes).size().width
+      var cursorX: CGFloat = 0
+      var maxHeight: CGFloat = 0
+      for (index, word) in words.enumerated() {
+        let isKaraoke = wordMode == "karaoke"
+        // Karaoke colour-swap: unsung words render in the style
+        // colour at 45% opacity; the highlight twin renders at
+        // full strength and pops in at the word's start.
+        let baseFill = isKaraoke ? fillColor.withAlphaComponent(0.45) : fillColor
+        guard
+          let rendered = lyricTextImage(
+            word.text,
+            font: font,
+            fillColor: baseFill,
+            strokeColor: strokeColor,
+            strokeFractionOfFont: strokeFraction,
+            boldStrokeFallback: boldFallback,
+            pad: wordPad,
+            scale: renderScale
+          )
+        else { continue }
+
+        let wordLayer = CALayer()
+        wordLayer.contents = rendered.image
+        wordLayer.contentsScale = renderScale
+        wordLayer.contentsGravity = .resize
+        wordLayer.bounds = CGRect(origin: .zero, size: rendered.displaySize)
+
+        var highlightLayer: CALayer?
+        if isKaraoke,
+          let highlighted = lyricTextImage(
+            word.text,
+            font: font,
+            fillColor: fillColor,
+            strokeColor: strokeColor,
+            strokeFractionOfFont: strokeFraction,
+            boldStrokeFallback: boldFallback,
+            pad: wordPad,
+            scale: renderScale
+          )
+        {
+          let layer = CALayer()
+          layer.contents = highlighted.image
+          layer.contentsScale = renderScale
+          layer.contentsGravity = .resize
+          layer.bounds = CGRect(origin: .zero, size: highlighted.displaySize)
+          layer.opacity = 0
+          highlightLayer = layer
+        }
+
+        wordEntries.append((
+          layer: wordLayer,
+          highlight: highlightLayer,
+          centerX: cursorX + rendered.displaySize.width / 2,
+          wordStart: word.start,
+          index: index
+        ))
+        cursorX += rendered.displaySize.width + spaceWidth
+        maxHeight = max(maxHeight, rendered.displaySize.height)
+      }
+      guard !wordEntries.isEmpty else { return nil }
+      contentSize = CGSize(width: cursorX - spaceWidth, height: maxHeight)
+    } else {
+      guard
+        let rendered = lyricTextImage(
+          text,
+          font: font,
+          fillColor: fillColor,
+          strokeColor: strokeColor,
+          strokeFractionOfFont: strokeFraction,
+          boldStrokeFallback: boldFallback,
+          pad: linePad,
+          scale: renderScale
+        )
+      else { return nil }
+      let imageLayer = CALayer()
+      imageLayer.contents = rendered.image
+      imageLayer.contentsScale = renderScale
+      imageLayer.contentsGravity = .resize
+      imageLayer.bounds = CGRect(origin: .zero, size: rendered.displaySize)
+      singleLayer = imageLayer
+      contentSize = rendered.displaySize
+    }
+    guard contentSize.width > 0, contentSize.height > 0 else { return nil }
+
+    // ---- Container: the pill adds padding around the content ----
+    let wantsPill = style.background == "pill"
+    let pillPadX = wantsPill ? font.pointSize * 0.55 : 0
+    let pillPadY = wantsPill ? font.pointSize * 0.24 : 0
+    let containerSize = CGSize(
+      width: contentSize.width + pillPadX * 2,
+      height: contentSize.height + pillPadY * 2
+    )
+
+    // Anchor: centred horizontally; vertically per style.position
+    // with a 10%-of-height margin for top/bottom, clamped on-canvas.
+    // CALayer space is bottom-left origin, y up.
+    let centreX = renderSize.width / 2
+    let rawCentreY: CGFloat
+    switch style.position {
+    case "top":
+      rawCentreY = renderSize.height * 0.90 - containerSize.height / 2
+    case "center":
+      rawCentreY = renderSize.height / 2
+    default: // "bottom" and anything unrecognised
+      rawCentreY = renderSize.height * 0.10 + containerSize.height / 2
+    }
+    let centreY = min(
+      max(rawCentreY, containerSize.height / 2),
+      renderSize.height - containerSize.height / 2
+    )
+
+    let gateLayer = CALayer()
+    gateLayer.bounds = CGRect(origin: .zero, size: containerSize)
+    gateLayer.position = CGPoint(x: centreX, y: centreY)
+    gateLayer.opacity = 0
+    addLyricGateAnimation(to: gateLayer, start: start, end: end, totalDuration: durationSeconds)
+
+    let innerLayer = CALayer()
+    innerLayer.bounds = CGRect(origin: .zero, size: containerSize)
+    innerLayer.position = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    gateLayer.addSublayer(innerLayer)
+
+    if wantsPill {
+      let pillLayer = CALayer()
+      pillLayer.frame = CGRect(origin: .zero, size: containerSize)
+      let pillColor = lyricColor(style.backgroundColorHex) ?? UIColor.black.withAlphaComponent(0.55)
+      pillLayer.backgroundColor = pillColor.cgColor
+      pillLayer.cornerRadius = containerSize.height / 2
+      innerLayer.addSublayer(pillLayer)
+    }
+
+    // Content is centred in the container (pill padding is
+    // symmetric, so the content centre is the container centre).
+    let contentCentre = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    if let singleLayer {
+      singleLayer.position = contentCentre
+      innerLayer.addSublayer(singleLayer)
+    }
+    let contentOriginX = (containerSize.width - contentSize.width) / 2
+    for entry in wordEntries {
+      let position = CGPoint(
+        x: contentOriginX + entry.centerX,
+        y: contentCentre.y
+      )
+      entry.layer.position = position
+      innerLayer.addSublayer(entry.layer)
+      if let highlight = entry.highlight {
+        highlight.position = position
+        innerLayer.addSublayer(highlight)
+        addLyricWordPopAnimation(
+          to: highlight,
+          wordStart: entry.wordStart,
+          lineStart: start,
+          lineDuration: lineDuration
+        )
+      }
+      switch wordMode {
+      case "stagger":
+        let stagger = max(0, lyricFinite(animation.wordStaggerSecs, 0.05))
+        let wordBegin = min(max(start + Double(entry.index) * stagger, start), end - 0.05)
+        addLyricWordEnterAnimation(
+          to: entry.layer,
+          animation: animation,
+          wordBegin: wordBegin,
+          lineEnd: end,
+          lineHeight: contentSize.height,
+          lineWidth: contentSize.width
+        )
+      case "typewriter":
+        addLyricWordPopAnimation(
+          to: entry.layer,
+          wordStart: entry.wordStart,
+          lineStart: start,
+          lineDuration: lineDuration
+        )
+      default:
+        break // karaoke base words are present for the whole line
+      }
+    }
+
+    // Line enter/exit/emphasis on the inner layer. The per-word
+    // modes animate their own entrances (stagger / typewriter), so
+    // their inner layer carries only the exit + emphasis; 'none'
+    // and 'karaoke' lines enter as a whole.
+    addLyricLineAnimations(
+      to: innerLayer,
+      animation: animation,
+      applyEnter: !useWords || wordMode == "karaoke",
+      start: start,
+      lineDuration: lineDuration,
+      lineHeight: contentSize.height,
+      lineWidth: contentSize.width
+    )
+
+    return gateLayer
   }
 
   // MARK: Export

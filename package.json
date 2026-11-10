@@ -51,7 +51,8 @@
     "lint": "expo lint",
     "doctor": "expo-doctor",
     "test:shuffle": "tsc --ignoreConfig src/lib/shuffle.ts src/lib/analysis.ts --outDir tests/.build --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/shuffle.test.cjs",
-    "test:edl": "tsc --ignoreConfig src/lib/shuffleEdl.ts --outDir tests/.build-edl --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/edl.test.cjs"
+    "test:edl": "tsc --ignoreConfig src/lib/shuffleEdl.ts --outDir tests/.build-edl --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/edl.test.cjs",
+    "test:lyrics": "tsc --ignoreConfig src/lib/lyrics.ts --outDir tests/.build-lyrics --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/lyrics.test.cjs"
   },
   "private": true
 }

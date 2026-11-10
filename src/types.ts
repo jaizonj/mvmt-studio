@@ -156,6 +156,66 @@ export interface AudioRegion {
 }
 
 /**
+ * One word of a lyric line with its own timing (from Whisper). Frames
+ * are on the SONG timeline at the project fps (30), song-absolute —
+ * the same clock the EDL's `audio.regionStartFrame` lives on.
+ */
+export interface LyricWord {
+  text: string;
+  startFrame: number;
+  endFrame: number;
+}
+
+/**
+ * One lyric line, timed on the SONG timeline (NOT the composition
+ * timeline): `startFrame`/`endFrame` are song-absolute frames at the
+ * EDL fps. Because the master song plays continuously through every
+ * cut, pinning lines to the song clock means shuffle edits can never
+ * knock lyrics out of sync — the song↔timeline mapping happens once,
+ * at the native boundary (src/lib/lyrics.ts).
+ */
+export interface LyricLine {
+  id: string;
+  text: string;
+  startFrame: number;
+  endFrame: number;
+  /**
+   * Per-word timings from detection. Optional: manual lines and lines
+   * whose text was edited into a different word count carry none, and
+   * word-level animations fall back to line-level for them.
+   */
+  words?: LyricWord[];
+}
+
+/** How a project's lyrics are drawn — one style per project (v1). */
+export interface LyricStyle {
+  /** Font catalog id (src/lib/lyricFonts.ts). */
+  fontId: string;
+  /** Font size as a fraction of the canvas WIDTH (0.04–0.16). */
+  sizeRatio: number;
+  /** #RRGGBB text colour. */
+  color: string;
+  /** #RRGGBB outline colour; undefined = no outline. */
+  strokeColor?: string;
+  /** Outline width as a fraction of the font size (0–0.25). */
+  strokeWidthRatio?: number;
+  /** Backing plate behind the line. */
+  background: 'none' | 'pill';
+  /** #RRGGBB or rgba() pill colour; undefined = default dark pill. */
+  backgroundColor?: string;
+  position: 'top' | 'center' | 'bottom';
+  /** Animation preset id (src/lib/lyricAnimations.ts). */
+  animationId: string;
+  bold: boolean;
+}
+
+/** A project's detected/edited lyrics plus their style. */
+export interface ProjectLyrics {
+  lines: LyricLine[];
+  style: LyricStyle;
+}
+
+/**
  * A project — the unit the new IA is built around (Studio / Projects /
  * workspace). Everything creative lives here and is persisted as JSON;
  * media FILES live in the app sandbox and are referenced by URI.
@@ -182,6 +242,18 @@ export interface Project {
    * the effective value (`watermarkEnabled` in StudioContext).
    */
   watermarkEnabled?: boolean;
+  /**
+   * Lyrics for this project's song (Whisper-detected, then edited in
+   * the Editor's Lyrics panel). Timings are song-absolute frames —
+   * see LyricLine. Undefined = no lyrics yet.
+   */
+  lyrics?: ProjectLyrics;
+  /**
+   * Whether lyrics are drawn on preview/export. Undefined = ON when
+   * the project has lines, OFF when it has none (the store exposes
+   * the effective value, like `watermarkEnabled`).
+   */
+  lyricsEnabled?: boolean;
   /** When the project's video was last successfully rendered (Export stamps it). */
   exportedAt?: number;
 }

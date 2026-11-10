@@ -4,7 +4,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { LyricsOverlay } from '../../components/LyricsOverlay';
 import { NativePreview } from '../../components/NativePreview';
+import { useLyricFonts } from '../../components/useLyricFonts';
 import { WatermarkOverlay } from '../../components/WatermarkOverlay';
 import { SegmentedControl } from '../../components/SegmentedControl';
 import {
@@ -26,6 +28,7 @@ import {
   type AssetMeasure,
   type Edl,
 } from '../../lib/edl';
+import { buildCompositeLyrics } from '../../lib/lyrics';
 import { saveToPhotoLibrary, shareFile } from '../../lib/media';
 import { validateAgainstAssets } from '../../lib/shuffleEdl';
 import { resolveWatermarkUri } from '../../lib/watermark';
@@ -135,6 +138,19 @@ export default function ExportScreen() {
   const cut: ValidatedCut | null =
     nativeCut && nativeCut.sig === edlSig ? nativeCut : fallbackCut;
 
+  // Lyrics: the project's song-frame lines mapped to composition
+  // seconds against the cut's own region start — the payload rides
+  // on the ONE request below, so the render burns exactly what the
+  // stage preview draws through LyricsOverlay.
+  useLyricFonts();
+  const lyricsPayload = useMemo(
+    () =>
+      cut && studio.lyricsEnabled
+        ? buildCompositeLyrics(studio.lyrics, cut.edl.audio.regionStartFrame, cut.edl.fps)
+        : null,
+    [cut, studio.lyrics, studio.lyricsEnabled],
+  );
+
   // Watermark: the project's flag (toggled on the Edit screen) plus
   // the logo's resolved file URI (shared cache, src/lib/watermark.ts)
   // ride on the ONE request below — so the final preview shows the
@@ -171,11 +187,11 @@ export default function ExportScreen() {
       // The canvas override is applied HERE, on the single shared
       // request, so the preview the user approves is framed identically
       // to the file the exporter writes (see header note).
-      return { ...base, canvasWidth: canvas.width, canvasHeight: canvas.height };
+      return { ...base, canvasWidth: canvas.width, canvasHeight: canvas.height, lyrics: lyricsPayload };
     } catch {
       return null;
     }
-  }, [cut, takeUri, takes, exportQuality, watermarkEnabled, watermarkUri]);
+  }, [cut, takeUri, takes, exportQuality, watermarkEnabled, watermarkUri, lyricsPayload]);
 
   const requestKey = useMemo(() => (request ? JSON.stringify(request) : ''), [request]);
   const totalSeconds = cut ? edlDurationSeconds(cut.edl) : 0;
@@ -369,6 +385,7 @@ export default function ExportScreen() {
                 style={styles.stagePreview}
               />
               <WatermarkOverlay enabled={watermarkEnabled} width={stageWidth} />
+              <LyricsOverlay lyrics={lyricsPayload} positionSeconds={position} width={stageWidth} />
               {previewStatus === 'loading' ? (
                 <View style={styles.previewLoading} pointerEvents="none">
                   <ActivityIndicator color={colors.label} />

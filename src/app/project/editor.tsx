@@ -18,7 +18,10 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { LyricsOverlay } from '../../components/LyricsOverlay';
+import { LyricsPanel } from '../../components/LyricsPanel';
 import { NativePreview, type NativePreviewHandle } from '../../components/NativePreview';
+import { useLyricFonts } from '../../components/useLyricFonts';
 import { WatermarkOverlay } from '../../components/WatermarkOverlay';
 import { SegmentedControl } from '../../components/SegmentedControl';
 import {
@@ -44,6 +47,7 @@ import {
   type Edl,
   type EdlSegment,
 } from '../../lib/edl';
+import { buildCompositeLyrics } from '../../lib/lyrics';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import { buildEdlFromShuffle, validateAgainstAssets } from '../../lib/shuffleEdl';
 import { useStudio } from '../../store/StudioContext';
@@ -519,6 +523,25 @@ function EditorWorkspace() {
   // toggle never rebuilds the preview.
   const watermarkOn = studio.watermarkEnabled;
 
+  // Lyrics: bundled faces load for the panel's font chips and the
+  // overlay. The payload (composition seconds, resolved style) is
+  // built ONCE here from the project's song-frame lines — the SAME
+  // builder the Export screen feeds the native render. The native
+  // preview request itself deliberately carries NO lyrics (like the
+  // watermark): the preview draws them through LyricsOverlay, so
+  // lyric edits never rebuild the composition mid-edit.
+  useLyricFonts();
+  const regionStartFrame = edl
+    ? edl.audio.regionStartFrame
+    : secondsToFrames(regionStartSeconds, DEFAULT_FPS);
+  const lyricsPayload = useMemo(
+    () =>
+      studio.lyricsEnabled
+        ? buildCompositeLyrics(studio.lyrics, regionStartFrame, DEFAULT_FPS)
+        : null,
+    [studio.lyrics, studio.lyricsEnabled, regionStartFrame],
+  );
+
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
     try {
@@ -638,6 +661,7 @@ function EditorWorkspace() {
             />
             {sweepKey > 0 ? <SweepOverlay key={sweepKey} width={previewWidth} /> : null}
             <WatermarkOverlay enabled={watermarkOn} width={previewWidth} />
+            <LyricsOverlay lyrics={lyricsPayload} positionSeconds={positionSeconds} width={previewWidth} />
             {previewStatus === 'loading' ? (
               <View style={styles.previewOverlay} pointerEvents="none">
                 <ActivityIndicator color={colors.label} />
@@ -1041,6 +1065,21 @@ function EditorWorkspace() {
               </View>
             </View>
           </View>
+
+          {/* Lyrics — Whisper-detected lines on the song timeline,
+              edited line by line, styled CapCut-style. A creative
+              tool, so it lives here in Edit (not Settings). */}
+          <LyricsPanel
+            regionStartFrame={regionStartFrame}
+            positionSeconds={positionSeconds}
+            isPlaying={!paused}
+            onSeek={(seconds) => {
+              previewRef.current?.seek(seconds);
+              setPositionSeconds(seconds);
+            }}
+            onPlay={() => setPaused(false)}
+            onPause={() => setPaused(true)}
+          />
         </ScrollView>
       )}
     </View>

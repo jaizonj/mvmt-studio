@@ -29,6 +29,68 @@ export interface CompositeClipInput {
   volume: number;
 }
 
+/** One timed word inside a composite lyric line (composition seconds). */
+export interface CompositeLyricWord {
+  text: string;
+  startSeconds: number;
+  endSeconds: number;
+}
+
+/** One lyric line in COMPOSITION seconds (already song→timeline mapped). */
+export interface CompositeLyricLine {
+  text: string;
+  startSeconds: number;
+  endSeconds: number;
+  words?: CompositeLyricWord[];
+}
+
+/**
+ * The animation parameters a lyric style resolves to — the full
+ * parametric model from src/lib/lyricAnimations.ts, whose header is
+ * the shared renderer spec both the JS overlay and the native text
+ * renderer implement. The native side applies these generically; it
+ * has no preset catalog.
+ */
+export interface LyricAnimationParams {
+  enterSecs: number;
+  exitSecs: number;
+  fromOpacity: number;
+  fromXOffsetFrac: number;
+  fromYOffsetFrac: number;
+  fromScale: number;
+  fromRotateDeg: number;
+  wordMode: 'none' | 'stagger' | 'karaoke' | 'typewriter';
+  wordStaggerSecs: number;
+  emphasisScale: number;
+}
+
+/**
+ * A lyric style with every choice RESOLVED: the font is a PostScript
+ * name (the native renderer looks it up directly; bold already folded
+ * in when the family has a real bold face), and the animation is the
+ * parameter set above.
+ */
+export interface ResolvedLyricStyle {
+  fontPostScriptName: string;
+  /** Font size as a fraction of the canvas WIDTH. */
+  sizeRatio: number;
+  color: string;
+  strokeColor?: string;
+  /** Outline width as a fraction of the font size. */
+  strokeWidthRatio?: number;
+  background: 'none' | 'pill';
+  backgroundColor?: string;
+  position: 'top' | 'center' | 'bottom';
+  bold: boolean;
+  animation: LyricAnimationParams;
+}
+
+/** The lyrics payload of a composite request (composition seconds). */
+export interface CompositeLyrics {
+  lines: CompositeLyricLine[];
+  style: ResolvedLyricStyle;
+}
+
 export interface CompositeRequest {
   /** The timeline: clips are laid end-to-end in array order. */
   clips: CompositeClipInput[];
@@ -63,6 +125,15 @@ export interface CompositeRequest {
    * the video renders without a watermark rather than failing.
    */
   watermarkImageUri?: string | null;
+  /**
+   * Lyrics burned into the EXPORT render (timed text layers in the
+   * same animation tool as the watermark). Like the watermark, this
+   * is EXPORT-ONLY: preview compositions are built tool-free (a
+   * composition carrying the tool throws when assigned to a player
+   * item), and previews draw the identical payload through the JS
+   * LyricsOverlay instead. Null/absent = no lyrics.
+   */
+  lyrics?: CompositeLyrics | null;
 }
 
 export interface CompositeResult {

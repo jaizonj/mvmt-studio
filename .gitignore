@@ -43,3 +43,4 @@ tests/.build/
 
 dist/
 tests/.build-edl/
+tests/.build-lyrics/

@@ -1,0 +1,1 @@
+{"description":"MVMT Studio's on-device lyrics detection engine (iOS): whisper.cpp (small, multilingual) with DTW word-level timestamps. Detection only — no lyrics lookup.","license":"MIT","main":"src/index.ts","name":"mvmt-whisper","private":true,"types":"src/index.ts","version":"1.0.0"}

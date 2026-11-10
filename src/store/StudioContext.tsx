@@ -2,6 +2,7 @@ import type { CameraType, VideoQuality } from 'expo-camera';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import type { Edl } from '../lib/edl';
+import { retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { loadProjects, saveProjects } from '../lib/persistence';
 import type {
   AudioRegion,
@@ -10,8 +11,11 @@ import type {
   CountdownSeconds,
   ExportQualityPref,
   FrameRatePref,
+  LyricLine,
+  LyricStyle,
   MusicalSection,
   Project,
+  ProjectLyrics,
   ShuffleFrequency,
   Take,
 } from '../types';
@@ -109,6 +113,26 @@ interface StudioState {
    *  win; projects saved before the flag existed read as ON. */
   watermarkEnabled: boolean;
   setWatermarkEnabled: (enabled: boolean) => void;
+
+  /** The active project's lyrics (song-frame timed lines + style). */
+  lyrics: ProjectLyrics | null;
+  /** Effective lyrics visibility — stored value wins; unset reads as
+   *  ON when the project has lines, OFF when it has none. */
+  lyricsEnabled: boolean;
+  setLyricsEnabled: (enabled: boolean) => void;
+  /** Replace (or clear, with null) the project's whole lyrics object. */
+  setLyrics: (lyrics: ProjectLyrics | null) => void;
+  /**
+   * Patch one line. A `text` patch without a `words` patch runs the
+   * word-timing rule (src/lib/lyrics.ts): same word count keeps the
+   * timings word-for-word, a different count drops them.
+   */
+  updateLyricLine: (lineId: string, patch: Partial<LyricLine>) => void;
+  addLyricLine: (line: LyricLine) => void;
+  deleteLyricLine: (lineId: string) => void;
+  setLyricStyle: (patch: Partial<LyricStyle>) => void;
+  /** Shift every line (and its words) by a frame delta. */
+  shiftAllLyrics: (frames: number) => void;
 
   // ---- Global camera + settings preferences ----
   facing: CameraType;
@@ -302,6 +326,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         track: next,
         trackRegion: { startSeconds: 0, durationSeconds: null },
         lastShuffleSequence: null,
+        // Lyrics are timed against THIS song's clock — a new song
+        // invalidates them, so they clear with the track.
+        lyrics: undefined,
+        lyricsEnabled: undefined,
       });
       setTrackSections([]);
       },
@@ -344,6 +372,91 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const setWatermarkEnabled = useCallback(
     (enabled: boolean) => patchActiveProject({ watermarkEnabled: enabled }),
     [patchActiveProject],
+  );
+
+  // ---- Lyrics (song-frame timed; see src/lib/lyrics.ts) ----
+  const lyrics = activeProject?.lyrics ?? null;
+  const lyricsEnabled = activeProject?.lyricsEnabled ?? ((activeProject?.lyrics?.lines.length ?? 0) > 0);
+
+  const setLyricsEnabled = useCallback(
+    (enabled: boolean) => patchActiveProject({ lyricsEnabled: enabled }),
+    [patchActiveProject],
+  );
+
+  /** Patch the lyrics object, keeping lines sorted by start frame. */
+  const patchLyrics = useCallback(
+    (next: ProjectLyrics | null) => {
+      patchActiveProject({ lyrics: next ? { ...next, lines: sortLyricLines(next.lines) } : undefined });
+    },
+    [patchActiveProject],
+  );
+
+  const setLyrics = useCallback(
+    (next: ProjectLyrics | null) => patchLyrics(next),
+    [patchLyrics],
+  );
+
+  const updateLyricLine = useCallback(
+    (lineId: string, patch: Partial<LyricLine>) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      patchLyrics({
+        ...current,
+        lines: current.lines.map((line) => {
+          if (line.id !== lineId) return line;
+          const { text, words, ...rest } = patch;
+          let next: LyricLine = { ...line, ...rest };
+          if (text !== undefined) {
+            // A text patch WITH an explicit words patch applies both
+            // verbatim (split/merge build their words themselves);
+            // a text patch alone runs the redistribution rule (same
+            // word count keeps the timings, different count drops).
+            next = words !== undefined ? { ...next, text, words } : retimeLineWordsForText(next, text);
+          } else if (words !== undefined) {
+            next = { ...next, words };
+          }
+          // Frame sanity: a line always spans at least one frame.
+          return { ...next, endFrame: Math.max(next.endFrame, next.startFrame + 1) };
+        }),
+      });
+    },
+    [patchLyrics],
+  );
+
+  const addLyricLine = useCallback(
+    (line: LyricLine) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      patchLyrics({ ...current, lines: [...current.lines, line] });
+    },
+    [patchLyrics],
+  );
+
+  const deleteLyricLine = useCallback(
+    (lineId: string) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      patchLyrics({ ...current, lines: current.lines.filter((l) => l.id !== lineId) });
+    },
+    [patchLyrics],
+  );
+
+  const setLyricStyle = useCallback(
+    (patch: Partial<LyricStyle>) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      patchLyrics({ ...current, style: { ...current.style, ...patch } });
+    },
+    [patchLyrics],
+  );
+
+  const shiftAllLyrics = useCallback(
+    (frames: number) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current || frames === 0) return;
+      patchLyrics({ ...current, lines: shiftLyricLines(current.lines, frames) });
+    },
+    [patchLyrics],
   );
 
   const addTake = useCallback(
@@ -413,6 +526,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setShuffleFrequency,
       watermarkEnabled,
       setWatermarkEnabled,
+      lyrics,
+      lyricsEnabled,
+      setLyricsEnabled,
+      setLyrics,
+      updateLyricLine,
+      addLyricLine,
+      deleteLyricLine,
+      setLyricStyle,
+      shiftAllLyrics,
       resolution,
       setResolution,
       frameRate,
@@ -471,6 +593,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setShuffleFrequency,
       watermarkEnabled,
       setWatermarkEnabled,
+      lyrics,
+      lyricsEnabled,
+      setLyricsEnabled,
+      setLyrics,
+      updateLyricLine,
+      addLyricLine,
+      deleteLyricLine,
+      setLyricStyle,
+      shiftAllLyrics,
       resolution,
       frameRate,
       captureQuality,
