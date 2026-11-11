@@ -938,7 +938,18 @@ const styles = StyleSheet.create({
   sliderLabel: { ...typeScale.subhead, color: colors.label },
   sliderValue: { ...typeScale.caption, color: colors.labelSecondary, fontVariant: ['tabular-nums'] },
   chipScroll: { marginHorizontal: -spacing.xs },
-  chipRow: { flexDirection: 'row', gap: spacing.sm, paddingHorizontal: spacing.xs, paddingVertical: 2 },
+  // alignItems center: font families have wildly different intrinsic
+  // line heights (Zapfino, Party LET) — with the default stretch, one
+  // tall line box stretched EVERY chip and the labels sat at the top
+  // of oversized pills (Jaizon, 2026-11-10: "put the fonts in the
+  // middle"). Each chip now hugs its own label, centred both ways.
+  chipRow: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.xs,
+    paddingVertical: 2,
+    alignItems: 'center',
+  },
   fontChip: {
     backgroundColor: colors.card,
     borderWidth: 1,
@@ -946,6 +957,8 @@ const styles = StyleSheet.create({
     borderRadius: radius.pill,
     paddingHorizontal: 14,
     paddingVertical: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   chipCurrent: { borderColor: colors.accent, borderWidth: 2, backgroundColor: colors.accentDim },
   swatchRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
