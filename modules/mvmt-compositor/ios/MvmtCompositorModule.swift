@@ -198,7 +198,7 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
   /// The frames this compositor hands back (via the render
   /// context's buffer pool): BGRA with IOSurface backing, the
   /// shape CIContext renders into most cheaply.
-  var sourcePixelBufferAttributes: [String: Any] = [
+  var sourcePixelBufferAttributes: [String: Any]? = [
     kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
     kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
   ]
@@ -206,8 +206,10 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
   /// Source frames are accepted as BGRA only — AVFoundation
   /// converts the takes' native formats before handing them over,
   /// so CIImage(cvPixelBuffer:) always sees a layout it reads
-  /// directly.
-  var requiredSourcePixelBufferAttributes: [String: Any] = [
+  /// directly. (The protocol property's full name is
+  /// ...AttributesForRenderContext and both attribute properties
+  /// are Optional in the Swift overlay — CI 42939378886.)
+  var requiredSourcePixelBufferAttributesForRenderContext: [String: Any]? = [
     kCVPixelBufferPixelFormatTypeKey as String: [Int(kCVPixelFormatType_32BGRA)],
     kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
   ]
@@ -252,9 +254,16 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
       // shape is one full-frame layer at a time (sequential cuts),
       // but the loop is the general one.
       var composed = CIImage(color: .black).cropped(to: renderExtent)
-      let instruction = request.videoCompositionInstruction
+      // videoCompositionInstruction is typed as the protocol in
+      // current SDKs; layerInstructions lives on the concrete
+      // AVVideoCompositionInstruction class (CI 42939378886). A
+      // non-standard instruction type simply yields no layers —
+      // a black (or gap) frame, never a crash.
+      let layerInstructions =
+        (request.videoCompositionInstruction as? AVVideoCompositionInstruction)?
+        .layerInstructions ?? []
       let time = request.compositionTime
-      for layerInstruction in instruction.layerInstructions {
+      for layerInstruction in layerInstructions {
         guard
           let sourceBuffer = request.sourceFrame(byTrackID: layerInstruction.trackID)
         else { continue }
