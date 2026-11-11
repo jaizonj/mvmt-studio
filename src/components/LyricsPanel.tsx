@@ -431,8 +431,8 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                         accessibilityLabel="Lyric fine offset"
                       />
                       <Text style={styles.caption}>
-                        Drag to shift all lyrics earlier or later — for when they're off by a beat. Preview and
-                        export follow; your line timings stay untouched.
+                        Drag to shift all lyrics earlier or later — for when the lines are off by a beat. Preview
+                        and export follow; your line timings stay untouched.
                       </Text>
                     </View>
 

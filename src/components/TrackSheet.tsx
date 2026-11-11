@@ -14,7 +14,7 @@ interface TrackSheetProps {
 
 /** Track sheet: which song, and which part of it (the AudioRegionPicker). */
 export function TrackSheet({ visible, onClose, onPickTrack }: TrackSheetProps) {
-  const { track, songLibrary, useLibrarySong, deleteSongLibraryEntry } = useStudio();
+  const { track, songLibrary, applyLibrarySong, deleteSongLibraryEntry } = useStudio();
   return (
     <Sheet visible={visible} onClose={onClose} title="Track">
       {visible && track ? (
@@ -55,7 +55,7 @@ export function TrackSheet({ visible, onClose, onPickTrack }: TrackSheetProps) {
             <View key={entry.key} style={styles.libraryRow}>
               <Pressable
                 style={styles.libraryMain}
-                onPress={() => useLibrarySong(entry)}
+                onPress={() => applyLibrarySong(entry)}
                 accessibilityRole="button"
                 accessibilityLabel={`Use ${entry.name} with its saved lyrics`}>
                 <Ionicons name="library" size={17} color={colors.accent} />

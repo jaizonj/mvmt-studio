@@ -178,7 +178,7 @@ interface StudioState {
   /** The song library: songs with the lyrics fixed for them. */
   songLibrary: SongLibraryEntry[];
   /** Use a library song as the active project's track, lyrics included. */
-  useLibrarySong: (entry: SongLibraryEntry) => void;
+  applyLibrarySong: (entry: SongLibraryEntry) => void;
   /** Remove a song from the library. */
   deleteSongLibraryEntry: (key: string) => void;
 
@@ -469,10 +469,35 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchActiveProject],
   );
 
-  /** Patch the lyrics object, keeping lines sorted by start frame. */
+  /** Patch the lyrics object, keeping lines sorted by start frame.
+   * Every lyric change also refreshes the song-library entry for
+   * the active track, so the fixed lyrics follow the song into
+   * future projects (the library's whole point). Event-driven on
+   * purpose — no state is ever set from an effect for this. */
   const patchLyrics = useCallback(
     (next: ProjectLyrics | null) => {
-      patchActiveProject({ lyrics: next ? { ...next, lines: sortLyricLines(next.lines) } : undefined });
+      const sorted = next ? { ...next, lines: sortLyricLines(next.lines) } : null;
+      patchActiveProject({ lyrics: sorted ?? undefined });
+      const track = activeProjectRef.current?.track;
+      if (sorted && sorted.lines.length > 0 && track) {
+        setSongLibrary((current) => {
+          const existing = findSongLibraryEntry(current, track.name, track.durationSeconds);
+          if (
+            existing &&
+            existing.uri === track.uri &&
+            JSON.stringify(existing.lyrics) === JSON.stringify(sorted)
+          ) {
+            return current;
+          }
+          return upsertSongLibraryEntry(current, {
+            name: track.name,
+            uri: track.uri,
+            durationSeconds: track.durationSeconds,
+            lyrics: sorted,
+            now: Date.now(),
+          });
+        });
+      }
     },
     [patchActiveProject],
   );
@@ -576,7 +601,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchLyrics],
   );
 
-  const useLibrarySong = useCallback(
+  const applyLibrarySong = useCallback(
     (entry: SongLibraryEntry) => {
       setTrack({
         uri: entry.uri,
@@ -592,41 +617,25 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     setSongLibrary((current) => removeSongLibraryEntry(current, key));
   }, []);
 
-  // Keep the library current with the active project: once a song
-  // has fixed lyrics, they are saved against that song (name +
-  // duration) so the next project that uses it inherits them. The
-  // JSON comparison keeps this from churning state on every render.
-  useEffect(() => {
-    if (!hydrated) return;
-    const project = activeProject;
-    if (!project?.track || !project.lyrics || project.lyrics.lines.length === 0) return;
-    const { track, lyrics } = project;
-    setSongLibrary((current) => {
-      const existing = findSongLibraryEntry(current, track.name, track.durationSeconds);
-      if (existing && existing.uri === track.uri && JSON.stringify(existing.lyrics) === JSON.stringify(lyrics)) {
-        return current;
-      }
-      return upsertSongLibraryEntry(current, {
-        name: track.name,
-        uri: track.uri,
-        durationSeconds: track.durationSeconds,
-        lyrics,
-        now: Date.now(),
-      });
-    });
-  }, [hydrated, activeProject]);
-
   // A known song brings its lyrics back: when the active project's
   // track matches a library entry and the project has no lyrics of
   // its own yet, attach the saved ones. Runs after setTrack (which
-  // clears lyrics for the new song) and on project switches.
+  // clears lyrics for the new song) and on project switches. The
+  // patch lands through an async boundary, mirroring hydration —
+  // state is never set synchronously from an effect here.
   useEffect(() => {
     if (!hydrated) return;
     const project = activeProject;
     if (!project?.track || project.lyrics !== undefined) return;
     const entry = findSongLibraryEntry(songLibrary, project.track.name, project.track.durationSeconds);
     if (!entry) return;
-    patchActiveProject({ lyrics: entry.lyrics, lyricsEnabled: true });
+    let alive = true;
+    void (async () => {
+      if (alive) patchActiveProject({ lyrics: entry.lyrics, lyricsEnabled: true });
+    })();
+    return () => {
+      alive = false;
+    };
   }, [hydrated, activeProject, songLibrary, patchActiveProject]);
 
   // ---- Video look (per-project grade; see src/lib/looks.ts) ----
@@ -720,7 +729,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       lyricsOffsetFrames,
       setLyricsOffset,
       songLibrary,
-      useLibrarySong,
+      applyLibrarySong,
       deleteSongLibraryEntry,
       look,
       setProjectLook,
@@ -802,7 +811,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       lyricsOffsetFrames,
       setLyricsOffset,
       songLibrary,
-      useLibrarySong,
+      applyLibrarySong,
       deleteSongLibraryEntry,
       look,
       setProjectLook,
