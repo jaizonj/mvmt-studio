@@ -210,9 +210,51 @@ export function stripWhisperBracketTokens(text: string): string {
   return text.replace(WHISPER_BRACKET_TOKEN, '');
 }
 
-/** Bracket-strip + whitespace-normalise a word or line text. */
+/** Profanity respelling (Jaizon, 2026-11-11): detected lyrics get
+ * the clean-version spellings he asked for — niggas → ngas,
+ * fuck → f, bitch → bih, shit → shi — with their common
+ * inflections folded to the same roots. Matches are whole words
+ * with an explicit inflection list, so lookalike words (shitake,
+ * class) are never touched. The replacement takes the matched
+ * word's casing: Niggas → Ngas, FUCK → F. */
+const LYRIC_PROFANITY_RULES: { pattern: RegExp; replacement: string }[] = [
+  // The tail guard is a letter lookahead, not \b: after a consumed
+  // apostrophe ("fuckin'") a \b can never match, which would leave
+  // the apostrophe stranded on the replacement.
+  { pattern: /\bniggas(?![a-z])|\bniggaz(?![a-z])/gi, replacement: 'ngas' },
+  { pattern: /\bnigga(?![a-z])/gi, replacement: 'nga' },
+  { pattern: /\bfuck(?:s|ed|ing|in'?|er|ers)?(?![a-z])/gi, replacement: 'f' },
+  { pattern: /\bbitch(?:es|y)?(?![a-z])/gi, replacement: 'bih' },
+  { pattern: /\bshit(?:s|ty|ted|ting|tin'?)?(?![a-z])/gi, replacement: 'shi' },
+];
+
+function matchProfanityCase(source: string, replacement: string): string {
+  if (source.length > 1 && source === source.toUpperCase()) {
+    return replacement.toUpperCase();
+  }
+  if (source.charAt(0) === source.charAt(0).toUpperCase()) {
+    return replacement.charAt(0).toUpperCase() + replacement.slice(1);
+  }
+  return replacement;
+}
+
+/** Respell the profanity in a lyric fragment to Jaizon's clean
+ * versions. Applied wherever lyric text is cleaned (detection,
+ * stored-lyrics hydration) and wherever a line's text is committed
+ * (editor edits, split/merge, added lines), so preview and export
+ * always show the clean spellings. */
+export function respellLyricProfanity(text: string): string {
+  let out = text;
+  for (const rule of LYRIC_PROFANITY_RULES) {
+    out = out.replace(rule.pattern, (matched) => matchProfanityCase(matched, rule.replacement));
+  }
+  return out;
+}
+
+/** Bracket-strip + profanity-respell + whitespace-normalise a word
+ * or line text. */
 function cleanLyricText(text: string): string {
-  return stripWhisperBracketTokens(text).replace(/\s+/g, ' ').trim();
+  return respellLyricProfanity(stripWhisperBracketTokens(text)).replace(/\s+/g, ' ').trim();
 }
 
 /** Dedup key: case, punctuation and spacing don't make a line a

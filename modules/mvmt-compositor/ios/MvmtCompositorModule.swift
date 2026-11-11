@@ -2428,8 +2428,21 @@ private enum MvmtCompositorEngine {
         (exportId != nil && onProgress != nil)
         ? { fraction in onProgress?(0.8 + 0.2 * fraction) }
         : nil
+      // A master whose animation tool carried lyric layers is a
+      // sound final file but corrupts in the reader/writer pass
+      // below (see flattenRenderedFile) — stage it through a bare
+      // session render first and transcode THAT. A flatten failure
+      // falls back to transcoding the original render, as before.
+      var transcodeSourceURL = outputURL
+      var flattenedURL: URL? = nil
+      if let lyrics = request.lyrics, !lyrics.lines.isEmpty,
+        let flattened = await flattenRenderedFile(sourceURL: outputURL)
+      {
+        flattenedURL = flattened
+        transcodeSourceURL = flattened
+      }
       var delivered = await transcodeVideoFile(
-        sourceURL: outputURL,
+        sourceURL: transcodeSourceURL,
         videoBitrateBps: targetBitrate,
         codec: codec,
         canvasSize: canvasSize,
@@ -2452,7 +2465,7 @@ private enum MvmtCompositorEngine {
           )
           if corrected < targetBitrate,
             let second = await transcodeVideoFile(
-              sourceURL: outputURL,
+              sourceURL: transcodeSourceURL,
               videoBitrateBps: corrected,
               codec: codec,
               canvasSize: canvasSize,
@@ -2472,6 +2485,11 @@ private enum MvmtCompositorEngine {
         try? FileManager.default.removeItem(at: outputURL)
         finalURL = delivered
         appliedBitrate = usedBitrate
+      }
+      // The flattened staging file is an intermediate — it never
+      // survives as the delivered file.
+      if let flattenedURL, flattenedURL != finalURL {
+        try? FileManager.default.removeItem(at: flattenedURL)
       }
       if exportId != nil {
         onProgress?(1.0)
@@ -2534,6 +2552,111 @@ private enum MvmtCompositorEngine {
   private static func fileSizeBytes(_ url: URL) -> Int? {
     let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
     return (attributes?[.size] as? NSNumber)?.intValue
+  }
+
+  /// Re-renders a finished export file through a PLAIN composition
+  /// — the master's own video and audio tracks inserted whole, no
+  /// animation tool, no grade, no video composition — at
+  /// HighestQuality, and returns the new file's URL (nil on any
+  /// failure; the caller then transcodes the original render, as
+  /// before).
+  ///
+  /// WHY (Jaizon's device triangulation, 2026-11-11): a master
+  /// rendered with lyric layers in its animation tool is a sound
+  /// final file — High with the look on Original delivers it
+  /// untouched and it plays perfectly — but the reader/writer
+  /// transcode corrupts exactly those masters: TikTok and
+  /// Balanced/Small exports of styled projects came out as
+  /// ~4-second still-frame files with bad audio, graded or
+  /// ungraded, while watermark-only masters transcode cleanly.
+  /// The export session's own machinery reads compositions built
+  /// from files without trouble (every preview proves the decode
+  /// path), so a styled master takes one bare session pass first:
+  /// the flattened file is the vanilla structure the reader/writer
+  /// pass handles everywhere else, with the overlays already
+  /// burned into its pixels.
+  private static func flattenRenderedFile(sourceURL: URL) async -> URL? {
+    let asset = AVURLAsset(url: sourceURL)
+    guard
+      let sourceVideo = (try? await asset.loadTracks(withMediaType: .video))?.first,
+      let videoRange = try? await sourceVideo.load(.timeRange),
+      videoRange.duration.isValid, CMTimeGetSeconds(videoRange.duration) > 0,
+      let videoTransform = try? await sourceVideo.load(.preferredTransform)
+    else {
+      return nil
+    }
+    let sourceAudio = (try? await asset.loadTracks(withMediaType: .audio))?.first
+    var audioRange: CMTimeRange?
+    if let sourceAudio {
+      audioRange = try? await sourceAudio.load(.timeRange)
+    }
+
+    let composition = AVMutableComposition()
+    do {
+      guard
+        let videoTrack = composition.addMutableTrack(
+          withMediaType: .video,
+          preferredTrackID: kCMPersistentTrackID_Invalid
+        )
+      else {
+        return nil
+      }
+      try insertTimeRangeGuarded(
+        into: videoTrack, videoRange, of: sourceVideo, at: .zero,
+        "The rendered video could not be staged for resizing"
+      )
+      videoTrack.preferredTransform = videoTransform
+      if let sourceAudio, let audioRange,
+        CMTimeGetSeconds(audioRange.duration) > 0,
+        let audioTrack = composition.addMutableTrack(
+          withMediaType: .audio,
+          preferredTrackID: kCMPersistentTrackID_Invalid
+        )
+      {
+        try insertTimeRangeGuarded(
+          into: audioTrack, audioRange, of: sourceAudio, at: .zero,
+          "The rendered audio could not be staged for resizing"
+        )
+      }
+    } catch {
+      return nil
+    }
+
+    guard
+      let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    else {
+      return nil
+    }
+    let outputURL = cachesDirectory.appendingPathComponent("mvmt-export-flat-\(UUID().uuidString).mp4")
+    var createdSession: AVAssetExportSession?
+    let sessionException = avTry {
+      guard
+        let session = AVAssetExportSession(
+          asset: composition,
+          presetName: AVAssetExportPresetHighestQuality
+        )
+      else {
+        return
+      }
+      session.outputURL = outputURL
+      session.outputFileType = .mp4
+      session.shouldOptimizeForNetworkUse = false
+      createdSession = session
+    }
+    if sessionException != nil {
+      return nil
+    }
+    guard let session = createdSession else { return nil }
+    let completed: Bool = await withCheckedContinuation { continuation in
+      session.exportAsynchronously {
+        continuation.resume(returning: session.status == .completed)
+      }
+    }
+    guard completed, FileManager.default.fileExists(atPath: outputURL.path) else {
+      try? FileManager.default.removeItem(at: outputURL)
+      return nil
+    }
+    return outputURL
   }
 
   /// Transcodes a finished render at an explicit video bitrate via

@@ -3,7 +3,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import type { Edl } from '../lib/edl';
 import { effectiveLook } from '../lib/looks';
-import { cleanDetectedLyrics, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
+import { cleanDetectedLyrics, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { loadProjects, saveProjects } from '../lib/persistence';
 import type {
   AudioRegion,
@@ -462,7 +462,17 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         ...current,
         lines: current.lines.map((line) => {
           if (line.id !== lineId) return line;
-          const { text, words, ...rest } = patch;
+          const { text: rawText, words: rawWords, ...rest } = patch;
+          // Lyric text committed by hand gets the same profanity
+          // respelling as detected text (Jaizon's clean versions).
+          const text = rawText !== undefined ? respellLyricProfanity(rawText) : undefined;
+          const words =
+            rawWords !== undefined
+              ? rawWords.map((w) => {
+                  const respelled = respellLyricProfanity(w.text);
+                  return respelled === w.text ? w : { ...w, text: respelled };
+                })
+              : undefined;
           let next: LyricLine = { ...line, ...rest };
           if (text !== undefined) {
             // A text patch WITH an explicit words patch applies both
@@ -485,7 +495,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     (line: LyricLine) => {
       const current = activeProjectRef.current?.lyrics;
       if (!current) return;
-      patchLyrics({ ...current, lines: [...current.lines, line] });
+      const text = respellLyricProfanity(line.text);
+      const words = line.words?.map((w) => {
+        const respelled = respellLyricProfanity(w.text);
+        return respelled === w.text ? w : { ...w, text: respelled };
+      });
+      patchLyrics({
+        ...current,
+        lines: [...current.lines, { ...line, text, ...(words ? { words } : {}) }],
+      });
     },
     [patchLyrics],
   );

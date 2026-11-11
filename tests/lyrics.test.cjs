@@ -11,6 +11,7 @@ const assert = require('node:assert/strict');
 const {
   groupWhisperSegments,
   cleanDetectedLyrics,
+  respellLyricProfanity,
   songFrameToTimelineFrame,
   timelineFrameToSongFrame,
   lineAtSongFrame,
@@ -358,6 +359,59 @@ test('cleanup: cleanDetectedLyrics strips saved junk and collapses normalized du
     ['me?', 'Hello, World!', 'a different line', 'Hello, World!'],
   );
   assert.equal(cleaned[0].words[0].text, 'me?');
+});
+
+test('profanity: respellLyricProfanity applies Jaizon\'s clean versions with casing', () => {
+  assert.equal(respellLyricProfanity('niggas'), 'ngas');
+  assert.equal(respellLyricProfanity('nigga'), 'nga');
+  assert.equal(respellLyricProfanity('Niggas'), 'Ngas');
+  assert.equal(respellLyricProfanity('NIGGA'), 'NGA');
+  assert.equal(respellLyricProfanity('fuck'), 'f');
+  assert.equal(respellLyricProfanity('Fuck'), 'F');
+  assert.equal(respellLyricProfanity('FUCK'), 'F');
+  assert.equal(respellLyricProfanity('bitch'), 'bih');
+  assert.equal(respellLyricProfanity('Bitch'), 'Bih');
+  assert.equal(respellLyricProfanity('shit'), 'shi');
+  assert.equal(respellLyricProfanity('Shit'), 'Shi');
+});
+
+test('profanity: inflections fold to the same roots', () => {
+  assert.equal(respellLyricProfanity('fucking'), 'f');
+  assert.equal(respellLyricProfanity("fuckin'"), 'f');
+  assert.equal(respellLyricProfanity('fucked'), 'f');
+  assert.equal(respellLyricProfanity('bitches'), 'bih');
+  assert.equal(respellLyricProfanity('shitty'), 'shi');
+  assert.equal(respellLyricProfanity('niggaz'), 'ngas');
+});
+
+test('profanity: punctuation neighbours survive, lookalike words untouched', () => {
+  assert.equal(respellLyricProfanity('fuck, that shit!'), 'f, that shi!');
+  assert.equal(respellLyricProfanity('shitake mushrooms in class'), 'shitake mushrooms in class');
+  assert.equal(respellLyricProfanity('a clean line entirely'), 'a clean line entirely');
+});
+
+test('profanity: cleanDetectedLyrics respells line text and words', () => {
+  const saved = [
+    {
+      id: 'a',
+      text: 'my niggas fuck shit up',
+      startFrame: 0,
+      endFrame: 60,
+      words: [
+        { text: 'my', startFrame: 0, endFrame: 10 },
+        { text: 'niggas', startFrame: 10, endFrame: 25 },
+        { text: 'fuck', startFrame: 25, endFrame: 40 },
+        { text: 'shit', startFrame: 40, endFrame: 55 },
+        { text: 'up', startFrame: 55, endFrame: 60 },
+      ],
+    },
+  ];
+  const cleaned = cleanDetectedLyrics(saved);
+  assert.equal(cleaned[0].text, 'my ngas f shi up');
+  assert.deepEqual(
+    cleaned[0].words.map((word) => word.text),
+    ['my', 'ngas', 'f', 'shi', 'up'],
+  );
 });
 
 test('cleanup: cleanDetectedLyrics is idempotent and leaves clean lines untouched', () => {
