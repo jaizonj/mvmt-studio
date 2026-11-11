@@ -126,6 +126,7 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const [sizeDraft, setSizeDraft] = useState<number | null>(null);
   const [offsetDraft, setOffsetDraft] = useState<number | null>(null);
   const [strokeDraft, setStrokeDraft] = useState<number | null>(null);
+  const [nudgeDraft, setNudgeDraft] = useState<number | null>(null);
   const [hexDraft, setHexDraft] = useState('');
 
   const selectedIndex = lines.findIndex((l) => l.id === selectedId);
@@ -420,11 +421,14 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                         minimumValue={-45}
                         maximumValue={45}
                         step={1}
-                        onValueChange={setOffsetDraft}
-                        onSlidingComplete={(v) => {
+                        onValueChange={(v) => {
+                          // Live commit: a pick that only saved on
+                          // release could be lost entirely (Jaizon:
+                          // "the size I pick isn't rendering").
+                          setOffsetDraft(v);
                           studio.setLyricsOffset(v);
-                          setOffsetDraft(null);
                         }}
+                        onSlidingComplete={() => setOffsetDraft(null)}
                         minimumTrackTintColor={colors.accent}
                         maximumTrackTintColor={colors.elevated}
                         thumbTintColor={colors.label}
@@ -538,11 +542,14 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                       minimumValue={0.04}
                       maximumValue={0.16}
                       step={0.005}
-                      onValueChange={setSizeDraft}
-                      onSlidingComplete={(v) => {
+                      onValueChange={(v) => {
+                        // Live commit (see the Fine offset slider):
+                        // the pick applies as it moves, never only
+                        // on release.
+                        setSizeDraft(v);
                         studio.setLyricStyle({ sizeRatio: v });
-                        setSizeDraft(null);
                       }}
+                      onSlidingComplete={() => setSizeDraft(null)}
                       minimumTrackTintColor={colors.accent}
                       maximumTrackTintColor={colors.elevated}
                       thumbTintColor={colors.label}
@@ -618,11 +625,11 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                           minimumValue={STROKE_MIN}
                           maximumValue={STROKE_MAX}
                           step={0.01}
-                          onValueChange={setStrokeDraft}
-                          onSlidingComplete={(v) => {
+                          onValueChange={(v) => {
+                            setStrokeDraft(v);
                             studio.setLyricStyle({ strokeWidthRatio: v });
-                            setStrokeDraft(null);
                           }}
+                          onSlidingComplete={() => setStrokeDraft(null)}
                           minimumTrackTintColor={colors.accent}
                           maximumTrackTintColor={colors.elevated}
                           thumbTintColor={colors.label}
@@ -661,6 +668,37 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                       onChange={(v) => studio.setLyricStyle({ position: v })}
                       accessibilityLabel="Lyric position for all lines"
                     />
+
+                    {/* Vertical nudge — a fine adjustment on top of
+                        the Top/Center/Bottom anchor, for every line
+                        at once (Jaizon, 2026-11-11). Positive = up. */}
+                    <View style={styles.sliderLabelRow}>
+                      <Text style={styles.sliderLabel}>Vertical nudge</Text>
+                      <Text style={styles.sliderValue}>
+                        {(() => {
+                          const n = nudgeDraft ?? style.verticalOffsetRatio ?? 0;
+                          return n === 0 ? '0%' : `${n > 0 ? '+' : '−'}${Math.abs(Math.round(n * 100))}%`;
+                        })()}
+                      </Text>
+                    </View>
+                    <Slider
+                      value={nudgeDraft ?? style.verticalOffsetRatio ?? 0}
+                      minimumValue={-0.25}
+                      maximumValue={0.25}
+                      step={0.005}
+                      onValueChange={(v) => {
+                        setNudgeDraft(v);
+                        studio.setLyricStyle({ verticalOffsetRatio: v });
+                      }}
+                      onSlidingComplete={() => setNudgeDraft(null)}
+                      minimumTrackTintColor={colors.accent}
+                      maximumTrackTintColor={colors.elevated}
+                      thumbTintColor={colors.label}
+                      accessibilityLabel="Lyric vertical nudge for all lines"
+                    />
+                    <Text style={styles.caption}>
+                      Slides every line up or down a little from its Top, Center or Bottom spot.
+                    </Text>
 
                     <Text style={styles.fieldLabel}>Animation</Text>
                     <View style={styles.animationGrid}>

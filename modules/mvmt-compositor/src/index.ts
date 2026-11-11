@@ -81,6 +81,9 @@ export interface ResolvedLyricStyle {
   background: 'none' | 'pill';
   backgroundColor?: string;
   position: 'top' | 'center' | 'bottom';
+  /** Fine vertical nudge, fraction of the canvas height,
+   * positive = up. Always emitted (0 when unset). */
+  verticalOffsetRatio: number;
   bold: boolean;
   animation: LyricAnimationParams;
 }

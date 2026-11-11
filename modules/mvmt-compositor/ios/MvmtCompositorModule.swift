@@ -486,6 +486,11 @@ struct LyricStyleRecord: Record {
   @Field
   var position: String = "bottom"
 
+  /// Fine vertical nudge as a fraction of the canvas height,
+  /// applied on top of the position anchor (positive = up).
+  @Field
+  var verticalOffsetRatio: Double? = nil
+
   @Field
   var bold: Bool = false
 
@@ -1925,7 +1930,7 @@ private enum MvmtCompositorEngine {
     // with a 10%-of-height margin for top/bottom, clamped on-canvas.
     // CALayer space is bottom-left origin, y up.
     let centreX = renderSize.width / 2
-    let rawCentreY: CGFloat
+    var rawCentreY: CGFloat
     switch style.position {
     case "top":
       rawCentreY = renderSize.height * 0.90 - containerSize.height / 2
@@ -1934,6 +1939,12 @@ private enum MvmtCompositorEngine {
     default: // "bottom" and anything unrecognised
       rawCentreY = renderSize.height * 0.10 + containerSize.height / 2
     }
+    // Fine vertical nudge (Jaizon): a fraction of the canvas
+    // height on top of the anchor — positive moves the line UP
+    // (layer space is y-up). The on-canvas clamp still applies.
+    rawCentreY +=
+      CGFloat(lyricClamp(lyricFinite(style.verticalOffsetRatio ?? 0, 0), -0.3, 0.3))
+      * renderSize.height
     let centreY = min(
       max(rawCentreY, containerSize.height / 2),
       renderSize.height - containerSize.height / 2

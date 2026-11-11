@@ -119,6 +119,7 @@ export function LyricsOverlay({
   width: number;
 }) {
   const [lineSize, setLineSize] = useState({ w: 0, h: 0 });
+  const [stageH, setStageH] = useState(0);
   const active = useMemo(() => {
     if (!lyrics) return null;
     return lyrics.lines.find((l) => positionSeconds >= l.startSeconds && positionSeconds < l.endSeconds) ?? null;
@@ -237,6 +238,10 @@ export function LyricsOverlay({
   return (
     <View
       pointerEvents="none"
+      onLayout={(e) => {
+        const h = e.nativeEvent.layout.height;
+        if (h > 0 && Math.abs(h - stageH) > 1) setStageH(h);
+      }}
       style={[
         styles.anchor,
         {
@@ -245,6 +250,10 @@ export function LyricsOverlay({
           paddingTop: style.position === 'top' ? width * 0.16 : 0,
           paddingBottom: style.position === 'bottom' ? width * 0.2 : 0,
           paddingHorizontal: width * 0.04,
+          // Fine vertical nudge: fraction of the stage height,
+          // positive = up (screen space is y-down) — mirrors the
+          // native burn-in's placement exactly.
+          transform: [{ translateY: -(style.verticalOffsetRatio ?? 0) * stageH }],
         },
       ]}>
       <View

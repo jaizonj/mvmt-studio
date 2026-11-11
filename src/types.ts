@@ -265,6 +265,11 @@ export interface LyricStyle {
   /** #RRGGBB or rgba() pill colour; undefined = default dark pill. */
   backgroundColor?: string;
   position: 'top' | 'center' | 'bottom';
+  /** Fine vertical nudge as a fraction of the canvas HEIGHT,
+   * applied on top of the position anchor (positive = up) —
+   * Jaizon, 2026-11-11: move all the words up or down slightly
+   * while keeping the Top/Center/Bottom choice. Undefined = 0. */
+  verticalOffsetRatio?: number;
   /** Animation preset id (src/lib/lyricAnimations.ts). */
   animationId: string;
   bold: boolean;
