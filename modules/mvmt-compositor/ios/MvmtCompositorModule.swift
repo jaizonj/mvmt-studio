@@ -146,20 +146,19 @@ struct LookParamsRecord: Record {
 
 // MARK: - Preview look compositor
 
-/// The resolved look params the preview compositor grades with.
+/// The resolved look params LookVideoCompositor grades with.
 /// The composition builder writes the slot whenever it builds a
 /// preview composition with a non-identity look (and points that
 /// composition's customVideoCompositorClass at
-/// LookVideoCompositor); the compositor reads the slot per request.
-/// A single slot is sound because this app has exactly ONE preview
-/// consumer at a time — PreviewStore's standing player — and every
-/// preview of a project shares that project's resolved look.
-/// Exports never read the slot: they grade in the render transcode
-/// (see the RULE in buildComposition). Lock-guarded: the builder
-/// writes from its queue while requests read on AVFoundation's
-/// compositor queue. A stale slot is never observable — a preview
-/// composition only runs the compositor when the builder just set
-/// both the class and the slot for it.
+/// LookVideoCompositor); a graded render transcode writes its
+/// pending grade before starting its reader and clears the slot
+/// when the attempt finishes. The compositor reads the slot per
+/// request. Lock-guarded: owners write from their queues while
+/// requests read on AVFoundation's compositor queue. A stale slot
+/// is never observable in previews — a preview composition only
+/// runs the compositor when the builder just set both the class
+/// and the slot for it — and the transcode installs its own grade
+/// explicitly rather than relying on whatever a preview left here.
 enum LookCompositorStore {
   private static let lock = NSLock()
   private static var stored: LookParamsRecord?
@@ -178,15 +177,18 @@ enum LookCompositorStore {
   }
 }
 
-/// Grades PREVIEW frames for the look system by compositing the
-/// EDL's layer instructions itself and running the shared CI grade
-/// chain (MvmtCompositorEngine.gradedImage) over the result.
+/// Grades frames for the look system by compositing each
+/// composition's layer instructions itself and running the shared
+/// CI grade chain (MvmtCompositorEngine.gradedImage) over the
+/// result. It serves both preview compositions and the single-
+/// instruction composition used by a graded render transcode.
 ///
 /// Why a custom compositor at all: the factory CI-filter
-/// composition (applyingCIFiltersWithHandler) throws on this
-/// builder's compositions — previews AND exports crashed on device
-/// (2026-11-10) — while a custom AVVideoCompositing class is the
-/// supported way to post-process an arbitrary composition's frames.
+/// composition throws on this builder's compositions — previews
+/// AND exports crashed on device (2026-11-10) — and produced
+/// corrupt transcodes when tried there instead. A custom
+/// AVVideoCompositing class is the supported way to post-process
+/// an arbitrary composition's frames.
 ///
 /// FAILURE DISCIPLINE IS THE POINT: startRequest runs on
 /// AVFoundation's compositor queue, where an uncaught exception is
@@ -1099,32 +1101,31 @@ private enum MvmtCompositorEngine {
     }
 
     // ---- Optional look (edit/export-stage grade) ----
-    // RULE (device crashes, 2026-11-10): an EDL composition must
-    // NEVER be wrapped in the applyingCIFiltersWithHandler twin,
-    // and a CI-filter composition must never carry the animation
-    // tool. -[AVCoreImageFilterCustomVideoCompositor
-    // startVideoCompositionRequest:] threw on AVFoundation's own
-    // queue for BOTH kinds of build — EXC_CRASH/SIGABRT, outside
-    // avTry's reach: EXPORT builds died on the animation-tool
-    // conflict (crash log MVMTStudio-2026-11-10-181458, hit Export
-    // with the watermark on and a look active), and PREVIEW builds
-    // died too (Jaizon, entering Edit) — the factory compositor
-    // also rejects this builder's multi-segment EDL instructions
-    // themselves. So the grade has two homes, neither of them a
-    // wrapped composition:
-    //  • PREVIEW builds: a CUSTOM VIDEO COMPOSITOR
-    //    (LookVideoCompositor) hangs off this plain EDL composition
-    //    and grades each frame as the player requests it, reading
-    //    the resolved params from LookCompositorStore. Preview
-    //    compositions never carry the animation tool (see above),
-    //    and the editor must show the grade it will export.
+    // RULE (device failures, 2026-11-10): the factory filter
+    // composition is BANNED everywhere in this module. Its
+    // compositor threw on AVFoundation's own queue for BOTH kinds
+    // of EDL build — EXC_CRASH/SIGABRT, outside avTry's reach:
+    // EXPORT builds died on the animation-tool conflict (crash
+    // log MVMTStudio-2026-11-10-181458, hit Export with the
+    // watermark on and a look active), and PREVIEW builds died
+    // too (Jaizon, entering Edit). Moving it into the render
+    // transcode did not save it either: TikTok transcodes came
+    // out as short, still-frame files with bad audio while High
+    // exports stayed correct. So the grade has two homes, both of
+    // them the same custom compositor:
+    //  • PREVIEW builds: LookVideoCompositor hangs off this plain
+    //    EDL composition and grades each frame as the player
+    //    requests it, reading the resolved params from
+    //    LookCompositorStore. Preview compositions never carry
+    //    the animation tool (see above), and the editor must show
+    //    the grade it will export.
     //  • EXPORT builds: this composition is left EXACTLY as it was
     //    before looks existed (animation tool and all); the
     //    resolved params travel out as BuiltComposition.pendingGrade
-    //    and render() applies them in its post-render transcode,
-    //    through a factory filtering composition over the finished
-    //    file (watermark/lyrics already burned in — no tool
-    //    anywhere near the filter compositor).
+    //    and render() applies them in its post-render transcode —
+    //    export grade = LookVideoCompositor inside the
+    //    transcode's single-instruction composition over the
+    //    finished file (watermark/lyrics already burned in).
     var pendingGrade: LookParamsRecord?
     if let look = request.look, !lookIsIdentity(look) {
       if forExport {
@@ -2194,10 +2195,6 @@ private enum MvmtCompositorEngine {
 
   // MARK: Look (CI grade on the composed frames)
 
-  /// Shared CI context for the look's filtering handler (CIContext
-  /// is thread-safe; the handler runs on the compositor's queues).
-  private static let lookCIContext = CIContext()
-
   private static func lookIsIdentity(_ look: LookParamsRecord) -> Bool {
     abs(look.brightness) < 0.001
       && abs(look.contrast - 1) < 0.001
@@ -2213,10 +2210,11 @@ private enum MvmtCompositorEngine {
   /// (CIFilter instances are not shared across the compositor's
   /// concurrent calls). Stages at identity values are skipped, in
   /// the fixed order: exposure → temperature → colour controls →
-  /// vibrance → sharpen → vignette. Shared by both grade homes:
-  /// LookVideoCompositor (previews) and the render transcode's
-  /// factory filtering composition (exports) — internal rather
-  /// than private so the compositor class can reach it.
+  /// vibrance → sharpen → vignette. Applied by
+  /// LookVideoCompositor in both grade homes — preview
+  /// compositions and the render transcode's single-instruction
+  /// composition — internal rather than private so the compositor
+  /// class can reach it.
   static func gradedImage(_ source: CIImage, look: LookParamsRecord) -> CIImage {
     var image = source
     func apply(_ name: String, _ parameters: [String: Any]) {
@@ -2392,9 +2390,9 @@ private enum MvmtCompositorEngine {
     // ---- Post-render pass (render-only): transcode the finished
     // file at an explicit video bitrate (see transcodeVideoFile),
     // for size control and/or to apply the export grade the builder
-    // carried out as pendingGrade (a CI-filter composition must
-    // never carry the animation tool — the grade cannot ride the
-    // export composition itself; see the RULE in buildComposition).
+    // carried out as pendingGrade (the factory filter composition
+    // is banned — the grade cannot ride the export composition
+    // itself; see the RULE in buildComposition).
     // The composition is untouched — the preview built from this
     // same request stays truthful, only the file's encoding (and,
     // with a grade, its pixels) changes. ANY failure delivers the
@@ -2539,16 +2537,16 @@ private enum MvmtCompositorEngine {
   }
 
   /// Transcodes a finished render at an explicit video bitrate via
-  /// AVAssetReader → AVAssetWriter. The composition is NOT involved:
-  /// the source is a plain file (watermark/lyrics already burned
-  /// in), re-framed onto the canvas with the builder's aspect-fill
-  /// normalisation at the target frame rate. When `grade` is set,
-  /// the reader side instead runs the factory CI-filter composition
-  /// over the file (see transcodeAttempt) — the export-side home of
-  /// the look, since a filtering composition must never carry the
-  /// animation tool the export composition needed. Audio passes
-  /// through untouched when possible (the export session writes
-  /// AAC); otherwise it is re-encoded to AAC 192k stereo. Returns
+  /// AVAssetReader → AVAssetWriter. The source is a plain file
+  /// (watermark/lyrics already burned in). Without a grade there is
+  /// NO video composition at all: a track output vends the file's
+  /// own frames and timestamps, and the writer re-encodes them at
+  /// the canvas (the render's own dimensions). When `grade` is set,
+  /// the reader side uses a plain single-instruction composition
+  /// whose custom compositor is LookVideoCompositor — the
+  /// export-side home of the look. Audio is re-encoded to AAC
+  /// 192k stereo first (a format this code fully controls), with
+  /// stored-format passthrough as the fallback attempt. Returns
   /// nil on ANY failure — the caller delivers the original render.
   private static func transcodeVideoFile(
     sourceURL: URL,
@@ -2576,7 +2574,9 @@ private enum MvmtCompositorEngine {
       audioFormatDescription = (try? await audioTrack.load(.formatDescriptions))?.first
     }
 
-    let attempts: [Bool] = audioTrack != nil ? [true, false] : [false]
+    // Audio strategy order: re-encode first (deterministic LPCM →
+    // AAC), passthrough second. The Bool is `passthroughAudio`.
+    let attempts: [Bool] = audioTrack != nil ? [false, true] : [false]
     for passthroughAudio in attempts {
       if let url = await transcodeAttempt(
         asset: asset,
@@ -2620,6 +2620,21 @@ private enum MvmtCompositorEngine {
     passthroughAudio: Bool,
     onProgress: ((Double) -> Void)?
   ) async -> URL? {
+    // Install a graded attempt's params BEFORE any reader using
+    // the composition below can start, and clear them when this
+    // attempt exits by ANY path (setup failure, pump failure, or
+    // success). The defer is registered first and only acts for a
+    // graded attempt, so an ungraded attempt never disturbs a
+    // preview's slot.
+    defer {
+      if grade != nil {
+        LookCompositorStore.current = nil
+      }
+    }
+    if let grade {
+      LookCompositorStore.current = grade
+    }
+
     guard
       let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
     else {
@@ -2632,7 +2647,7 @@ private enum MvmtCompositorEngine {
 
     var reader: AVAssetReader?
     var writer: AVAssetWriter?
-    var videoOutput: AVAssetReaderVideoCompositionOutput?
+    var videoOutput: AVAssetReaderOutput?
     var videoInput: AVAssetWriterInput?
     var audioOutput: AVAssetReaderTrackOutput?
     var audioInput: AVAssetWriterInput?
@@ -2642,42 +2657,32 @@ private enum MvmtCompositorEngine {
         let createdReader = try AVAssetReader(asset: asset)
         let createdWriter = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
-        // Reader-side video composition: the target frame rate and
-        // canvas, so the transcoded file is framed exactly like the
-        // render. Two forms:
+        // Reader-side video path. The ungraded path is deliberately
+        // boring: a plain track output with NO video composition,
+        // so the master file's own frames and timestamps flow
+        // straight to the writer's encoder. Only a graded attempt
+        // uses a composition output, and then only a plain
+        // single-instruction composition graded by the same custom
+        // compositor the preview uses.
         let targetFrameDuration = CMTime(
           value: 1,
           timescale: CMTimeScale(max(1.0, frameRate).rounded())
         )
-        let videoComposition: AVMutableVideoComposition
-        if let grade {
-          // GRADED: the CI factory composition in its supported
-          // form — its compositor runs every frame through the SAME
-          // gradedImage chain the preview compositor uses. Safe here
-          // because the source is the finished render: watermark
-          // and lyrics are already burned into its pixels and there
-          // is NO animation tool anywhere (the tool must never meet
-          // the filter compositor — see the RULE in
-          // buildComposition). The factory derives its instructions
-          // from the asset; the render's frames are already at the
-          // canvas, upright, so only the render size and frame
-          // duration need pinning to the transcode targets.
-          let factory = AVMutableVideoComposition(
-            asset: asset,
-            applyingCIFiltersWithHandler: { request in
-              let graded = gradedImage(request.sourceImage, look: grade)
-              request.finish(with: graded, context: lookCIContext)
-            }
-          )
-          factory.renderSize = canvasSize
-          factory.frameDuration = targetFrameDuration
-          videoComposition = factory
-        } else {
-          // UNGRADED: a hand-built composition carrying the
-          // builder's aspect-fill normalisation.
-          let plain = AVMutableVideoComposition()
-          plain.renderSize = canvasSize
-          plain.frameDuration = targetFrameDuration
+        let videoOutputSettings: [String: Any] = [
+          kCVPixelBufferPixelFormatTypeKey as String:
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
+        let createdVideoOutput: AVAssetReaderOutput
+        if grade != nil {
+          // GRADED: one instruction over the full duration, one
+          // layer carrying the aspect-fill normalisation, and
+          // LookVideoCompositor as the composition's custom
+          // compositor (its params were installed in
+          // LookCompositorStore at the start of this attempt).
+          let composition = AVMutableVideoComposition()
+          composition.renderSize = canvasSize
+          composition.frameDuration = targetFrameDuration
+          composition.customVideoCompositorClass = LookVideoCompositor.self
           let instruction = AVMutableVideoCompositionInstruction()
           instruction.timeRange = CMTimeRange(
             start: .zero,
@@ -2704,25 +2709,32 @@ private enum MvmtCompositorEngine {
             layerInstruction.setTransform(transform, at: .zero)
           }
           instruction.layerInstructions = [layerInstruction]
-          plain.instructions = [instruction]
-          videoComposition = plain
+          composition.instructions = [instruction]
+
+          let compositionOutput = AVAssetReaderVideoCompositionOutput(
+            videoTracks: [videoTrack],
+            videoSettings: videoOutputSettings
+          )
+          compositionOutput.videoComposition = composition
+          createdVideoOutput = compositionOutput
+        } else {
+          // UNGRADED: no composition anywhere — the track output
+          // vends the rendered file's frames untouched.
+          createdVideoOutput = AVAssetReaderTrackOutput(
+            track: videoTrack,
+            outputSettings: videoOutputSettings
+          )
         }
 
-        let createdVideoOutput = AVAssetReaderVideoCompositionOutput(
-          videoTracks: [videoTrack],
-          videoSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-          ]
-        )
-        createdVideoOutput.videoComposition = videoComposition
         guard createdReader.canAdd(createdVideoOutput) else {
           throw compositorError("The transcode reader rejected the video output.")
         }
         createdReader.add(createdVideoOutput)
 
-        // No AVVideoExpectedSourceFrameRateKey (the cadence lives in
-        // the reader composition's frameDuration) — the banned-key
-        // discipline from the capture writer applies here too.
+        // No AVVideoExpectedSourceFrameRateKey — the banned-key
+        // discipline from the capture writer applies here too. An
+        // ungraded attempt takes cadence from the source samples;
+        // a graded attempt's composition carries the frameDuration.
         var compressionProperties: [String: Any] = [
           AVVideoAverageBitRateKey: videoBitrateBps,
           AVVideoMaxKeyFrameIntervalKey: 60,
