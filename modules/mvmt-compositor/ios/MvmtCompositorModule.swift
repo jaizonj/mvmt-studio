@@ -211,7 +211,7 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
   /// requiredPixelBufferAttributesForRenderContext — PixelBuffer,
   /// not SourcePixelBuffer — both attribute properties are
   /// Optional, and their values are Sendable-constrained.)
-  var requiredPixelBufferAttributesForRenderContext: [String: any Sendable]? = [
+  var requiredPixelBufferAttributesForRenderContext: [String: any Sendable] = [
     kCVPixelBufferPixelFormatTypeKey as String: [Int(kCVPixelFormatType_32BGRA)],
     kCVPixelBufferIOSurfacePropertiesKey as String: [String: any Sendable](),
   ]
@@ -234,6 +234,59 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
   func cancelAllPendingVideoCompositionRequests() {
     // Requests complete synchronously inside startRequest, so
     // there is never anything pending to cancel.
+  }
+
+  /// A ramp's interpolated fraction at `time` (0 outside/at the
+  /// start, 1 at/after the end); nil duration data reads as the
+  /// ramp's start value.
+  private func rampFraction(_ range: CMTimeRange, at time: CMTime) -> Double {
+    guard range.duration.isValid, range.start.isValid, time.isValid else { return 0 }
+    let duration = range.duration.seconds
+    guard duration > 0 else { return 0 }
+    return max(0, min(1, (time.seconds - range.start.seconds) / duration))
+  }
+
+  /// Layer opacity at a composition time, via the ramp API —
+  /// this SDK's Swift overlay exposes no opacity(at:)
+  /// convenience on AVVideoCompositionLayerInstruction
+  /// (CI 42943180029). No ramp data = fully opaque; our EDL
+  /// sets a static 1.0 per segment anyway.
+  private func layerOpacity(
+    _ layer: AVVideoCompositionLayerInstruction, at time: CMTime
+  ) -> Float {
+    var start: Float = 1
+    var end: Float = 1
+    var range = CMTimeRange(start: .zero, duration: .zero)
+    guard
+      layer.getOpacityRamp(
+        for: time, startOpacity: &start, endOpacity: &end, timeRange: &range)
+    else { return 1 }
+    if start == end { return start }
+    return start + (end - start) * Float(rampFraction(range, at: time))
+  }
+
+  /// Layer transform at a composition time, via the ramp API
+  /// (same reason as layerOpacity). No ramp data = identity;
+  /// ramps interpolate component-wise.
+  private func layerTransform(
+    _ layer: AVVideoCompositionLayerInstruction, at time: CMTime
+  ) -> CGAffineTransform {
+    var start = CGAffineTransform.identity
+    var end = CGAffineTransform.identity
+    var range = CMTimeRange(start: .zero, duration: .zero)
+    guard
+      layer.getTransformRamp(
+        for: time, startTransform: &start, endTransform: &end, timeRange: &range)
+    else { return .identity }
+    let f = CGFloat(rampFraction(range, at: time))
+    if f <= 0 { return start }
+    if f >= 1 { return end }
+    func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * f }
+    return CGAffineTransform(
+      a: mix(start.a, end.a), b: mix(start.b, end.b),
+      c: mix(start.c, end.c), d: mix(start.d, end.d),
+      tx: mix(start.tx, end.tx), ty: mix(start.ty, end.ty)
+    )
   }
 
   func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
@@ -283,7 +336,7 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
         // Opacity: CI works premultiplied, so scale all four
         // components — the over-composite then blends by exactly
         // the layer's opacity factor.
-        let opacity = layerInstruction.opacity(at: time)
+        let opacity = layerOpacity(layerInstruction, at: time)
         if opacity < 0.999 {
           let factor = CGFloat(max(0, min(1, opacity)))
           image = image.applyingFilter(
@@ -303,7 +356,7 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
         // by the two flips — flip(source) then the AV transform
         // then flip(render) — so framing matches the default
         // compositor's output exactly (identity in, identity out).
-        let avTransform = layerInstruction.transform(at: time)
+        let avTransform = layerTransform(layerInstruction, at: time)
         let flipSource = CGAffineTransform(
           a: 1, b: 0, c: 0, d: -1, tx: 0, ty: sourceExtent.height
         )
