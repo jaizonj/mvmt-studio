@@ -5,6 +5,7 @@ import type { Edl } from '../lib/edl';
 import { effectiveLook } from '../lib/looks';
 import { cleanDetectedLyrics, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { loadProjects, saveProjects } from '../lib/persistence';
+import { findSongLibraryEntry, removeSongLibraryEntry, upsertSongLibraryEntry } from '../lib/songLibrary';
 import type {
   AudioRegion,
   AudioTrack,
@@ -19,6 +20,7 @@ import type {
   ProjectLook,
   ProjectLyrics,
   ShuffleFrequency,
+  SongLibraryEntry,
   Take,
 } from '../types';
 
@@ -61,6 +63,19 @@ function cleanStoredLyrics(projects: Project[]): Project[] {
       lines.length !== lyrics.lines.length || lines.some((line, i) => line !== lyrics.lines[i]);
     return changed ? { ...project, lyrics: { ...lyrics, lines } } : project;
   });
+}
+
+/** The same load-time cleanup for song-library entries, plus a
+ * shape guard — a malformed entry is dropped, never trusted. */
+function cleanStoredLibrary(entries: SongLibraryEntry[] | undefined): SongLibraryEntry[] {
+  if (!Array.isArray(entries)) return [];
+  const out: SongLibraryEntry[] = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry.key !== 'string' || typeof entry.uri !== 'string') continue;
+    if (!entry.lyrics || !Array.isArray(entry.lyrics.lines)) continue;
+    out.push({ ...entry, lyrics: { ...entry.lyrics, lines: cleanDetectedLyrics(entry.lyrics.lines) } });
+  }
+  return out;
 }
 
 export function createEmptyProject(name: string): Project {
@@ -155,6 +170,17 @@ interface StudioState {
   setLyricStyle: (patch: Partial<LyricStyle>) => void;
   /** Shift every line (and its words) by a frame delta. */
   shiftAllLyrics: (frames: number) => void;
+  /** The active lyrics' fine offset in frames (0 when unset) — the
+   * Lyrics panel's drag bar; applied at render time only. */
+  lyricsOffsetFrames: number;
+  /** Store the fine offset (clamped to ±90 frames). */
+  setLyricsOffset: (frames: number) => void;
+  /** The song library: songs with the lyrics fixed for them. */
+  songLibrary: SongLibraryEntry[];
+  /** Use a library song as the active project's track, lyrics included. */
+  useLibrarySong: (entry: SongLibraryEntry) => void;
+  /** Remove a song from the library. */
+  deleteSongLibraryEntry: (key: string) => void;
 
   /**
    * The active project's EFFECTIVE video look — the stored look when
@@ -224,6 +250,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [songLibrary, setSongLibrary] = useState<SongLibraryEntry[]>([]);
 
   // Transient (never persisted): the track analysis cache.
   const [trackSections, setTrackSections] = useState<MusicalSection[]>([]);
@@ -274,6 +301,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       if (!alive) return;
       if (loaded && loaded.projects.length > 0) {
         setProjects(cleanStoredLyrics(loaded.projects));
+        setSongLibrary(cleanStoredLibrary(loaded.songLibrary));
         setActiveProjectId(
           loaded.activeProjectId && loaded.projects.some((p) => p.id === loaded.activeProjectId)
             ? loaded.activeProjectId
@@ -297,12 +325,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     if (!hydrated) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      void saveProjects({ version: 1, projects, activeProjectId });
+      void saveProjects({ version: 1, projects, activeProjectId, songLibrary });
     }, 400);
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-  }, [projects, activeProjectId, hydrated]);
+  }, [projects, activeProjectId, songLibrary, hydrated]);
 
   /** Patch the active project immutably + stamp updatedAt. */
   const patchActiveProject = useCallback((patch: Partial<Project>) => {
@@ -535,6 +563,72 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchLyrics],
   );
 
+  // ---- Lyric fine offset + song library ----
+  const lyricsOffsetFrames = activeProject?.lyrics?.offsetFrames ?? 0;
+
+  const setLyricsOffset = useCallback(
+    (frames: number) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      const clamped = Math.max(-90, Math.min(90, Math.round(frames)));
+      patchLyrics({ ...current, offsetFrames: clamped });
+    },
+    [patchLyrics],
+  );
+
+  const useLibrarySong = useCallback(
+    (entry: SongLibraryEntry) => {
+      setTrack({
+        uri: entry.uri,
+        name: entry.name,
+        ...(entry.durationSeconds !== undefined ? { durationSeconds: entry.durationSeconds } : {}),
+      });
+      patchActiveProject({ lyrics: entry.lyrics, lyricsEnabled: true });
+    },
+    [patchActiveProject, setTrack],
+  );
+
+  const deleteSongLibraryEntry = useCallback((key: string) => {
+    setSongLibrary((current) => removeSongLibraryEntry(current, key));
+  }, []);
+
+  // Keep the library current with the active project: once a song
+  // has fixed lyrics, they are saved against that song (name +
+  // duration) so the next project that uses it inherits them. The
+  // JSON comparison keeps this from churning state on every render.
+  useEffect(() => {
+    if (!hydrated) return;
+    const project = activeProject;
+    if (!project?.track || !project.lyrics || project.lyrics.lines.length === 0) return;
+    const { track, lyrics } = project;
+    setSongLibrary((current) => {
+      const existing = findSongLibraryEntry(current, track.name, track.durationSeconds);
+      if (existing && existing.uri === track.uri && JSON.stringify(existing.lyrics) === JSON.stringify(lyrics)) {
+        return current;
+      }
+      return upsertSongLibraryEntry(current, {
+        name: track.name,
+        uri: track.uri,
+        durationSeconds: track.durationSeconds,
+        lyrics,
+        now: Date.now(),
+      });
+    });
+  }, [hydrated, activeProject]);
+
+  // A known song brings its lyrics back: when the active project's
+  // track matches a library entry and the project has no lyrics of
+  // its own yet, attach the saved ones. Runs after setTrack (which
+  // clears lyrics for the new song) and on project switches.
+  useEffect(() => {
+    if (!hydrated) return;
+    const project = activeProject;
+    if (!project?.track || project.lyrics !== undefined) return;
+    const entry = findSongLibraryEntry(songLibrary, project.track.name, project.track.durationSeconds);
+    if (!entry) return;
+    patchActiveProject({ lyrics: entry.lyrics, lyricsEnabled: true });
+  }, [hydrated, activeProject, songLibrary, patchActiveProject]);
+
   // ---- Video look (per-project grade; see src/lib/looks.ts) ----
   // The EFFECTIVE look is exposed (stored value wins, otherwise the
   // Auto Enhance default) so the Editor and Export always agree;
@@ -623,6 +717,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       deleteLyricLine,
       setLyricStyle,
       shiftAllLyrics,
+      lyricsOffsetFrames,
+      setLyricsOffset,
+      songLibrary,
+      useLibrarySong,
+      deleteSongLibraryEntry,
       look,
       setProjectLook,
       resolution,
@@ -700,6 +799,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       deleteLyricLine,
       setLyricStyle,
       shiftAllLyrics,
+      lyricsOffsetFrames,
+      setLyricsOffset,
+      songLibrary,
+      useLibrarySong,
+      deleteSongLibraryEntry,
       look,
       setProjectLook,
       resolution,

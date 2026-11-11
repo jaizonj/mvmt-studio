@@ -2480,10 +2480,27 @@ private enum MvmtCompositorEngine {
           }
         }
       }
-      if let delivered {
+      // Duration guard: a transcode that comes back drastically
+      // shorter than the render carries the corruption signature
+      // this whole staging dance exists to avoid — never deliver
+      // it. The flattened file (full length, vanilla structure)
+      // takes its place; without one, the original render stands.
+      var accepted = delivered
+      if let candidate = accepted,
+        let candidateSeconds = await mediaDurationSeconds(candidate),
+        renderSeconds > 0, candidateSeconds < renderSeconds * 0.85
+      {
+        try? FileManager.default.removeItem(at: candidate)
+        accepted = nil
+        if let flattenedURL {
+          try? FileManager.default.removeItem(at: outputURL)
+          finalURL = flattenedURL
+        }
+      }
+      if let accepted {
         // The transcoded file supersedes the original render.
         try? FileManager.default.removeItem(at: outputURL)
-        finalURL = delivered
+        finalURL = accepted
         appliedBitrate = usedBitrate
       }
       // The flattened staging file is an intermediate — it never
@@ -2554,6 +2571,15 @@ private enum MvmtCompositorEngine {
     return (attributes?[.size] as? NSNumber)?.intValue
   }
 
+  /// A finished file's measured duration in seconds (nil when it
+  /// cannot be read) — the duration guard's yardstick.
+  private static func mediaDurationSeconds(_ url: URL) async -> Double? {
+    let asset = AVURLAsset(url: url)
+    guard let duration = try? await asset.load(.duration) else { return nil }
+    let seconds = CMTimeGetSeconds(duration)
+    return seconds.isFinite ? seconds : nil
+  }
+
   /// Re-renders a finished export file through a PLAIN composition
   /// — the master's own video and audio tracks inserted whole, no
   /// animation tool, no grade, no video composition — at
@@ -2576,7 +2602,13 @@ private enum MvmtCompositorEngine {
   /// pass handles everywhere else, with the overlays already
   /// burned into its pixels.
   private static func flattenRenderedFile(sourceURL: URL) async -> URL? {
-    let asset = AVURLAsset(url: sourceURL)
+    // Precise timing: the composition inserts below are only as
+    // faithful as the loaded track ranges, and the approximate
+    // load is exactly what lets pre-roll hide inside a track.
+    let asset = AVURLAsset(
+      url: sourceURL,
+      options: [AVURLAssetPreferPreciseDurationAndTimingKey: true]
+    )
     guard
       let sourceVideo = (try? await asset.loadTracks(withMediaType: .video))?.first,
       let videoRange = try? await sourceVideo.load(.timeRange),

@@ -613,6 +613,39 @@ test('payload: words are clamped into the visible window', () => {
   assert.equal(payload.lines[0].words[0].startSeconds, 0);
 });
 
+test('payload: offsetFrames shifts every line and word at the boundary', () => {
+  const project = {
+    ...payloadProject([
+      {
+        id: 'a',
+        text: 'one two',
+        startFrame: 330,
+        endFrame: 390,
+        words: [
+          { text: 'one', startFrame: 330, endFrame: 360 },
+          { text: 'two', startFrame: 360, endFrame: 390 },
+        ],
+      },
+    ]),
+    offsetFrames: 15, // +0.5s — Jaizon's "off by half a second" case
+  };
+  const payload = buildCompositeLyrics(project, 300, FPS);
+  assert.equal(payload.lines[0].startSeconds, 1.5);
+  assert.equal(payload.lines[0].endSeconds, 3.5);
+  assert.equal(payload.lines[0].words[0].startSeconds, 1.5);
+  assert.equal(payload.lines[0].words[1].endSeconds, 3.5);
+  // The authored project is untouched — the offset is render-time only.
+  assert.equal(project.lines[0].startFrame, 330);
+});
+
+test('payload: a negative offset can push a line out of the window', () => {
+  const project = {
+    ...payloadProject([{ id: 'a', text: 'hi', startFrame: 300, endFrame: 330 }]),
+    offsetFrames: -45,
+  };
+  assert.equal(buildCompositeLyrics(project, 300, FPS), null);
+});
+
 test('payload: empty or invisible lyrics build null', () => {
   assert.equal(buildCompositeLyrics(null, 0, FPS), null);
   assert.equal(buildCompositeLyrics(payloadProject([]), 0, FPS), null);

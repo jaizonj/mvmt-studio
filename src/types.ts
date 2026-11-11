@@ -274,6 +274,33 @@ export interface LyricStyle {
 export interface ProjectLyrics {
   lines: LyricLine[];
   style: LyricStyle;
+  /**
+   * Global fine offset, in song-timeline frames, applied to EVERY
+   * line (and word) when the lyrics are rendered — the Lyrics
+   * panel's drag bar (Jaizon, 2026-11-11: "if they seem off by half
+   * a second you can just drag it"). Non-destructive: the authored
+   * line timings never change, preview and export both read the
+   * offset through buildCompositeLyrics. Undefined = 0.
+   */
+  offsetFrames?: number;
+}
+
+/**
+ * One song in the song library: the audio (a sandbox copy that
+ * outlives any single project) plus the lyrics Jaizon fixed for
+ * it, so picking the song again — in any project — brings the
+ * corrected lyrics with it (Jaizon, 2026-11-11). Entries are
+ * keyed by songLibraryKey(name, duration) (src/lib/songLibrary.ts).
+ */
+export interface SongLibraryEntry {
+  key: string;
+  /** Display name (the track's file name when it was saved). */
+  name: string;
+  /** file:// URI of the library's audio copy in the sandbox. */
+  uri: string;
+  durationSeconds?: number;
+  lyrics: ProjectLyrics;
+  updatedAt: number;
 }
 
 /**

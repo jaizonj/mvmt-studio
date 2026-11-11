@@ -14,7 +14,7 @@ interface TrackSheetProps {
 
 /** Track sheet: which song, and which part of it (the AudioRegionPicker). */
 export function TrackSheet({ visible, onClose, onPickTrack }: TrackSheetProps) {
-  const { track } = useStudio();
+  const { track, songLibrary, useLibrarySong, deleteSongLibraryEntry } = useStudio();
   return (
     <Sheet visible={visible} onClose={onClose} title="Track">
       {visible && track ? (
@@ -48,6 +48,40 @@ export function TrackSheet({ visible, onClose, onPickTrack }: TrackSheetProps) {
           </Pressable>
         </>
       )}
+      {visible && songLibrary.length > 0 ? (
+        <>
+          <Text style={styles.sectionLabel}>Song library</Text>
+          {songLibrary.map((entry) => (
+            <View key={entry.key} style={styles.libraryRow}>
+              <Pressable
+                style={styles.libraryMain}
+                onPress={() => useLibrarySong(entry)}
+                accessibilityRole="button"
+                accessibilityLabel={`Use ${entry.name} with its saved lyrics`}>
+                <Ionicons name="library" size={17} color={colors.accent} />
+                <View style={styles.libraryText}>
+                  <Text style={styles.libraryName} numberOfLines={1}>
+                    {entry.name}
+                  </Text>
+                  <Text style={styles.libraryMeta}>
+                    Lyrics saved · {entry.lyrics.lines.length} {entry.lyrics.lines.length === 1 ? 'line' : 'lines'}
+                  </Text>
+                </View>
+              </Pressable>
+              <Pressable
+                onPress={() => deleteSongLibraryEntry(entry.key)}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel={`Remove ${entry.name} from the library`}>
+                <Ionicons name="trash-outline" size={17} color={colors.labelSecondary} />
+              </Pressable>
+            </View>
+          ))}
+          <Text style={styles.libraryHint}>
+            Picking a library song loads its audio with the lyrics you already fixed for it.
+          </Text>
+        </>
+      ) : null}
     </Sheet>
   );
 }
@@ -94,4 +128,18 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   confirmButtonText: { color: colors.onAccent, fontSize: 15, fontWeight: '700' },
+  libraryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+  },
+  libraryMain: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  libraryText: { flex: 1, gap: 2 },
+  libraryName: { color: colors.label, fontSize: 14, fontWeight: '600' },
+  libraryMeta: { color: colors.labelSecondary, fontSize: 12 },
+  libraryHint: { color: colors.labelSecondary, fontSize: 12, lineHeight: 17, marginTop: 2 },
 });

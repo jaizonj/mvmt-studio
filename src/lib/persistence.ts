@@ -1,6 +1,6 @@
 import { Directory, File, Paths } from 'expo-file-system';
 
-import type { Project } from '../types';
+import type { Project, SongLibraryEntry } from '../types';
 
 /**
  * Project persistence — one JSON file in the app's documents folder.
@@ -21,6 +21,9 @@ export interface PersistedProjects {
   version: 1;
   projects: Project[];
   activeProjectId: string | null;
+  /** Song library (songs + their fixed lyrics). Optional: files
+   * written before the library existed simply omit it. */
+  songLibrary?: SongLibraryEntry[];
 }
 
 const DIR_NAME = 'mvmt';

@@ -53,6 +53,13 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../theme
  * control anywhere — the model UI is state, progress and errors only.
  */
 
+/** "+0.37s" / "−0.50s" / "0.00s" readout for the offset drag bar. */
+function formatOffsetSeconds(frames: number): string {
+  const seconds = frames / DEFAULT_FPS;
+  const sign = seconds > 0 ? '+' : seconds < 0 ? '−' : '';
+  return `${sign}${Math.abs(seconds).toFixed(2)}s`;
+}
+
 interface LyricsPanelProps {
   /** Song frame that composition frame 0 maps to (the region start). */
   regionStartFrame: number;
@@ -117,6 +124,7 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [sizeDraft, setSizeDraft] = useState<number | null>(null);
+  const [offsetDraft, setOffsetDraft] = useState<number | null>(null);
   const [strokeDraft, setStrokeDraft] = useState<number | null>(null);
   const [hexDraft, setHexDraft] = useState('');
 
@@ -393,6 +401,39 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                         <NudgeButton label="+0.1s" onPress={() => studio.shiftAllLyrics(FRAME_0_1S)} />
                         <NudgeButton label="+1s" onPress={() => studio.shiftAllLyrics(DEFAULT_FPS)} />
                       </View>
+                    </View>
+
+                    {/* Fine-offset drag bar (Jaizon): nudges EVERY line
+                        in preview + export without rewriting the
+                        authored timings — the "off by half a second"
+                        fix. Stored as ProjectLyrics.offsetFrames and
+                        applied in buildCompositeLyrics. */}
+                    <View style={styles.offsetBox}>
+                      <View style={styles.sliderLabelRow}>
+                        <Text style={styles.sliderLabel}>Fine offset</Text>
+                        <Text style={styles.sliderValue}>
+                          {formatOffsetSeconds(offsetDraft ?? studio.lyricsOffsetFrames)}
+                        </Text>
+                      </View>
+                      <Slider
+                        value={offsetDraft ?? studio.lyricsOffsetFrames}
+                        minimumValue={-45}
+                        maximumValue={45}
+                        step={1}
+                        onValueChange={setOffsetDraft}
+                        onSlidingComplete={(v) => {
+                          studio.setLyricsOffset(v);
+                          setOffsetDraft(null);
+                        }}
+                        minimumTrackTintColor={colors.accent}
+                        maximumTrackTintColor={colors.elevated}
+                        thumbTintColor={colors.label}
+                        accessibilityLabel="Lyric fine offset"
+                      />
+                      <Text style={styles.caption}>
+                        Drag to shift all lyrics earlier or later — for when they're off by a beat. Preview and
+                        export follow; your line timings stay untouched.
+                      </Text>
                     </View>
 
                     {/* Tap-to-sync. */}
@@ -908,6 +949,7 @@ const styles = StyleSheet.create({
   toolButtonText: { ...typeScale.subhead, color: colors.label, fontWeight: '600' },
   shiftGroup: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
   shiftLabel: { ...typeScale.caption, color: colors.labelSecondary, marginRight: 2 },
+  offsetBox: { marginTop: spacing.md, gap: spacing.xs },
   syncRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   syncPlayButton: {
     width: 46,

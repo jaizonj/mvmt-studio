@@ -515,16 +515,20 @@ export function buildCompositeLyrics(
   fps: number,
 ): CompositeLyrics | null {
   if (!lyrics || lyrics.lines.length === 0) return null;
+  // The panel's fine-offset drag bar: a global shift applied here,
+  // at the one boundary every renderer (preview overlay + export
+  // burn-in) reads, so the authored line timings never change.
+  const offset = Math.round(lyrics.offsetFrames ?? 0);
   const out: CompositeLyricLine[] = [];
   for (const line of sortLyricLines(lyrics.lines)) {
-    const startTl = songFrameToTimelineFrame(line.startFrame, regionStartFrame);
-    const endTl = songFrameToTimelineFrame(line.endFrame, regionStartFrame);
+    const startTl = songFrameToTimelineFrame(line.startFrame, regionStartFrame) + offset;
+    const endTl = songFrameToTimelineFrame(line.endFrame, regionStartFrame) + offset;
     if (endTl <= 0 || endTl <= startTl) continue;
     const clampedStart = Math.max(0, startTl);
     const words = line.words
       ?.map((w) => {
-        const wStart = Math.max(clampedStart, songFrameToTimelineFrame(w.startFrame, regionStartFrame));
-        const wEnd = Math.min(endTl, songFrameToTimelineFrame(w.endFrame, regionStartFrame));
+        const wStart = Math.max(clampedStart, songFrameToTimelineFrame(w.startFrame, regionStartFrame) + offset);
+        const wEnd = Math.min(endTl, songFrameToTimelineFrame(w.endFrame, regionStartFrame) + offset);
         if (wEnd <= wStart) return null;
         return {
           text: w.text,
