@@ -276,7 +276,7 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
     var range = CMTimeRange(start: .zero, duration: .zero)
     guard
       layer.getTransformRamp(
-        for: time, startTransform: &start, endTransform: &end, timeRange: &range)
+        for: time, start: &start, end: &end, timeRange: &range)
     else { return .identity }
     let f = CGFloat(rampFraction(range, at: time))
     if f <= 0 { return start }
