@@ -79,6 +79,69 @@ struct CompositeRequestRecord: Record {
   /// problem degrades to rendering without lyrics, never a failure.
   @Field
   var lyrics: LyricsRecord? = nil
+
+  /// A resolved video look (src/lib/looks.ts): ONE numeric param set
+  /// the builder maps onto a CI filter chain on the composed frames.
+  /// Applies to preview AND export (the grade is part of the
+  /// composition). Nil (or the identity set) = no filtering.
+  @Field
+  var look: LookParamsRecord? = nil
+
+  /// Export size control — RENDER-ONLY fields (read by `render`,
+  /// never by the builder): the export session can't take a bitrate,
+  /// so when either is set the finished file is transcoded at an
+  /// explicit video bitrate — this one directly…
+  @Field
+  var exportVideoBitrate: Double? = nil
+
+  /// …or one computed from this target TOTAL file size in MB
+  /// (1 MB = 1,000,000 bytes) and the measured duration.
+  @Field
+  var exportTargetSizeMB: Double? = nil
+
+  /// Codec for the size-control transcode: 'h264' | 'hevc'.
+  /// Nil = 'h264'.
+  @Field
+  var exportCodec: String? = nil
+
+  /// Auto volume: measure the master song and gain it inside the
+  /// composition to −14 LUFS (peaks capped at −1 dBFS). Nil/false =
+  /// unity gain, the historical behaviour.
+  @Field
+  var normalizeVolume: Bool? = nil
+}
+
+/// The resolved numeric grade of a video look — mirrors
+/// src/lib/looks.ts LookParams field-for-field (the bridge converts
+/// by name; a mismatch silently empties the field, see the lyric
+/// style record's note). Identity = brightness 0, contrast 1,
+/// saturation 1, exposureEV 0, temperature 0, vibrance 0, sharpen 0,
+/// vignette 0.
+struct LookParamsRecord: Record {
+  @Field
+  var brightness: Double = 0
+
+  @Field
+  var contrast: Double = 1
+
+  @Field
+  var saturation: Double = 1
+
+  @Field
+  var exposureEV: Double = 0
+
+  /// Warmth offset on the 6500K neutral (positive = warmer).
+  @Field
+  var temperature: Double = 0
+
+  @Field
+  var vibrance: Double = 0
+
+  @Field
+  var sharpen: Double = 0
+
+  @Field
+  var vignette: Double = 0
 }
 
 struct LyricWordRecord: Record {
@@ -209,6 +272,24 @@ struct CompositeResultRecord: Record {
 
   @Field
   var height: Int
+
+  /// MEASURED byte size of the delivered file (after any
+  /// size-control transcode) — reported from the file system, never
+  /// estimated.
+  @Field
+  var fileSizeBytes: Int = 0
+
+  /// The video bitrate (bps) the size-control transcode applied,
+  /// when one ran (a corrective pass reports the final rate).
+  /// Nil = the file is the untouched export-session render.
+  @Field
+  var appliedVideoBitrate: Int? = nil
+
+  /// The loudness gain (dB) auto volume applied to the song inside
+  /// the composition. Nil = normalization off, unmeasurable, or the
+  /// song counted as silence.
+  @Field
+  var appliedGainDb: Double? = nil
 }
 
 struct AssetInfoRecord: Record {
@@ -408,6 +489,79 @@ private struct BuiltComposition {
   let videoComposition: AVMutableVideoComposition
   let audioMix: AVMutableAudioMix?
   let duration: CMTime
+  /// The loudness gain (dB) auto volume applied to the master song
+  /// inside this composition, when the request asked for it and a
+  /// measurement produced one. Surfaced on the render result; the
+  /// preview path ignores it (it just plays the gained mix).
+  let appliedGainDb: Double?
+}
+
+// MARK: - Loudness measurement support (auto volume)
+
+/// One song region's measured loudness: K-weighted integrated
+/// loudness (LUFS) + sample peak (dBFS) — see
+/// MvmtCompositorEngine.decodeLoudness.
+private struct LoudnessMeasurement {
+  let lufs: Double
+  let peakDbfs: Double
+}
+
+/// Session-scoped loudness cache: compositions rebuild constantly
+/// (every look/lyric edit re-previews), and re-decoding the song for
+/// each rebuild would stutter the editor. Keys carry the file path +
+/// size + mtime + the measured region, so a replaced song file or a
+/// different region never reads a stale value.
+private final class LoudnessCache {
+  static let shared = LoudnessCache()
+  private let lock = NSLock()
+  private var values: [String: LoudnessMeasurement] = [:]
+
+  func get(_ key: String) -> LoudnessMeasurement? {
+    lock.lock()
+    defer { lock.unlock() }
+    return values[key]
+  }
+
+  func set(_ key: String, _ value: LoudnessMeasurement) {
+    lock.lock()
+    values[key] = value
+    lock.unlock()
+  }
+}
+
+/// K-weighting for one channel: the two BS.1770 biquad stages
+/// (high-shelf pre-filter, then the RLB high-pass) with the standard
+/// 48 kHz coefficients. Applied at the asset's native rate — at
+/// 44.1 kHz the shelf's centre shifts slightly, an error well under
+/// half a LU for program material; this is a faithful-but-compact
+/// measurement, not a broadcast compliance meter.
+private final class KWeightingFilter {
+  private var shelfX1 = 0.0, shelfX2 = 0.0, shelfY1 = 0.0, shelfY2 = 0.0
+  private var rlbX1 = 0.0, rlbX2 = 0.0, rlbY1 = 0.0, rlbY2 = 0.0
+
+  func process(_ x: Double) -> Double {
+    let shelf =
+      1.53512485958697 * x
+      - 2.69169618940638 * shelfX1
+      + 1.19839281085285 * shelfX2
+      + 1.69065929318241 * shelfY1
+      - 0.73248077421585 * shelfY2
+    shelfX2 = shelfX1
+    shelfX1 = x
+    shelfY2 = shelfY1
+    shelfY1 = shelf
+    let rlb =
+      shelf
+      - 2.0 * rlbX1
+      + rlbX2
+      + 1.99004745483398 * rlbY1
+      - 0.99007225036621 * rlbY2
+    rlbX2 = rlbX1
+    rlbX1 = shelf
+    rlbY2 = rlbY1
+    rlbY1 = rlb
+    return rlb
+  }
 }
 
 // MARK: - Engine (AVFoundation)
@@ -581,6 +735,8 @@ private enum MvmtCompositorEngine {
 
     // ---- Master audio track over the whole cut (inserted once) ----
     var audioMixParameters: [AVMutableAudioMixInputParameters] = []
+    /// Set when auto volume gains the master track (below).
+    var appliedGainDb: Double? = nil
     if let parameters = clipAudioMixParameters {
       audioMixParameters.append(parameters)
     }
@@ -613,8 +769,37 @@ private enum MvmtCompositorEngine {
           at: .zero,
           "The master audio could not be added to the composition"
         )
+        // Auto volume: measure the region being inserted and gain
+        // it to the platform loudness (−14 LUFS, peak-capped) via
+        // this track's mix volume, so preview and export hear
+        // exactly what ships. Only the composition is gained —
+        // record-time playback and the sync correlation never see
+        // it. Measurement failure or silence leaves unity gain,
+        // silently (see measureLoudness / normalizationGainDb).
+        var masterVolume = max(0, min(1, request.audioVolume))
+        if request.normalizeVolume == true {
+          let attrs = try? FileManager.default.attributesOfItem(atPath: masterAsset.url.path)
+          let fileSize = (attrs?[.size] as? NSNumber)?.intValue ?? -1
+          let fileMtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+          let cacheKey =
+            "\(masterAsset.url.path)|\(fileSize)|\(fileMtime)|\(CMTimeGetSeconds(start))|\(CMTimeGetSeconds(length))"
+          if let measurement = await measureLoudness(
+            asset: masterAsset,
+            track: sourceMasterTrack,
+            range: CMTimeRange(start: start, duration: length),
+            cacheKey: cacheKey
+          ),
+            let gainDb = normalizationGainDb(
+              measuredLufs: measurement.lufs,
+              peakDbfs: measurement.peakDbfs
+            )
+          {
+            masterVolume *= pow(10.0, gainDb / 20.0)
+            appliedGainDb = gainDb
+          }
+        }
         let parameters = AVMutableAudioMixInputParameters(track: targetTrack)
-        parameters.setVolume(Float(max(0, min(1, request.audioVolume))), at: .zero)
+        parameters.setVolume(Float(masterVolume), at: .zero)
         audioMixParameters.append(parameters)
       }
     }
@@ -667,11 +852,28 @@ private enum MvmtCompositorEngine {
       videoComposition.animationTool = tool
     }
 
+    // ---- Optional look (edit/export-stage grade) ----
+    // A CI filter chain over the COMPOSED frames, applied through a
+    // filtering video composition that inherits this composition's
+    // instructions, render size, frame duration AND animation tool
+    // — grade and overlays coexist on the one composition the caller
+    // receives (see applyingLook). Applies to preview builds too:
+    // the editor must show the grade it will export. Any failure
+    // falls back to the unfiltered composition — a grade must never
+    // break a preview or an export.
+    var finalVideoComposition = videoComposition
+    if let look = request.look, !lookIsIdentity(look),
+      let filtered = applyingLook(look, to: videoComposition, asset: composition)
+    {
+      finalVideoComposition = filtered
+    }
+
     return BuiltComposition(
       composition: composition,
-      videoComposition: videoComposition,
+      videoComposition: finalVideoComposition,
       audioMix: audioMix,
-      duration: totalDuration
+      duration: totalDuration,
+      appliedGainDb: appliedGainDb
     )
   }
 
@@ -1549,6 +1751,283 @@ private enum MvmtCompositorEngine {
     return gateLayer
   }
 
+  // MARK: Loudness (auto volume)
+
+  /// The auto-volume gain decision — an EXACT mirror of
+  /// normalizationGainDb in src/lib/loudness.ts (where it is unit
+  /// tested); keep the two in step. Nil = apply nothing: a
+  /// non-finite measurement (decode failure) or silence — a silent
+  /// track must never be amplified into audibility.
+  static func normalizationGainDb(measuredLufs: Double, peakDbfs: Double) -> Double? {
+    guard measuredLufs.isFinite, peakDbfs.isFinite else { return nil }
+    guard measuredLufs >= -60 else { return nil }
+    let gain = min(-14 - measuredLufs, -1 - peakDbfs)
+    return min(15, max(-15, gain))
+  }
+
+  /// Measures (or recalls) the loudness of one song region. Cached
+  /// per path+size+mtime+region (LoudnessCache) because compositions
+  /// rebuild on every edit. Any failure returns nil — the caller
+  /// keeps unity gain, silently.
+  private static func measureLoudness(
+    asset: AVURLAsset,
+    track: AVAssetTrack,
+    range: CMTimeRange,
+    cacheKey: String
+  ) async -> LoudnessMeasurement? {
+    if let cached = LoudnessCache.shared.get(cacheKey) {
+      return cached
+    }
+    var sampleRate = 48_000.0
+    var streamChannels = 2
+    if let descriptions = try? await track.load(.formatDescriptions),
+      let first = descriptions.first,
+      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(first)
+    {
+      if asbd.pointee.mSampleRate > 0 { sampleRate = asbd.pointee.mSampleRate }
+      if asbd.pointee.mChannelsPerFrame > 0 { streamChannels = Int(asbd.pointee.mChannelsPerFrame) }
+    }
+    guard
+      let measurement = decodeLoudness(
+        asset: asset,
+        track: track,
+        range: range,
+        sampleRate: sampleRate,
+        streamChannels: streamChannels
+      )
+    else {
+      return nil
+    }
+    LoudnessCache.shared.set(cacheKey, measurement)
+    return measurement
+  }
+
+  /// Stream-decodes the region at the track's native rate (Float32
+  /// PCM, no full-track buffering — block energies accumulate on the
+  /// fly) and computes a BS.1770-style K-weighted integrated
+  /// loudness: per-channel K-weighting, 400 ms block energies,
+  /// absolute gate at −70 LUFS, then the standard −10 LU relative
+  /// gate. The peak is the raw SAMPLE peak (not true peak — no
+  /// oversampling), the compact approximation the −1 dBFS ceiling
+  /// budget allows for. At most the first two channels are measured
+  /// (channel weights 1.0 — front L/R; surround content is not
+  /// weighted up).
+  private static func decodeLoudness(
+    asset: AVAsset,
+    track: AVAssetTrack,
+    range: CMTimeRange,
+    sampleRate: Double,
+    streamChannels: Int
+  ) -> LoudnessMeasurement? {
+    var reader: AVAssetReader?
+    var output: AVAssetReaderTrackOutput?
+    let setupException = avTry {
+      do {
+        let createdReader = try AVAssetReader(asset: asset)
+        createdReader.timeRange = range
+        let outputSettings: [String: Any] = [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVLinearPCMBitDepthKey: 32,
+          AVLinearPCMIsFloatKey: true,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsNonInterleaved: false,
+        ]
+        let createdOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+        createdOutput.alwaysCopiesSampleData = false
+        if createdReader.canAdd(createdOutput) {
+          createdReader.add(createdOutput)
+          reader = createdReader
+          output = createdOutput
+        }
+      } catch {
+        // Unreadable — the guards below read nil as "unmeasurable".
+      }
+    }
+    guard setupException == nil, let reader, let output, reader.startReading() else {
+      return nil
+    }
+
+    let measuredChannels = max(1, min(2, streamChannels))
+    let filters = (0..<measuredChannels).map { _ in KWeightingFilter() }
+    let blockFrames = max(1, Int(0.4 * sampleRate))
+    var blockSums = [Double](repeating: 0, count: measuredChannels)
+    var framesInBlock = 0
+    var blockEnergies: [Double] = []
+    var peak = 0.0
+
+    func flushBlock() {
+      guard framesInBlock > 0 else { return }
+      var z = 0.0
+      for channel in 0..<measuredChannels {
+        z += blockSums[channel] / Double(framesInBlock)
+      }
+      blockEnergies.append(z)
+      blockSums = [Double](repeating: 0, count: measuredChannels)
+      framesInBlock = 0
+    }
+
+    while let sampleBuffer = output.copyNextSampleBuffer() {
+      guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+      let byteLength = CMBlockBufferGetDataLength(blockBuffer)
+      let floatCount = byteLength / 4
+      guard floatCount >= streamChannels else { continue }
+      var floats = [Float](repeating: 0, count: floatCount)
+      let copyStatus = floats.withUnsafeMutableBytes { pointer -> OSStatus in
+        guard let baseAddress = pointer.baseAddress else { return OSStatus(-1) }
+        return CMBlockBufferCopyDataBytes(
+          blockBuffer,
+          atOffset: 0,
+          dataLength: floatCount * 4,
+          destination: baseAddress
+        )
+      }
+      guard copyStatus == noErr else { return nil }
+      let frameCount = floatCount / streamChannels
+      for frame in 0..<frameCount {
+        let base = frame * streamChannels
+        for channel in 0..<measuredChannels {
+          let sample = Double(floats[base + channel])
+          let magnitude = abs(sample)
+          if magnitude > peak { peak = magnitude }
+          let weighted = filters[channel].process(sample)
+          blockSums[channel] += weighted * weighted
+        }
+        framesInBlock += 1
+        if framesInBlock == blockFrames {
+          flushBlock()
+        }
+      }
+    }
+    if reader.status == .failed {
+      return nil
+    }
+    // A trailing partial block still counts when it holds ≥100 ms.
+    if framesInBlock >= blockFrames / 4 {
+      flushBlock()
+    }
+    guard !blockEnergies.isEmpty else { return nil }
+
+    // Two-stage gating: absolute (−70 LUFS), then relative (−10 LU
+    // under the absolute-gated result), per BS.1770.
+    let absoluteGateZ = pow(10.0, (-70.0 + 0.691) / 10.0)
+    let absoluteGated = blockEnergies.filter { $0 > absoluteGateZ }
+    guard !absoluteGated.isEmpty else { return nil }
+    let ungatedMean = absoluteGated.reduce(0, +) / Double(absoluteGated.count)
+    let ungatedLufs = -0.691 + 10.0 * log10(ungatedMean)
+    let relativeGateZ = pow(10.0, (ungatedLufs - 10.0 + 0.691) / 10.0)
+    let gated = absoluteGated.filter { $0 > relativeGateZ }
+    let kept = gated.isEmpty ? absoluteGated : gated
+    let integrated = -0.691 + 10.0 * log10(kept.reduce(0, +) / Double(kept.count))
+    return LoudnessMeasurement(
+      lufs: integrated.isFinite ? integrated : -120,
+      peakDbfs: peak > 0 ? 20.0 * log10(peak) : -120
+    )
+  }
+
+  // MARK: Look (CI grade on the composed frames)
+
+  /// Shared CI context for the look's filtering handler (CIContext
+  /// is thread-safe; the handler runs on the compositor's queues).
+  private static let lookCIContext = CIContext()
+
+  private static func lookIsIdentity(_ look: LookParamsRecord) -> Bool {
+    abs(look.brightness) < 0.001
+      && abs(look.contrast - 1) < 0.001
+      && abs(look.saturation - 1) < 0.001
+      && abs(look.exposureEV) < 0.001
+      && abs(look.temperature) < 0.01
+      && abs(look.vibrance) < 0.001
+      && abs(look.sharpen) < 0.001
+      && abs(look.vignette) < 0.001
+  }
+
+  /// Builds the filtering twin of `base`: a video composition made
+  /// by the CI factory (its compositor grades every composed frame
+  /// through gradedImage), with the base's instructions, render
+  /// size, frame duration and — critically — animation tool copied
+  /// over, so the watermark/lyrics tool and the grade coexist on
+  /// the composition the caller receives. Guarded (avTry) like every
+  /// validate-and-throw site; nil = the caller keeps `base`.
+  private static func applyingLook(
+    _ look: LookParamsRecord,
+    to base: AVMutableVideoComposition,
+    asset: AVAsset
+  ) -> AVMutableVideoComposition? {
+    var filtered: AVMutableVideoComposition?
+    let exception = avTry {
+      let composition = AVMutableVideoComposition(
+        asset: asset,
+        applyingCIFiltersWithHandler: { request in
+          let graded = gradedImage(request.sourceImage, look: look)
+          request.finish(with: graded, context: lookCIContext)
+        }
+      )
+      composition.instructions = base.instructions
+      composition.renderSize = base.renderSize
+      composition.frameDuration = base.frameDuration
+      composition.animationTool = base.animationTool
+      filtered = composition
+    }
+    if exception != nil {
+      return nil
+    }
+    return filtered
+  }
+
+  /// The filter chain for one composed frame, built per request
+  /// (CIFilter instances are not shared across the compositor's
+  /// concurrent calls). Stages at identity values are skipped, in
+  /// the fixed order: exposure → temperature → colour controls →
+  /// vibrance → sharpen → vignette.
+  private static func gradedImage(_ source: CIImage, look: LookParamsRecord) -> CIImage {
+    var image = source
+    func apply(_ name: String, _ parameters: [String: Any]) {
+      guard let filter = CIFilter(name: name) else { return }
+      filter.setValue(image, forKey: kCIInputImageKey)
+      for (key, value) in parameters {
+        filter.setValue(value, forKey: key)
+      }
+      if let output = filter.outputImage {
+        image = output
+      }
+    }
+    if abs(look.exposureEV) > 0.001 {
+      apply("CIExposureAdjust", [kCIInputEVKey: look.exposureEV])
+    }
+    if abs(look.temperature) > 0.01 {
+      // Positive warmth: the scene's assumed neutral sits ABOVE
+      // 6500K, so converting down to a 6500 target warms the frame.
+      // 40K per warmth unit maps the ±30 range onto ±1200K.
+      let neutral = CIVector(x: CGFloat(6500 + look.temperature * 40), y: 0)
+      apply("CITemperatureAndTint", [
+        "inputNeutral": neutral,
+        "inputTargetNeutral": CIVector(x: 6500, y: 0),
+      ])
+    }
+    if abs(look.brightness) > 0.001 || abs(look.contrast - 1) > 0.001
+      || abs(look.saturation - 1) > 0.001
+    {
+      apply("CIColorControls", [
+        kCIInputBrightnessKey: look.brightness,
+        kCIInputContrastKey: look.contrast,
+        kCIInputSaturationKey: look.saturation,
+      ])
+    }
+    if abs(look.vibrance) > 0.001 {
+      apply("CIVibrance", ["inputAmount": look.vibrance])
+    }
+    if look.sharpen > 0.001 {
+      apply("CISharpenLuminance", [kCIInputSharpnessKey: look.sharpen])
+    }
+    if look.vignette > 0.001 {
+      let radius = max(source.extent.width, source.extent.height) * 0.75
+      apply("CIVignette", ["inputIntensity": look.vignette, "inputRadius": radius])
+    }
+    // Filters can grow the extent (vignette especially); the
+    // compositor wants the frame it asked for.
+    return image.cropped(to: source.extent)
+  }
+
   // MARK: Export
 
   static func render(
@@ -1609,6 +2088,12 @@ private enum MvmtCompositorEngine {
       }
     }
 
+    // When a size-control transcode will follow, the export session
+    // owns only the first 80% of the progress bar — the transcode
+    // reports the rest, so the bar never sits at 100% mid-work.
+    let sizeControlPlanned = request.exportVideoBitrate != nil || request.exportTargetSizeMB != nil
+    let progressCeiling = sizeControlPlanned ? 0.8 : 1.0
+
     let progressTask: Task<Void, Never>? = (exportId != nil && onProgress != nil)
       ? Task {
           while !Task.isCancelled {
@@ -1616,7 +2101,7 @@ private enum MvmtCompositorEngine {
             if status != .waiting && status != .exporting {
               break
             }
-            onProgress?(Double(exporter.progress))
+            onProgress?(Double(exporter.progress) * progressCeiling)
             try? await Task.sleep(nanoseconds: 100_000_000)
           }
         }
@@ -1646,7 +2131,7 @@ private enum MvmtCompositorEngine {
     }
     progressTask?.cancel()
     if exportId != nil {
-      onProgress?(1.0)
+      onProgress?(progressCeiling)
     }
 
     // MEASURE the written file — the result reports the rendered asset's
@@ -1660,14 +2145,429 @@ private enum MvmtCompositorEngine {
     let outputNaturalSize = try await outputVideoTrack.load(.naturalSize)
     let outputTransform = try await outputVideoTrack.load(.preferredTransform)
     let outputDisplay = outputNaturalSize.applying(outputTransform)
+    let measuredSeconds = CMTimeGetSeconds(measuredDuration)
+    let renderSeconds = measuredSeconds.isFinite ? measuredSeconds : 0
+
+    // ---- Size control (render-only): transcode the finished file
+    // at an explicit video bitrate (see transcodeVideoFile). The
+    // composition is untouched — the preview built from this same
+    // request stays truthful, only the file's encoding changes. ANY
+    // failure delivers the original render: size control must never
+    // fail an export.
+    var finalURL = outputURL
+    var appliedBitrate: Int? = nil
+    var targetBitrate: Int? = nil
+    if let targetMB = request.exportTargetSizeMB, targetMB > 0 {
+      targetBitrate = videoBitrate(forTargetSizeMB: targetMB, durationSeconds: renderSeconds)
+    } else if let fixed = request.exportVideoBitrate, fixed > 0 {
+      targetBitrate = Int(fixed)
+    }
+    if let targetBitrate {
+      let canvasSize = CGSize(
+        width: request.canvasWidth ?? Int(abs(outputDisplay.width).rounded()),
+        height: request.canvasHeight ?? Int(abs(outputDisplay.height).rounded())
+      )
+      let codec = request.exportCodec ?? "h264"
+      let transcodeProgress: ((Double) -> Void)? =
+        (exportId != nil && onProgress != nil)
+        ? { fraction in onProgress?(0.8 + 0.2 * fraction) }
+        : nil
+      var delivered = await transcodeVideoFile(
+        sourceURL: outputURL,
+        videoBitrateBps: targetBitrate,
+        codec: codec,
+        canvasSize: canvasSize,
+        frameRate: request.frameRate ?? 30,
+        onProgress: transcodeProgress
+      )
+      var usedBitrate = targetBitrate
+      // ONE corrective pass when a target was missed by >3%: rerun
+      // from the ORIGINAL render (not the first transcode — no
+      // double-generation loss) at the proportionally reduced rate.
+      if let first = delivered, let targetMB = request.exportTargetSizeMB, targetMB > 0,
+        let firstSize = fileSizeBytes(first)
+      {
+        let targetBytes = targetMB * 1_000_000
+        if Double(firstSize) > targetBytes * 1.03, targetBitrate > transcodeMinVideoBitrate {
+          let corrected = max(
+            transcodeMinVideoBitrate,
+            Int(Double(targetBitrate) * targetBytes / Double(firstSize))
+          )
+          if corrected < targetBitrate,
+            let second = await transcodeVideoFile(
+              sourceURL: outputURL,
+              videoBitrateBps: corrected,
+              codec: codec,
+              canvasSize: canvasSize,
+              frameRate: request.frameRate ?? 30,
+              onProgress: transcodeProgress
+            )
+          {
+            try? FileManager.default.removeItem(at: first)
+            delivered = second
+            usedBitrate = corrected
+          }
+        }
+      }
+      if let delivered {
+        // The transcoded file supersedes the original render.
+        try? FileManager.default.removeItem(at: outputURL)
+        finalURL = delivered
+        appliedBitrate = usedBitrate
+      }
+      if exportId != nil {
+        onProgress?(1.0)
+      }
+    }
+
+    // Re-measure when the delivered file is the transcoded one.
+    var resultDuration = renderSeconds
+    var resultWidth = Int(abs(outputDisplay.width).rounded())
+    var resultHeight = Int(abs(outputDisplay.height).rounded())
+    if finalURL != outputURL {
+      let finalAsset = AVURLAsset(url: finalURL)
+      if let finalDuration = try? await finalAsset.load(.duration) {
+        let seconds = CMTimeGetSeconds(finalDuration)
+        if seconds.isFinite {
+          resultDuration = seconds
+        }
+      }
+      if let finalTrack = (try? await finalAsset.loadTracks(withMediaType: .video))?.first,
+        let finalNaturalSize = try? await finalTrack.load(.naturalSize),
+        let finalTransform = try? await finalTrack.load(.preferredTransform)
+      {
+        let display = finalNaturalSize.applying(finalTransform)
+        resultWidth = Int(abs(display.width).rounded())
+        resultHeight = Int(abs(display.height).rounded())
+      }
+    }
 
     let result = CompositeResultRecord()
-    result.uri = outputURL.absoluteString
-    let measuredSeconds = CMTimeGetSeconds(measuredDuration)
-    result.durationSeconds = measuredSeconds.isFinite ? measuredSeconds : 0
-    result.width = Int(abs(outputDisplay.width).rounded())
-    result.height = Int(abs(outputDisplay.height).rounded())
+    result.uri = finalURL.absoluteString
+    result.durationSeconds = resultDuration
+    result.width = resultWidth
+    result.height = resultHeight
+    result.fileSizeBytes = fileSizeBytes(finalURL) ?? 0
+    result.appliedVideoBitrate = appliedBitrate
+    result.appliedGainDb = built.appliedGainDb
     return result
+  }
+
+  // MARK: Export size control (post-render transcode)
+
+  /// Audio allowance inside a target file size, and the bitrate the
+  /// transcode re-encodes audio at when passthrough is impossible.
+  private static let transcodeAudioBitrateBps = 192_000
+
+  /// Video bitrate floor for target-size work — mirrors
+  /// MIN_VIDEO_BITRATE_BPS in src/lib/exportSize.ts.
+  private static let transcodeMinVideoBitrate = 800_000
+
+  /// The video bitrate that makes a render of `durationSeconds`
+  /// land at `targetMB` total — an EXACT mirror of
+  /// videoBitrateForTargetSize in src/lib/exportSize.ts (where it is
+  /// unit tested); keep the two in step.
+  static func videoBitrate(forTargetSizeMB targetMB: Double, durationSeconds: Double) -> Int {
+    guard durationSeconds > 0, targetMB > 0 else { return transcodeMinVideoBitrate }
+    let raw = ((targetMB * 8_000_000) / durationSeconds - Double(transcodeAudioBitrateBps)) * 0.94
+    return max(transcodeMinVideoBitrate, Int(raw))
+  }
+
+  private static func fileSizeBytes(_ url: URL) -> Int? {
+    let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+    return (attributes?[.size] as? NSNumber)?.intValue
+  }
+
+  /// Transcodes a finished render at an explicit video bitrate via
+  /// AVAssetReader → AVAssetWriter. The composition is NOT involved:
+  /// the source is a plain file (watermark/lyrics already burned
+  /// in), re-framed onto the canvas with the builder's aspect-fill
+  /// normalisation at the target frame rate. Audio passes through
+  /// untouched when possible (the export session writes AAC);
+  /// otherwise it is re-encoded to AAC 192k stereo. Returns nil on
+  /// ANY failure — the caller delivers the original render.
+  private static func transcodeVideoFile(
+    sourceURL: URL,
+    videoBitrateBps: Int,
+    codec: String,
+    canvasSize: CGSize,
+    frameRate: Double,
+    onProgress: ((Double) -> Void)? = nil
+  ) async -> URL? {
+    let asset = AVURLAsset(url: sourceURL)
+    guard
+      let videoTrack = (try? await asset.loadTracks(withMediaType: .video))?.first,
+      let duration = try? await asset.load(.duration),
+      let naturalSize = try? await videoTrack.load(.naturalSize),
+      let preferredTransform = try? await videoTrack.load(.preferredTransform)
+    else {
+      return nil
+    }
+    let durationSeconds = CMTimeGetSeconds(duration)
+    guard durationSeconds.isFinite, durationSeconds > 0 else { return nil }
+    let audioTrack = (try? await asset.loadTracks(withMediaType: .audio))?.first
+    var audioFormatDescription: CMFormatDescription?
+    if let audioTrack {
+      audioFormatDescription = (try? await audioTrack.load(.formatDescriptions))?.first
+    }
+
+    let attempts: [Bool] = audioTrack != nil ? [true, false] : [false]
+    for passthroughAudio in attempts {
+      if let url = await transcodeAttempt(
+        asset: asset,
+        videoTrack: videoTrack,
+        audioTrack: audioTrack,
+        audioFormatDescription: audioFormatDescription,
+        naturalSize: naturalSize,
+        preferredTransform: preferredTransform,
+        durationSeconds: durationSeconds,
+        videoBitrateBps: videoBitrateBps,
+        codec: codec,
+        canvasSize: canvasSize,
+        frameRate: frameRate,
+        passthroughAudio: passthroughAudio,
+        onProgress: onProgress
+      ) {
+        return url
+      }
+    }
+    return nil
+  }
+
+  /// One transcode attempt with a chosen audio strategy. All
+  /// construction is validate-and-throw territory, so it runs
+  /// inside avTry with Swift errors collected (the
+  /// insertTimeRangeGuarded pattern).
+  private static func transcodeAttempt(
+    asset: AVAsset,
+    videoTrack: AVAssetTrack,
+    audioTrack: AVAssetTrack?,
+    audioFormatDescription: CMFormatDescription?,
+    naturalSize: CGSize,
+    preferredTransform: CGAffineTransform,
+    durationSeconds: Double,
+    videoBitrateBps: Int,
+    codec: String,
+    canvasSize: CGSize,
+    frameRate: Double,
+    passthroughAudio: Bool,
+    onProgress: ((Double) -> Void)?
+  ) async -> URL? {
+    guard
+      let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    else {
+      return nil
+    }
+    let outputURL = cachesDirectory.appendingPathComponent("mvmt-export-sized-\(UUID().uuidString).mp4")
+    if FileManager.default.fileExists(atPath: outputURL.path) {
+      try? FileManager.default.removeItem(at: outputURL)
+    }
+
+    var reader: AVAssetReader?
+    var writer: AVAssetWriter?
+    var videoOutput: AVAssetReaderVideoCompositionOutput?
+    var videoInput: AVAssetWriterInput?
+    var audioOutput: AVAssetReaderTrackOutput?
+    var audioInput: AVAssetWriterInput?
+    var setupError: Error?
+    let setupException = avTry {
+      do {
+        let createdReader = try AVAssetReader(asset: asset)
+        let createdWriter = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+
+        // Reader-side video composition: the target frame rate and
+        // canvas, with the builder's aspect-fill normalisation, so
+        // the transcoded file is framed exactly like the render.
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.renderSize = canvasSize
+        videoComposition.frameDuration = CMTime(
+          value: 1,
+          timescale: CMTimeScale(max(1.0, frameRate).rounded())
+        )
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(
+          start: .zero,
+          duration: CMTime(seconds: durationSeconds, preferredTimescale: 600)
+        )
+        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+        let displayRect = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
+        let displaySize = CGSize(width: abs(displayRect.width), height: abs(displayRect.height))
+        if displaySize.width > 0, displaySize.height > 0 {
+          let fillScale = max(
+            canvasSize.width / displaySize.width,
+            canvasSize.height / displaySize.height
+          )
+          var transform = preferredTransform
+          transform = transform.concatenating(
+            CGAffineTransform(translationX: -displayRect.origin.x, y: -displayRect.origin.y)
+          )
+          transform = transform.concatenating(CGAffineTransform(scaleX: fillScale, y: fillScale))
+          let centreX = (canvasSize.width - displaySize.width * fillScale) / 2
+          let centreY = (canvasSize.height - displaySize.height * fillScale) / 2
+          transform = transform.concatenating(
+            CGAffineTransform(translationX: centreX, y: centreY)
+          )
+          layerInstruction.setTransform(transform, at: .zero)
+        }
+        instruction.layerInstructions = [layerInstruction]
+        videoComposition.instructions = [instruction]
+
+        let createdVideoOutput = AVAssetReaderVideoCompositionOutput(
+          videoTracks: [videoTrack],
+          videoSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+          ]
+        )
+        createdVideoOutput.videoComposition = videoComposition
+        guard createdReader.canAdd(createdVideoOutput) else {
+          throw compositorError("The transcode reader rejected the video output.")
+        }
+        createdReader.add(createdVideoOutput)
+
+        // No AVVideoExpectedSourceFrameRateKey (the cadence lives in
+        // the reader composition's frameDuration) — the banned-key
+        // discipline from the capture writer applies here too.
+        var compressionProperties: [String: Any] = [
+          AVVideoAverageBitRateKey: videoBitrateBps,
+          AVVideoMaxKeyFrameIntervalKey: 60,
+        ]
+        let codecType: AVVideoCodecType = codec == "hevc" ? .hevc : .h264
+        if codecType == .h264 {
+          compressionProperties[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+        }
+        let videoSettings: [String: Any] = [
+          AVVideoCodecKey: codecType,
+          AVVideoWidthKey: Int(canvasSize.width),
+          AVVideoHeightKey: Int(canvasSize.height),
+          AVVideoCompressionPropertiesKey: compressionProperties,
+        ]
+        let createdVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        createdVideoInput.expectsMediaDataInRealTime = false
+        guard createdWriter.canAdd(createdVideoInput) else {
+          throw compositorError("The transcode writer rejected the video input.")
+        }
+        createdWriter.add(createdVideoInput)
+
+        if let audioTrack {
+          let createdAudioOutput: AVAssetReaderTrackOutput
+          let createdAudioInput: AVAssetWriterInput
+          if passthroughAudio {
+            // Nil settings on both sides = the samples pass through
+            // in their stored (AAC) format untouched.
+            createdAudioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+            createdAudioInput = AVAssetWriterInput(
+              mediaType: .audio,
+              outputSettings: nil,
+              sourceFormatHint: audioFormatDescription
+            )
+          } else {
+            createdAudioOutput = AVAssetReaderTrackOutput(
+              track: audioTrack,
+              outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 2,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+              ]
+            )
+            createdAudioInput = AVAssetWriterInput(
+              mediaType: .audio,
+              outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: transcodeAudioBitrateBps,
+              ]
+            )
+          }
+          createdAudioOutput.alwaysCopiesSampleData = false
+          createdAudioInput.expectsMediaDataInRealTime = false
+          guard createdReader.canAdd(createdAudioOutput) else {
+            throw compositorError("The transcode reader rejected the audio output.")
+          }
+          createdReader.add(createdAudioOutput)
+          guard createdWriter.canAdd(createdAudioInput) else {
+            throw compositorError("The transcode writer rejected the audio input.")
+          }
+          createdWriter.add(createdAudioInput)
+          audioOutput = createdAudioOutput
+          audioInput = createdAudioInput
+        }
+
+        reader = createdReader
+        writer = createdWriter
+        videoOutput = createdVideoOutput
+        videoInput = createdVideoInput
+      } catch {
+        setupError = error
+      }
+    }
+    guard setupException == nil, setupError == nil,
+      let reader, let writer, let videoOutput, let videoInput
+    else {
+      return nil
+    }
+
+    guard reader.startReading(), writer.startWriting() else {
+      writer.cancelWriting()
+      return nil
+    }
+    writer.startSession(atSourceTime: .zero)
+
+    // The classic reader/writer pump: each input pulls from its
+    // output on its own serial queue until the output runs dry.
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      let group = DispatchGroup()
+      group.enter()
+      var videoFinished = false
+      videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "au.mvmtstudio.transcode.video")) {
+        if videoFinished { return }
+        while videoInput.isReadyForMoreMediaData {
+          guard let buffer = videoOutput.copyNextSampleBuffer() else { break }
+          if !videoInput.append(buffer) { break }
+          let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
+          let seconds = CMTimeGetSeconds(pts)
+          if seconds.isFinite, durationSeconds > 0 {
+            onProgress?(min(1, max(0, seconds / durationSeconds)))
+          }
+        }
+        videoFinished = true
+        videoInput.markAsFinished()
+        group.leave()
+      }
+      if let audioInput, let audioOutput {
+        group.enter()
+        var audioFinished = false
+        audioInput.requestMediaDataWhenReady(
+          on: DispatchQueue(label: "au.mvmtstudio.transcode.audio")
+        ) {
+          if audioFinished { return }
+          while audioInput.isReadyForMoreMediaData {
+            guard let buffer = audioOutput.copyNextSampleBuffer() else { break }
+            if !audioInput.append(buffer) { break }
+          }
+          audioFinished = true
+          audioInput.markAsFinished()
+          group.leave()
+        }
+      }
+      group.notify(queue: DispatchQueue(label: "au.mvmtstudio.transcode.done")) {
+        continuation.resume()
+      }
+    }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      writer.finishWriting {
+        continuation.resume()
+      }
+    }
+    guard writer.status == .completed, reader.status != .failed else {
+      try? FileManager.default.removeItem(at: outputURL)
+      return nil
+    }
+    return outputURL
   }
 
   // MARK: Asset inspection
@@ -2716,6 +3616,33 @@ private enum CaptureQuality: String {
     case .p1080at60, .p4kAt60: return 60
     }
   }
+
+  /// Writer video bitrate (bps) for a take of the given size at the
+  /// given cadence — the tuned "Balanced" table (Jaizon, 2026-11-10):
+  /// HEVC at these rates matches the old H.264 look at ~40% fewer
+  /// bits (the old bpp formula produced ≈10/20/45 Mbps). Keyed on the
+  /// DELIVERED pixels × fps — not the requested quality — because a
+  /// format fallback can hand the writer a different cadence than
+  /// the quality asked for. Unlisted shapes scale the 1080p60 figure
+  /// by their pixel-throughput ratio.
+  static func writerVideoBitrate(pixelCount: Double, framesPerSecond: Double) -> Int {
+    let hdPixels = 1920.0 * 1080.0
+    let uhdPixels = 3840.0 * 2160.0
+    let isHD = abs(pixelCount - hdPixels) < hdPixels * 0.05
+    let isUHD = abs(pixelCount - uhdPixels) < uhdPixels * 0.05
+    if isHD, framesPerSecond < 45 {
+      return 8_000_000 // 1080p30
+    }
+    if isHD {
+      return 14_000_000 // 1080p60
+    }
+    if isUHD, framesPerSecond >= 45 {
+      return 30_000_000 // 4K60
+    }
+    let reference = hdPixels * 60.0
+    let scaled = 14_000_000.0 * (pixelCount * framesPerSecond) / reference
+    return Int(min(60_000_000.0, max(1_000_000.0, scaled)))
+  }
 }
 
 private struct CaptureConfiguration {
@@ -2725,6 +3652,12 @@ private struct CaptureConfiguration {
   var zoom: Double = 0
   var mirrored: Bool = false
   var quality: CaptureQuality = .p1080at30
+  /// Stabilization preference (Settings, default ON): the capture
+  /// connections run .auto when true, .off when false.
+  var stabilization: Bool = true
+  /// Exposure-lock preference (Settings, default ON): exposure +
+  /// white balance lock for the duration of each take.
+  var lockExposureWhileRecording: Bool = true
 }
 
 private final class CaptureCoordinator: NSObject,
@@ -2798,6 +3731,10 @@ private final class CaptureCoordinator: NSObject,
   }
 
   private var state: State = .idle
+  /// True while THIS capture holds the device's exposure / white
+  /// balance locked (see lockExposureForCaptureLocked) — cleanup
+  /// restores continuous auto only when a lock was actually taken.
+  private var exposureLockedForCapture = false
   private var writer: AVAssetWriter?
   private var videoWriterInput: AVAssetWriterInput?
   private var audioWriterInput: AVAssetWriterInput?
@@ -2919,6 +3856,44 @@ private final class CaptureCoordinator: NSObject,
             self.updateSessionRunningLocked()
           }
         }
+        continuation.resume()
+      }
+    }
+  }
+
+  /// Applies the Settings stabilization toggle. The mode itself is
+  /// (re)asserted by applyConnectionSettingsLocked; like the other
+  /// preferences this never reconfigures mid-capture — a change made
+  /// while recording lands on the connection from the next take.
+  func setStabilization(_ enabled: Bool) async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      queue.async { [weak self] in
+        guard let self else {
+          continuation.resume()
+          return
+        }
+        if self.configuration.stabilization != enabled {
+          self.configuration.stabilization = enabled
+          if self.state != .recording, self.state != .preparing {
+            self.applyConnectionSettingsLocked()
+          }
+        }
+        continuation.resume()
+      }
+    }
+  }
+
+  /// Applies the Settings exposure-lock toggle. Just stores the
+  /// preference: beginCaptureLocked reads it when a take arms and
+  /// cleanupCaptureLocked restores continuous auto when it ends.
+  func setExposureLock(_ enabled: Bool) async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      queue.async { [weak self] in
+        guard let self else {
+          continuation.resume()
+          return
+        }
+        self.configuration.lockExposureWhileRecording = enabled
         continuation.resume()
       }
     }
@@ -3177,6 +4152,7 @@ private final class CaptureCoordinator: NSObject,
         connection.automaticallyAdjustsVideoMirroring = false
         connection.isVideoMirrored = mirrored
       }
+      applyStabilization(on: connection)
     }
     if let layer = previewLayer {
       let layerConnection = layer.connection
@@ -3187,8 +4163,23 @@ private final class CaptureCoordinator: NSObject,
             layerConnection.automaticallyAdjustsVideoMirroring = false
             layerConnection.isVideoMirrored = mirrored
           }
+          self.applyStabilization(on: layerConnection)
         }
       }
+    }
+  }
+
+  /// Stabilization from the Settings preference: .auto (the device
+  /// picks the strongest mode the active format supports) or .off,
+  /// applied wherever the connection supports it. The writer
+  /// connection's mode is what the recorded file gets; the preview
+  /// layer's connection is set identically so the preview doesn't
+  /// promise steadiness the file won't have (or vice versa).
+  private func applyStabilization(on connection: AVCaptureConnection) {
+    guard connection.isVideoStabilizationSupported else { return }
+    let mode: AVCaptureVideoStabilizationMode = configuration.stabilization ? .auto : .off
+    if connection.preferredVideoStabilizationMode != mode {
+      connection.preferredVideoStabilizationMode = mode
     }
   }
 
@@ -3545,6 +4536,15 @@ private final class CaptureCoordinator: NSObject,
       return
     }
 
+    // Exposure lock (Settings, default ON): freeze exposure + white
+    // balance at their armed values for the whole take, so the
+    // picture can't breathe mid-performance. Armed HERE — after the
+    // session is configured and the writer exists, the last point
+    // where every exit still funnels through cleanupCaptureLocked
+    // (which restores continuous auto). Best-effort by design: a
+    // device that refuses simply records unlocked.
+    lockExposureForCaptureLocked()
+
     state = .preparing
     // From here to cleanupCaptureLocked every delivered frame is a
     // potential timing hole in the take: stop discarding late frames
@@ -3843,6 +4843,28 @@ private final class CaptureCoordinator: NSObject,
 
   // MARK: Writer plumbing (queue only, driven by the delegates)
 
+  /// Creates a video writer input inside avTry: the initialiser
+  /// validates the settings against the sourceFormatHint and can
+  /// raise an NSException (see the ban-list note in
+  /// startWriterLocked) — a raise reads as nil here, so the caller
+  /// can fall back or abort the take cleanly, never the process.
+  private func makeVideoWriterInput(
+    settings: [String: Any],
+    formatDescription: CMFormatDescription
+  ) -> AVAssetWriterInput? {
+    var created: AVAssetWriterInput?
+    avTry {
+      let input = AVAssetWriterInput(
+        mediaType: .video,
+        outputSettings: settings,
+        sourceFormatHint: formatDescription
+      )
+      input.expectsMediaDataInRealTime = true
+      created = input
+    }
+    return created
+  }
+
   /// Creates the writer inputs from the first video buffer's own
   /// format description (post-rotation dimensions — ground truth,
   /// not a guess from the device format), starts the writer session
@@ -3858,53 +4880,71 @@ private final class CaptureCoordinator: NSObject,
       return false
     }
     let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
-    // Bitrate follows pixel throughput at the active frame rate:
-    // ≈0.16 bits per pixel at 1080p (≈10 Mbps at 30fps — the proven
-    // figure — and ≈20 Mbps at 60fps), easing to ≈0.09 above four
-    // megapixels, where frames compress more efficiently per pixel
-    // (≈45 Mbps at 4K60). Derived from THIS buffer's dimensions and
-    // the configured cadence, never hardcoded per quality.
     let pixelCount = Double(dimensions.width) * Double(dimensions.height)
-    let bitsPerPixel = pixelCount > 4_000_000 ? 0.09 : 0.16
-    let averageBitRate = Int(pixelCount * activeFramesPerSecond * bitsPerPixel)
-    var videoSettings: [String: Any] = [
-      AVVideoCodecKey: AVVideoCodecType.h264,
+    // Bitrate: the tuned "Balanced" table (see
+    // CaptureQuality.writerVideoBitrate) — 8/14/30 Mbps by delivered
+    // size × cadence, derived from THIS buffer's dimensions and the
+    // configured frame rate, never from the requested quality alone.
+    let targetBitRate = CaptureQuality.writerVideoBitrate(
+      pixelCount: pixelCount,
+      framesPerSecond: activeFramesPerSecond
+    )
+    // Deliberately NO AVVideoExpectedSourceFrameRateKey in either
+    // settings dict below: with a sourceFormatHint attached,
+    // AVAssetWriterInput's initialiser validates the settings and
+    // THREW an uncaught NSException on device the moment record was
+    // pressed (crash log MVMTStudio-2026-11-09-213806). It was only
+    // an encoder hint — the real cadence lives in the sample
+    // timestamps. Input creation goes through makeVideoWriterInput
+    // (avTry): whatever the initialiser validates, a rejection falls
+    // back or aborts this take cleanly, never the process.
+    //
+    // HEVC first (Balanced update): the same settings shape as the
+    // proven H.264 path minus the profile-level key — optional for
+    // HEVC, and a wrong constant is exactly the kind of thing the
+    // initialiser validates-and-throws over. ANY failure (exception,
+    // nil, the writer refusing the input) falls back to the legacy
+    // H.264 settings — the bpp formula (≈0.16 bpp at 1080p, ≈0.09
+    // above four megapixels) that recorded every take before this
+    // update — so a device that can't encode HEVC in this pipeline
+    // records exactly as it always has.
+    let hevcSettings: [String: Any] = [
+      AVVideoCodecKey: AVVideoCodecType.hevc,
       AVVideoWidthKey: Int(dimensions.width),
       AVVideoHeightKey: Int(dimensions.height),
       AVVideoCompressionPropertiesKey: [
-        AVVideoAverageBitRateKey: averageBitRate,
-        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+        AVVideoAverageBitRateKey: targetBitRate
       ],
     ]
-    // Deliberately NO AVVideoExpectedSourceFrameRateKey here: with a
-    // sourceFormatHint attached, AVAssetWriterInput's initialiser
-    // validates the settings and THREW an uncaught NSException on
-    // device the moment record was pressed (crash log
-    // MVMTStudio-2026-11-09-213806). It was only an encoder hint —
-    // the real cadence lives in the sample timestamps. The settings
-    // below are exactly the shape that recorded fine in every
-    // pre-60fps build. The initialiser is ALSO wrapped in avTry now:
-    // whatever it validates, a rejection must abort this take
-    // cleanly (the app's notice path), never the process.
-    var createdVideoInput: AVAssetWriterInput?
-    if let exception = avTry({
-      let input = AVAssetWriterInput(
-        mediaType: .video,
-        outputSettings: videoSettings,
-        sourceFormatHint: formatDescription
+    var createdVideoInput = makeVideoWriterInput(
+      settings: hevcSettings,
+      formatDescription: formatDescription
+    )
+    if let input = createdVideoInput, !writer.canAdd(input) {
+      createdVideoInput = nil
+    }
+    if createdVideoInput == nil {
+      let bitsPerPixel = pixelCount > 4_000_000 ? 0.09 : 0.16
+      let legacyBitRate = Int(pixelCount * activeFramesPerSecond * bitsPerPixel)
+      let h264Settings: [String: Any] = [
+        AVVideoCodecKey: AVVideoCodecType.h264,
+        AVVideoWidthKey: Int(dimensions.width),
+        AVVideoHeightKey: Int(dimensions.height),
+        AVVideoCompressionPropertiesKey: [
+          AVVideoAverageBitRateKey: legacyBitRate,
+          AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+        ],
+      ]
+      createdVideoInput = makeVideoWriterInput(
+        settings: h264Settings,
+        formatDescription: formatDescription
       )
-      input.expectsMediaDataInRealTime = true
-      createdVideoInput = input
-    }) {
-      abortCaptureLocked(error: exceptionError("The video writer input was rejected", exception))
-      return false
+      if let input = createdVideoInput, !writer.canAdd(input) {
+        createdVideoInput = nil
+      }
     }
     guard let videoInput = createdVideoInput else {
       abortCaptureLocked(error: compositorError("The video writer input could not be created."))
-      return false
-    }
-    guard writer.canAdd(videoInput) else {
-      abortCaptureLocked(error: compositorError("The writer rejected the video input."))
       return false
     }
     writer.add(videoInput)
@@ -4157,7 +5197,69 @@ private final class CaptureCoordinator: NSObject,
     cleanupCaptureLocked()
   }
 
+  /// Locks the active device's exposure + white balance for the
+  /// take being armed (see beginCaptureLocked). Guarded like every
+  /// device-configuration site in this coordinator: lockForConfiguration
+  /// + the mode assignments run inside avTry, the device is unlocked
+  /// outside the guard, and ANY failure leaves the take unlocked —
+  /// an enhancement must never fail a recording.
+  private func lockExposureForCaptureLocked() {
+    exposureLockedForCapture = false
+    guard configuration.lockExposureWhileRecording, let device = videoDevice else { return }
+    var deviceLocked = false
+    var applied = false
+    let exception = avTry {
+      do {
+        try device.lockForConfiguration()
+        deviceLocked = true
+        if device.isExposureModeSupported(.locked) {
+          device.exposureMode = .locked
+          applied = true
+        }
+        if device.isWhiteBalanceModeSupported(.locked) {
+          device.whiteBalanceMode = .locked
+          applied = true
+        }
+      } catch {
+        // lockForConfiguration refused — the take proceeds unlocked.
+      }
+    }
+    if deviceLocked {
+      device.unlockForConfiguration()
+    }
+    exposureLockedForCapture = exception == nil && applied
+  }
+
+  /// Restores continuous auto exposure / white balance after a take
+  /// that held them locked. Same guard discipline as the lock.
+  private func restoreExposureLocked() {
+    guard exposureLockedForCapture else { return }
+    exposureLockedForCapture = false
+    guard let device = videoDevice else { return }
+    var deviceLocked = false
+    avTry {
+      do {
+        try device.lockForConfiguration()
+        deviceLocked = true
+        if device.isExposureModeSupported(.continuousAutoExposure) {
+          device.exposureMode = .continuousAutoExposure
+        }
+        if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+          device.whiteBalanceMode = .continuousAutoWhiteBalance
+        }
+      } catch {
+        // Nothing to restore against a device that won't configure.
+      }
+    }
+    if deviceLocked {
+      device.unlockForConfiguration()
+    }
+  }
+
   private func cleanupCaptureLocked() {
+    // Undo the take's exposure lock first, while the device that was
+    // locked is still the configured one.
+    restoreExposureLocked()
     // The capture is over (finish and abort both funnel here): idle
     // frames may be discarded late again, so the preview can never
     // backlog the session between takes.
@@ -4388,6 +5490,14 @@ public class MvmtCompositorModule: Module {
 
     AsyncFunction("setCaptureQuality") { (quality: String) in
       await CaptureCoordinator.shared.setQuality(quality)
+    }
+
+    AsyncFunction("setCaptureStabilization") { (enabled: Bool) in
+      await CaptureCoordinator.shared.setStabilization(enabled)
+    }
+
+    AsyncFunction("setCaptureExposureLock") { (enabled: Bool) in
+      await CaptureCoordinator.shared.setExposureLock(enabled)
     }
 
     AsyncFunction("createPreview") { (request: CompositeRequestRecord) -> String in

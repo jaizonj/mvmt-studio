@@ -134,6 +134,62 @@ export interface CompositeRequest {
    * LyricsOverlay instead. Null/absent = no lyrics.
    */
   lyrics?: CompositeLyrics | null;
+  /**
+   * A resolved video look (src/lib/looks.ts — preset + intensity +
+   * overrides already folded into ONE numeric param set by the JS
+   * side; the engine applies the numbers blindly as a CI filter
+   * chain). Unlike the watermark/lyrics this DOES apply to previews:
+   * the grade is part of the composition itself, so the editor
+   * preview and the export render show the same picture. Null/absent
+   * (or the identity set) = no filtering.
+   */
+  look?: ResolvedLookParams | null;
+  /**
+   * EXPORT SIZE CONTROL — render-only fields: they never touch the
+   * composition, so the preview built from this same request stays a
+   * truthful picture of the cut; they only change how the rendered
+   * FILE is encoded. AVAssetExportSession can't take a bitrate, so
+   * when either field is set the engine renders as usual and then
+   * transcodes the finished file (reader → writer) at an explicit
+   * video bitrate: `exportVideoBitrate` directly, or one computed
+   * from `exportTargetSizeMB` and the measured duration. Absent =
+   * the render is delivered exactly as the export session wrote it.
+   */
+  exportVideoBitrate?: number | null;
+  /** Target TOTAL file size in MB (1 MB = 1,000,000 bytes). */
+  exportTargetSizeMB?: number | null;
+  /** Codec for the size-control transcode. Default 'h264'. */
+  exportCodec?: 'h264' | 'hevc' | null;
+  /**
+   * Auto volume: when true, the engine measures the master song's
+   * loudness (K-weighted LUFS + sample peak, BS.1770-style) and gains
+   * the song inside the composition to the platform level (−14 LUFS,
+   * peaks capped at −1 dBFS). Part of the composition, so previews
+   * and exports agree. Absent/false = unity gain, the historical
+   * behaviour. Measurement failure or silence leaves the gain at
+   * unity, silently. Record-time playback and sync measurement are
+   * never affected — only the built composition.
+   */
+  normalizeVolume?: boolean;
+}
+
+/**
+ * A video look with every choice RESOLVED to numbers (src/lib/looks.ts
+ * does the resolving; this mirrors types.ts LookParams). The native
+ * side maps the set onto a Core Image chain: CIExposureAdjust →
+ * CITemperatureAndTint → CIColorControls → CIVibrance →
+ * CISharpenLuminance → CIVignette, skipping stages at identity.
+ */
+export interface ResolvedLookParams {
+  brightness: number;
+  contrast: number;
+  saturation: number;
+  exposureEV: number;
+  /** Warmth offset on the 6500K CI neutral (positive = warmer). */
+  temperature: number;
+  vibrance: number;
+  sharpen: number;
+  vignette: number;
 }
 
 export interface CompositeResult {
@@ -148,6 +204,24 @@ export interface CompositeResult {
   width: number;
   /** Measured frame height of the written file (display size). */
   height: number;
+  /**
+   * MEASURED byte size of the delivered file (after any size-control
+   * transcode). Optional: absent in older native builds.
+   */
+  fileSizeBytes?: number;
+  /**
+   * The video bitrate (bps) the size-control transcode actually
+   * applied, when one ran — including a corrective second pass.
+   * Null/absent when the file is the untouched export-session render.
+   */
+  appliedVideoBitrate?: number | null;
+  /**
+   * The loudness gain (dB) auto volume applied to the song inside
+   * the composition, when the request asked for normalization and a
+   * measurement produced one. Null/absent when the toggle was off,
+   * the song couldn't be measured, or it counted as silence.
+   */
+  appliedGainDb?: number | null;
 }
 
 /** Measured facts about a media file, from the native inspector. */
@@ -339,6 +413,8 @@ interface NativeMvmtCompositorModule {
   stopCapture(): Promise<CaptureResult>;
   prepareSong(songUri: string | null): Promise<void>;
   setCaptureQuality(quality: string): Promise<void>;
+  setCaptureStabilization(enabled: boolean): Promise<void>;
+  setCaptureExposureLock(enabled: boolean): Promise<void>;
   createPreview(request: CompositeRequest): Promise<string>;
   setPreviewPaused(previewId: string, paused: boolean): Promise<void>;
   seekPreview(previewId: string, seconds: number): Promise<void>;
@@ -576,6 +652,37 @@ export async function setCaptureQuality(quality: CaptureQuality): Promise<void> 
     return;
   }
   return nativeModule.setCaptureQuality(quality);
+}
+
+/**
+ * Video stabilization for the native recorder (Settings toggle,
+ * default ON): when enabled the capture connections run with
+ * `preferredVideoStabilizationMode = .auto` (the device picks the
+ * strongest mode the active format supports); disabled = `.off`.
+ * Best-effort like `setCaptureQuality`: silently no-ops in Expo Go
+ * and in older builds without the function.
+ */
+export async function setCaptureStabilization(enabled: boolean): Promise<void> {
+  if (!nativeModule || typeof nativeModule.setCaptureStabilization !== 'function') {
+    return;
+  }
+  return nativeModule.setCaptureStabilization(enabled);
+}
+
+/**
+ * Exposure lock for the native recorder (Settings toggle, default
+ * ON): while a take records, the camera's exposure and white balance
+ * are locked at their armed values so the picture can't breathe
+ * mid-performance (walking past a window, stage lights sweeping);
+ * continuous auto resumes when the take ends. A device that refuses
+ * the lock simply records unlocked. Best-effort like
+ * `setCaptureQuality`.
+ */
+export async function setCaptureExposureLock(enabled: boolean): Promise<void> {
+  if (!nativeModule || typeof nativeModule.setCaptureExposureLock !== 'function') {
+    return;
+  }
+  return nativeModule.setCaptureExposureLock(enabled);
 }
 
 type NativeCaptureViewComponent = ComponentType<CapturePreviewProps>;

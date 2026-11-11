@@ -2,6 +2,7 @@ import type { CameraType, VideoQuality } from 'expo-camera';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import type { Edl } from '../lib/edl';
+import { effectiveLook } from '../lib/looks';
 import { cleanDetectedLyrics, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { loadProjects, saveProjects } from '../lib/persistence';
 import type {
@@ -15,6 +16,7 @@ import type {
   LyricStyle,
   MusicalSection,
   Project,
+  ProjectLook,
   ProjectLyrics,
   ShuffleFrequency,
   Take,
@@ -154,6 +156,16 @@ interface StudioState {
   /** Shift every line (and its words) by a frame delta. */
   shiftAllLyrics: (frames: number) => void;
 
+  /**
+   * The active project's EFFECTIVE video look — the stored look when
+   * one was chosen, otherwise the auto-applied default (Auto Enhance
+   * at full intensity). Resolve it with resolveLookParams
+   * (src/lib/looks.ts) wherever a request is built.
+   */
+  look: ProjectLook;
+  /** Store a look on the active project (preset pick, intensity, slider overrides). */
+  setProjectLook: (look: ProjectLook) => void;
+
   // ---- Global camera + settings preferences ----
   facing: CameraType;
   setFacing: (f: CameraType | ((current: CameraType) => CameraType)) => void;
@@ -171,6 +183,12 @@ interface StudioState {
   setFrameRate: (v: FrameRatePref) => void;
   captureQuality: CaptureQuality;
   setCaptureQuality: (v: CaptureQuality) => void;
+  /** Native recorder stabilization: ON = the connection's .auto mode. */
+  stabilization: boolean;
+  setStabilization: (v: boolean | ((current: boolean) => boolean)) => void;
+  /** Lock exposure + white balance for the duration of each take. */
+  lockExposureWhileRecording: boolean;
+  setLockExposureWhileRecording: (v: boolean | ((current: boolean) => boolean)) => void;
   gridOverlay: boolean;
   setGridOverlay: (v: boolean | ((current: boolean) => boolean)) => void;
   levelGuide: boolean;
@@ -185,6 +203,19 @@ interface StudioState {
   setAutosave: (v: boolean | ((current: boolean) => boolean)) => void;
   exportQuality: ExportQualityPref;
   setExportQuality: (v: ExportQualityPref) => void;
+  /**
+   * Export file-size target in MB (0 = off). Applies to the TikTok /
+   * Balanced / Small tiers; stored like exportQuality.
+   */
+  exportTargetSizeMB: number;
+  setExportTargetSizeMB: (v: number) => void;
+  /**
+   * Auto volume: normalize the song to the platform loudness
+   * (−14 LUFS) inside the composition. Default ON; the toggle lives
+   * on the Export screen and rides both preview and export requests.
+   */
+  autoVolume: boolean;
+  setAutoVolume: (v: boolean | ((current: boolean) => boolean)) => void;
 }
 
 const StudioContext = createContext<StudioState | null>(null);
@@ -207,6 +238,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [resolution, setResolution] = useState<VideoQuality>('1080p');
   const [frameRate, setFrameRate] = useState<FrameRatePref>(30);
   const [captureQuality, setCaptureQuality] = useState<CaptureQuality>('1080p30');
+  // Capture enhancements (Balanced quality update): stabilization
+  // auto-on, exposure locked while a take records — both default ON
+  // and auto-applied; Settings turns them off.
+  const [stabilization, setStabilization] = useState(true);
+  const [lockExposureWhileRecording, setLockExposureWhileRecording] = useState(true);
   const [gridOverlay, setGridOverlay] = useState(false);
   const [levelGuide, setLevelGuide] = useState(false);
   const [audioOffsetMs, setAudioOffsetMsState] = useState(0);
@@ -215,6 +251,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [metronome, setMetronome] = useState(false);
   const [autosave, setAutosave] = useState(true);
   const [exportQuality, setExportQuality] = useState<ExportQualityPref>('balanced');
+  const [exportTargetSizeMB, setExportTargetSizeMB] = useState(0);
+  const [autoVolume, setAutoVolume] = useState(true);
 
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
@@ -479,6 +517,18 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchLyrics],
   );
 
+  // ---- Video look (per-project grade; see src/lib/looks.ts) ----
+  // The EFFECTIVE look is exposed (stored value wins, otherwise the
+  // Auto Enhance default) so the Editor and Export always agree;
+  // writes go through patchActiveProject like every creative field,
+  // and — unlike lyrics — a track change does NOT clear it.
+  const look = useMemo(() => effectiveLook(activeProject), [activeProject]);
+
+  const setProjectLook = useCallback(
+    (next: ProjectLook) => patchActiveProject({ look: next }),
+    [patchActiveProject],
+  );
+
   const addTake = useCallback(
     (take: Take) => {
       const current = activeProjectRef.current;
@@ -555,12 +605,18 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       deleteLyricLine,
       setLyricStyle,
       shiftAllLyrics,
+      look,
+      setProjectLook,
       resolution,
       setResolution,
       frameRate,
       setFrameRate,
       captureQuality,
       setCaptureQuality,
+      stabilization,
+      setStabilization,
+      lockExposureWhileRecording,
+      setLockExposureWhileRecording,
       gridOverlay,
       setGridOverlay,
       levelGuide,
@@ -575,6 +631,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setAutosave,
       exportQuality,
       setExportQuality,
+      exportTargetSizeMB,
+      setExportTargetSizeMB,
+      autoVolume,
+      setAutoVolume,
       facing,
       setFacing,
       torch,
@@ -622,9 +682,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       deleteLyricLine,
       setLyricStyle,
       shiftAllLyrics,
+      look,
+      setProjectLook,
       resolution,
       frameRate,
       captureQuality,
+      stabilization,
+      lockExposureWhileRecording,
       gridOverlay,
       levelGuide,
       audioOffsetMs,
@@ -633,6 +697,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       metronome,
       autosave,
       exportQuality,
+      exportTargetSizeMB,
+      autoVolume,
       facing,
       torch,
       mirror,

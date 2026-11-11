@@ -156,7 +156,54 @@ export const SHUFFLE_FREQUENCY_LENGTHS: Record<ShuffleFrequency, number> = {
 /** Settings-only configuration types (no creative tools — they live in the Editor). */
 export type FrameRatePref = 30 | 60;
 export type CountInBeats = 0 | 4 | 8;
-export type ExportQualityPref = 'high' | 'balanced' | 'small';
+export type ExportQualityPref = 'high' | 'tiktok' | 'balanced' | 'small';
+
+/**
+ * The numeric grade a "look" resolves to — ONE parametric set, in the
+ * spirit of the lyric animation params: presets in src/lib/looks.ts
+ * are just named points in this space, the JS side resolves a stored
+ * ProjectLook (preset + intensity + per-param overrides) into these
+ * numbers, and the native engine applies them blindly (a CI filter
+ * chain in the compositor). Identity (no visible change) is
+ * brightness 0, contrast 1, saturation 1, exposureEV 0, temperature 0,
+ * vibrance 0, sharpen 0, vignette 0 — see IDENTITY_LOOK_PARAMS.
+ */
+export interface LookParams {
+  /** CIColorControls brightness, -0.15..0.15. */
+  brightness: number;
+  /** CIColorControls contrast, 0.85..1.2. */
+  contrast: number;
+  /** CIColorControls saturation, 0..1.6 (0 = black & white). */
+  saturation: number;
+  /** CIExposureAdjust EV, -0.7..0.7. */
+  exposureEV: number;
+  /**
+   * Warmth, -30..30 — an offset on the 6500K neutral the engine's
+   * CITemperatureAndTint converts from (positive = warmer picture).
+   */
+  temperature: number;
+  /** CIVibrance amount, -1..1. */
+  vibrance: number;
+  /** CISharpenLuminance sharpness, 0..1.2. */
+  sharpen: number;
+  /** CIVignette intensity, 0..1.2. */
+  vignette: number;
+}
+
+/**
+ * A project's chosen look, as STORED: a preset id, a master intensity
+ * (0..1, scales the preset from identity toward its full values at
+ * resolve time), and optional per-param overrides forked by the Edit
+ * screen's Adjust sliders (absolute values that win over the lerped
+ * preset). Absent on a project = the effective default (Auto Enhance
+ * at full intensity — looks are auto-applied); picking the Original
+ * preset stores explicitly and means "no grade".
+ */
+export interface ProjectLook {
+  presetId: string;
+  intensity: number;
+  overrides?: Partial<LookParams>;
+}
 
 /**
  * The selected part of the track — THE single source of truth for "which
@@ -268,6 +315,14 @@ export interface Project {
    * the effective value, like `watermarkEnabled`).
    */
   lyricsEnabled?: boolean;
+  /**
+   * The project's video look (an edit/export-stage grade — see
+   * LookParams / src/lib/looks.ts). Undefined = the effective default
+   * (Auto Enhance); the store exposes the effective value (`look` in
+   * StudioContext). A creative choice, so it is NOT cleared when the
+   * track changes.
+   */
+  look?: ProjectLook;
   /** When the project's video was last successfully rendered (Export stamps it). */
   exportedAt?: number;
 }

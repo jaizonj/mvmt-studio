@@ -59,7 +59,7 @@ export default function SettingsScreen() {
         </ControlBlock>
         <ControlBlock
           label="Capture quality"
-          hint="The native recorder's format. 60 fps and 4K takes are smoother and sharper but use much more storage.">
+          hint="The native recorder's format, encoded in HEVC at tuned bitrates (8 / 14 / 30 Mbps). 60 fps and 4K takes are smoother and sharper but use more storage.">
           <SegmentedControl
             options={[
               { value: '1080p30' as CaptureQuality, label: '1080p · 30fps' },
@@ -71,6 +71,12 @@ export default function SettingsScreen() {
             accessibilityLabel="Native capture quality"
           />
         </ControlBlock>
+        <ToggleRow label="Stabilization" value={studio.stabilization} onChange={studio.setStabilization} />
+        <ToggleRow
+          label="Lock exposure when recording"
+          value={studio.lockExposureWhileRecording}
+          onChange={studio.setLockExposureWhileRecording}
+        />
         <ToggleRow label="Mirror front camera" value={studio.mirror} onChange={studio.setMirror} />
         <ToggleRow label="Grid overlay" value={studio.gridOverlay} onChange={studio.setGridOverlay} />
         <ToggleRow label="Centre level guide" value={studio.levelGuide} onChange={studio.setLevelGuide} last />
@@ -141,6 +147,7 @@ export default function SettingsScreen() {
           <SegmentedControl
             options={[
               { value: 'high' as ExportQualityPref, label: 'High' },
+              { value: 'tiktok' as ExportQualityPref, label: 'TikTok' },
               { value: 'balanced' as ExportQualityPref, label: 'Balanced' },
               { value: 'small' as ExportQualityPref, label: 'Small' },
             ]}

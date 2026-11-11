@@ -9,26 +9,32 @@ import { loadTrackPeaks, samplePeaks, standinPeaks } from '../lib/waveform';
 import { useStudio } from '../store/StudioContext';
 import { colors, formatTime, radius, spacing } from '../theme';
 
-const PRESETS: { label: string; seconds: number | null }[] = [
-  { label: '15s', seconds: 15 },
-  { label: '30s', seconds: 30 },
-  { label: '1 min', seconds: 60 },
-  { label: '3 min', seconds: 180 },
-  { label: 'Full', seconds: null },
-];
-
 const BAR_COUNT = 48;
 
+/** The shortest performable part — handles and steppers enforce it. */
+const MIN_REGION_SECONDS = 1;
+
 /**
- * Audio-part picker.
+ * Audio-part picker: WHICH PART of the song, chosen by explicit
+ * start and end (Jaizon, 2026-11-10 — the 15s/30s/1min/3min/Full
+ * duration presets are gone, here and from the camera screen).
  *
- * Preset chips set the window length; the highlighted window on the
- * waveform can be dragged (or the bar tapped) to move it. Everything
- * clamps to the track: a preset longer than the track becomes the whole
- * track, and the window can never run past the end.
+ * The highlighted window on the waveform carries a handle at each
+ * edge: drag the left handle to set the start, the right handle to
+ * set the end, or the window's middle to move the whole part. One
+ * pan gesture hit-tests where the drag began (near an edge = that
+ * handle; inside = move; elsewhere = tap-to-centre), so there is
+ * exactly one gesture to arbitrate. ±1s steppers beside the start /
+ * end readouts give fine adjustment. Constraints everywhere: the
+ * region is at least 1s, both ends stay inside the song, and a
+ * handle stops at the other handle (start < end always).
  *
- * The selection lives in the studio store (AudioRegion) — recording,
- * shuffle sectioning and the editor all read that same value.
+ * The selection lives in the studio store (AudioRegion =
+ * start + duration; the end is start + duration) — recording length,
+ * take anchoring, shuffle sectioning, lyrics and the editor all read
+ * that same value. The neutral default is the full song: a freshly
+ * picked track stores { start: 0, duration: null } and the handles
+ * sit at the song's edges until they're moved.
  *
  * Waveform note: the bars are REAL decoded peaks (the native
  * `waveformPeaks` via src/lib/waveform.ts), resampled to BAR_COUNT.
@@ -43,7 +49,9 @@ export function AudioRegionPicker() {
   const region = effectiveRegion(trackRegion, duration);
   const [barWidth, setBarWidth] = useState(0);
   const [previewing, setPreviewing] = useState(false);
-  const dragStartRef = useRef(0);
+  /** The drag's mode + the region snapshot it started from. */
+  const dragRef = useRef<{ mode: 'start' | 'end' | 'move'; start: number; end: number } | null>(null);
+  const dragMovedRef = useRef(false);
 
   const player = useAudioPlayer(track?.uri ?? null);
 
@@ -78,7 +86,7 @@ export function AudioRegionPicker() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Preview must stop exactly at the window end.
+  // Preview must stop exactly at the region end.
   useEffect(() => {
     if (!previewing || !region) return;
     const timer = setInterval(() => {
@@ -106,36 +114,76 @@ export function AudioRegionPicker() {
   const windowLeftPct = (region.startSeconds / duration) * 100;
   const windowWidthPct = Math.max(4, (region.lengthSeconds / duration) * 100);
 
-  const applyStart = (startSeconds: number) => {
-    const maxStart = Math.max(0, duration - region.lengthSeconds);
-    setTrackRegion({
-      startSeconds: Math.min(Math.max(0, startSeconds), maxStart),
-      durationSeconds: trackRegion.durationSeconds,
-    });
+  /** Store an explicit start/end as the region (start + duration). */
+  const storeRegion = (startSeconds: number, endSeconds: number) => {
+    setTrackRegion({ startSeconds, durationSeconds: endSeconds - startSeconds });
+  };
+
+  const nudgeStart = (deltaSeconds: number) => {
+    const start = Math.min(
+      Math.max(0, region.startSeconds + deltaSeconds),
+      region.endSeconds - MIN_REGION_SECONDS,
+    );
+    storeRegion(start, region.endSeconds);
+  };
+
+  const nudgeEnd = (deltaSeconds: number) => {
+    const end = Math.min(
+      Math.max(region.startSeconds + MIN_REGION_SECONDS, region.endSeconds + deltaSeconds),
+      duration,
+    );
+    storeRegion(region.startSeconds, end);
   };
 
   // Gesture callbacks run on user input, not render — see camera screen.
   /* eslint-disable react-hooks/refs */
   const pan = Gesture.Pan()
     .runOnJS(true)
-    .onBegin(() => {
-      dragStartRef.current = region.startSeconds;
+    .onBegin((event) => {
+      // Hit-test the touch: near an edge = that handle, inside the
+      // window = move, outside = move too (a tap there centres the
+      // window — handled onEnd when the gesture never travelled).
+      // The grab zone is ~20px, widened in seconds so a handle is
+      // never ungrabbable on a long song.
+      const xSeconds = barWidth > 0 ? (event.x / barWidth) * duration : region.startSeconds;
+      const grabSeconds = Math.max((20 / Math.max(1, barWidth)) * duration, 0.6);
+      let mode: 'start' | 'end' | 'move' = 'move';
+      if (Math.abs(xSeconds - region.startSeconds) <= grabSeconds) mode = 'start';
+      else if (Math.abs(xSeconds - region.endSeconds) <= grabSeconds) mode = 'end';
+      dragRef.current = { mode, start: region.startSeconds, end: region.endSeconds };
+      dragMovedRef.current = false;
     })
     .onUpdate((event) => {
-      if (barWidth <= 0) return;
-      applyStart(dragStartRef.current + (event.translationX / barWidth) * duration);
+      const drag = dragRef.current;
+      if (!drag || barWidth <= 0) return;
+      if (Math.abs(event.translationX) > 3) dragMovedRef.current = true;
+      const dxSeconds = (event.translationX / barWidth) * duration;
+      if (drag.mode === 'start') {
+        // The start handle stops at the end handle (min region).
+        const start = Math.min(Math.max(0, drag.start + dxSeconds), drag.end - MIN_REGION_SECONDS);
+        storeRegion(start, drag.end);
+      } else if (drag.mode === 'end') {
+        const end = Math.min(Math.max(drag.start + MIN_REGION_SECONDS, drag.end + dxSeconds), duration);
+        storeRegion(drag.start, end);
+      } else {
+        const length = drag.end - drag.start;
+        const start = Math.min(Math.max(0, drag.start + dxSeconds), Math.max(0, duration - length));
+        storeRegion(start, start + length);
+      }
+    })
+    .onEnd((event) => {
+      // A tap (no real travel) outside the handles centres the
+      // window on the tap, keeping its length — the old tap-to-move.
+      const drag = dragRef.current;
+      if (drag && !dragMovedRef.current && drag.mode === 'move' && barWidth > 0) {
+        const tapped = (event.x / barWidth) * duration;
+        const length = drag.end - drag.start;
+        const start = Math.min(Math.max(0, tapped - length / 2), Math.max(0, duration - length));
+        storeRegion(start, start + length);
+      }
+      dragRef.current = null;
     });
   /* eslint-enable react-hooks/refs */
-
-  const applyPreset = (seconds: number | null) => {
-    if (seconds === null) {
-      setTrackRegion({ startSeconds: 0, durationSeconds: null });
-      return;
-    }
-    const length = Math.min(seconds, duration);
-    const start = Math.min(region.startSeconds, Math.max(0, duration - length));
-    setTrackRegion({ startSeconds: start, durationSeconds: length });
-  };
 
   const togglePreview = async () => {
     if (previewing) {
@@ -150,79 +198,84 @@ export function AudioRegionPicker() {
 
   return (
     <View>
-      {/* Preset chips */}
-      <View style={styles.chipRow}>
-        {PRESETS.map((preset) => {
-          const selected =
-            preset.seconds === null
-              ? trackRegion.durationSeconds === null
-              : trackRegion.durationSeconds === Math.min(preset.seconds, duration);
-          return (
+      {/* Waveform (real decoded peaks) with start/end handles */}
+      <GestureDetector gesture={pan}>
+        <View style={styles.barWrap} onLayout={(e) => setBarWidth(e.nativeEvent.layout.width)}>
+          <View style={styles.bars}>
+            {bars.map((h, i) => (
+              <View key={i} style={[styles.bar, { height: 8 + h * 30 }]} />
+            ))}
+          </View>
+          <View style={[styles.window, { left: `${windowLeftPct}%`, width: `${windowWidthPct}%` }]}>
+            <View style={[styles.handle, styles.handleLeft]}>
+              <View style={styles.handleGrip} />
+            </View>
+            <View style={styles.windowHandle} />
+            <View style={[styles.handle, styles.handleRight]}>
+              <View style={styles.handleGrip} />
+            </View>
+          </View>
+        </View>
+      </GestureDetector>
+
+      {/* Start / end readouts with ±1s fine-adjust steppers */}
+      <View style={styles.readoutRow}>
+        <View style={styles.endpoint}>
+          <Text style={styles.endpointLabel}>Start</Text>
+          <View style={styles.stepper}>
             <Pressable
-              key={preset.label}
-              onPress={() => applyPreset(preset.seconds)}
-              style={[styles.chip, selected && styles.chipSelected]}
+              style={styles.stepButton}
+              onPress={() => nudgeStart(-1)}
               accessibilityRole="button"
-              accessibilityState={{ selected }}>
-              <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{preset.label}</Text>
+              accessibilityLabel="Start one second earlier">
+              <Ionicons name="remove" size={15} color={colors.label} />
             </Pressable>
-          );
-        })}
+            <Text style={styles.timeValue}>{formatTime(region.startSeconds)}</Text>
+            <Pressable
+              style={styles.stepButton}
+              onPress={() => nudgeStart(1)}
+              accessibilityRole="button"
+              accessibilityLabel="Start one second later">
+              <Ionicons name="add" size={15} color={colors.label} />
+            </Pressable>
+          </View>
+        </View>
+        <Text style={styles.lengthCenter}>{formatTime(region.lengthSeconds)}</Text>
+        <View style={styles.endpoint}>
+          <Text style={styles.endpointLabel}>End</Text>
+          <View style={styles.stepper}>
+            <Pressable
+              style={styles.stepButton}
+              onPress={() => nudgeEnd(-1)}
+              accessibilityRole="button"
+              accessibilityLabel="End one second earlier">
+              <Ionicons name="remove" size={15} color={colors.label} />
+            </Pressable>
+            <Text style={styles.timeValue}>{formatTime(region.endSeconds)}</Text>
+            <Pressable
+              style={styles.stepButton}
+              onPress={() => nudgeEnd(1)}
+              accessibilityRole="button"
+              accessibilityLabel="End one second later">
+              <Ionicons name="add" size={15} color={colors.label} />
+            </Pressable>
+          </View>
+        </View>
       </View>
 
-      {/* Waveform (real decoded peaks) with draggable window */}
-      <Pressable
-        style={styles.barWrap}
-        onLayout={(e) => setBarWidth(e.nativeEvent.layout.width)}
-        onPress={(e) => {
-          if (barWidth <= 0) return;
-          const tapped = (e.nativeEvent.locationX / barWidth) * duration;
-          applyStart(tapped - region.lengthSeconds / 2);
-        }}>
-        <View style={styles.bars}>
-          {bars.map((h, i) => (
-            <View key={i} style={[styles.bar, { height: 8 + h * 30 }]} />
-          ))}
-        </View>
-        <GestureDetector gesture={pan}>
-          <View
-            style={[
-              styles.window,
-              { left: `${windowLeftPct}%`, width: `${windowWidthPct}%` },
-            ]}>
-            <View style={styles.windowHandle} />
-          </View>
-        </GestureDetector>
-      </Pressable>
-
-      {/* Live labels + preview */}
-      <View style={styles.labelRow}>
-        <Text style={styles.timeLabel}>
-          {formatTime(region.startSeconds)} – {formatTime(region.endSeconds)}
-        </Text>
-        <Text style={styles.lengthLabel}>{formatTime(region.lengthSeconds)} selected</Text>
+      <View style={styles.footerRow}>
+        <Text style={styles.note}>Drag the edges to set the start and end.</Text>
         <Pressable style={styles.previewButton} onPress={togglePreview} accessibilityRole="button">
           <Ionicons name={previewing ? 'pause' : 'play'} size={14} color="#14141F" />
           <Text style={styles.previewButtonText}>{previewing ? 'Stop' : 'Preview'}</Text>
         </Pressable>
       </View>
-      <Text style={styles.note}>Drag the highlighted part to move it.</Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   empty: { color: colors.labelSecondary, fontSize: 15, lineHeight: 20 },
-  chipRow: { flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap', marginBottom: spacing.md },
-  chip: {
-    borderRadius: radius.pill,
-    backgroundColor: 'rgba(120,120,128,0.24)',
-    paddingHorizontal: 13,
-    paddingVertical: 7,
-  },
-  chipSelected: { backgroundColor: '#FFFFFF' },
-  chipText: { color: colors.label, fontSize: 13, fontWeight: '600' },
-  chipTextSelected: { color: '#14141F' },
   barWrap: {
     height: 56,
     borderRadius: radius.md,
@@ -245,14 +298,63 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   windowHandle: { width: 22, height: 4, borderRadius: 2, backgroundColor: colors.accent },
-  labelRow: {
+  handle: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    width: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.accent,
+  },
+  handleLeft: { left: 0, borderTopLeftRadius: radius.sm, borderBottomLeftRadius: radius.sm },
+  handleRight: { right: 0, borderTopRightRadius: radius.sm, borderBottomRightRadius: radius.sm },
+  handleGrip: { width: 3, height: 18, borderRadius: 2, backgroundColor: 'rgba(20,20,31,0.55)' },
+  readoutRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: spacing.md,
+    marginTop: spacing.md,
+  },
+  endpoint: { gap: 4 },
+  endpointLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: colors.labelSecondary,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+  },
+  stepper: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
+  stepButton: {
+    width: 28,
+    height: 28,
+    borderRadius: radius.pill,
+    backgroundColor: 'rgba(120,120,128,0.24)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  timeValue: {
+    color: colors.label,
+    fontSize: 15,
+    fontWeight: '600',
+    fontVariant: ['tabular-nums'],
+    minWidth: 40,
+    textAlign: 'center',
+  },
+  lengthCenter: {
+    flex: 1,
+    textAlign: 'center',
+    color: colors.labelSecondary,
+    fontSize: 13,
+    paddingBottom: 6,
+  },
+  footerRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: spacing.md,
     marginTop: spacing.md,
   },
-  timeLabel: { color: colors.label, fontSize: 15, fontWeight: '600', fontVariant: ['tabular-nums'] },
-  lengthLabel: { color: colors.labelSecondary, fontSize: 13, flex: 1 },
+  note: { color: colors.labelTertiary, fontSize: 12, flex: 1 },
   previewButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -263,5 +365,4 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
   },
   previewButtonText: { color: '#14141F', fontSize: 13, fontWeight: '700' },
-  note: { color: colors.labelTertiary, fontSize: 12, marginTop: spacing.sm },
 });

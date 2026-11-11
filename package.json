@@ -53,7 +53,8 @@
     "doctor": "expo-doctor",
     "test:shuffle": "tsc --ignoreConfig src/lib/shuffle.ts src/lib/analysis.ts --outDir tests/.build --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/shuffle.test.cjs",
     "test:edl": "tsc --ignoreConfig src/lib/shuffleEdl.ts --outDir tests/.build-edl --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/edl.test.cjs",
-    "test:lyrics": "tsc --ignoreConfig src/lib/lyrics.ts --outDir tests/.build-lyrics --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/lyrics.test.cjs"
+    "test:lyrics": "tsc --ignoreConfig src/lib/lyrics.ts --outDir tests/.build-lyrics --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/lyrics.test.cjs",
+    "test:looks": "tsc --ignoreConfig src/lib/looks.ts src/lib/exportSize.ts src/lib/loudness.ts --outDir tests/.build-looks --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/looks.test.cjs"
   },
   "private": true
 }

@@ -1,4 +1,4 @@
-import type { CompositeRequest } from '../../modules/mvmt-compositor/src/index';
+import type { CompositeRequest, ResolvedLookParams } from '../../modules/mvmt-compositor/src/index';
 
 /**
  * Canonical Edit Decision List (EDL) — the ONE timeline representation
@@ -253,6 +253,19 @@ export function edlToCompositeRequest(
      * sampling of 60fps-shot takes differs.
      */
     frameRate?: number;
+    /**
+     * The project's resolved video look (src/lib/looks.ts), or null
+     * for no grade. Unlike the watermark this rides BOTH preview and
+     * export requests: the grade is part of the composition, so the
+     * editor preview must carry it to stay truthful.
+     */
+    look?: ResolvedLookParams | null;
+    /**
+     * Auto volume: the engine measures the song and gains it to the
+     * platform loudness (−14 LUFS) inside the composition. Like the
+     * look it rides preview AND export — what you hear is what ships.
+     */
+    normalizeVolume?: boolean;
   } = {},
 ): CompositeRequest {
   const clips = edl.segments.map((segment) => {
@@ -280,6 +293,11 @@ export function edlToCompositeRequest(
     // calibration preview) omit them and stay unwatermarked.
     watermarkEnabled: options.watermarkEnabled ?? false,
     watermarkImageUri: options.watermarkImageUri ?? null,
+    // Look: passed through untouched — null (the default for callers
+    // that don't grade, like the Record screen's calibration preview)
+    // renders unfiltered.
+    look: options.look ?? null,
+    normalizeVolume: options.normalizeVolume ?? false,
   };
 }
 

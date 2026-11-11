@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { LyricsOverlay } from '../../components/LyricsOverlay';
@@ -28,6 +28,12 @@ import {
   type AssetMeasure,
   type Edl,
 } from '../../lib/edl';
+import {
+  estimateExportBytes,
+  formatFileSize,
+  TIER_DEFAULT_VIDEO_BITRATE_BPS,
+} from '../../lib/exportSize';
+import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { saveToPhotoLibrary, shareFile } from '../../lib/media';
 import { validateAgainstAssets } from '../../lib/shuffleEdl';
@@ -63,12 +69,16 @@ let exportIdCounter = 0;
 /** Quality → output size. 'high' keeps the project's own canvas. */
 const QUALITY_CANVAS: Record<ExportQualityPref, { width: number; height: number } | null> = {
   high: null,
+  // TikTok's canvas is always 1080×1920, whatever the takes were
+  // shot at — its uploader downscales anything larger anyway.
+  tiktok: { width: 1080, height: 1920 },
   balanced: { width: 720, height: 1280 },
   small: { width: 540, height: 960 },
 };
 
 const QUALITY_CAPTIONS: Record<ExportQualityPref, string> = {
   high: 'Best quality · 60fps, bigger file.',
+  tiktok: 'For TikTok · 1080 × 1920 · 60fps · H.264 — the shape its uploader handles best.',
   balanced: 'A good size for sharing · 30fps.',
   small: 'Smaller file, softer picture · 30fps.',
 };
@@ -83,7 +93,31 @@ interface ValidatedCut {
 export default function ExportScreen() {
   const insets = useSafeAreaInsets();
   const studio = useStudio();
-  const { activeProject, takes, edl, exportQuality, setExportQuality, watermarkEnabled } = studio;
+  const {
+    activeProject,
+    takes,
+    edl,
+    exportQuality,
+    setExportQuality,
+    exportTargetSizeMB,
+    setExportTargetSizeMB,
+    autoVolume,
+    setAutoVolume,
+    watermarkEnabled,
+  } = studio;
+
+  // The controlled tiers (everything except High) render at a KNOWN
+  // bitrate through the engine's post-render transcode; High keeps
+  // the untouched HighestQuality render.
+  const controlledBitrate: number | null =
+    exportQuality === 'tiktok' || exportQuality === 'balanced' || exportQuality === 'small'
+      ? TIER_DEFAULT_VIDEO_BITRATE_BPS[exportQuality]
+      : null;
+
+  // The project's look, resolved to the one numeric param set the
+  // engine applies (null = no grade). Shared with the Editor through
+  // the store's effective look, so both screens grade identically.
+  const resolvedLook = useMemo(() => resolveLookParams(studio.look), [studio.look]);
 
   const engineAvailable = isCompositorAvailable();
   const noTakes = takes.length === 0;
@@ -176,26 +210,80 @@ export default function ExportScreen() {
         watermarkEnabled,
         watermarkImageUri: watermarkEnabled ? watermarkUri : null,
         // Export frame rate follows the quality tier (Jaizon):
-        // High renders 60fps; Balanced/Small render 30fps to keep
-        // files shareable (<20MB for typical clip lengths).
-        frameRate: exportQuality === 'high' ? 60 : 30,
+        // High and TikTok render 60fps; Balanced/Small render 30fps
+        // to keep files shareable (<20MB for typical clip lengths).
+        frameRate: exportQuality === 'high' || exportQuality === 'tiktok' ? 60 : 30,
+        // The look is part of the COMPOSITION (the engine grades the
+        // frames themselves), so it belongs on this shared request:
+        // the stage preview shows the grade the file will carry.
+        look: resolvedLook,
+        // Auto volume likewise: the gain is applied to the song
+        // inside the composition, so the preview plays at the level
+        // the file will ship at.
+        normalizeVolume: autoVolume,
       });
       // 'high' (null) renders at the cut's canvas — which follows the
-      // takes, so 4K takes export at 4K; balanced/small are explicit
-      // downscales the user picked for sharing.
+      // takes, so 4K takes export at 4K; the other tiers are explicit
+      // canvases the user picked (TikTok always 1080×1920).
       const canvas = QUALITY_CANVAS[exportQuality] ?? effectiveEdl.canvas;
       // The canvas override is applied HERE, on the single shared
       // request, so the preview the user approves is framed identically
       // to the file the exporter writes (see header note).
-      return { ...base, canvasWidth: canvas.width, canvasHeight: canvas.height, lyrics: lyricsPayload };
+      //
+      // Size control rides the same request, but note the asymmetry:
+      // exportVideoBitrate / exportTargetSizeMB / exportCodec are
+      // RENDER-ONLY — the engine reads them after the export session
+      // writes the file and transcodes that file at the given rate.
+      // They never touch the composition, so the preview built from
+      // this request stays truthful; nobody should "fix" the preview
+      // to match the transcode — the picture is identical, only the
+      // file's encoding differs.
+      const sizeControl =
+        controlledBitrate === null
+          ? {}
+          : {
+              exportCodec: 'h264' as const,
+              ...(exportTargetSizeMB > 0
+                ? { exportTargetSizeMB }
+                : { exportVideoBitrate: controlledBitrate }),
+            };
+      return {
+        ...base,
+        canvasWidth: canvas.width,
+        canvasHeight: canvas.height,
+        lyrics: lyricsPayload,
+        ...sizeControl,
+      };
     } catch {
       return null;
     }
-  }, [cut, takeUri, takes, exportQuality, watermarkEnabled, watermarkUri, lyricsPayload]);
+  }, [
+    cut,
+    takeUri,
+    takes,
+    exportQuality,
+    watermarkEnabled,
+    watermarkUri,
+    lyricsPayload,
+    resolvedLook,
+    autoVolume,
+    controlledBitrate,
+    exportTargetSizeMB,
+  ]);
 
   const requestKey = useMemo(() => (request ? JSON.stringify(request) : ''), [request]);
   const totalSeconds = cut ? edlDurationSeconds(cut.edl) : 0;
   const cutCount = cut?.edl.segments.length ?? 0;
+
+  // Live size estimate for the controlled tiers, from the same math
+  // the engine applies (src/lib/exportSize.ts): a chosen target IS
+  // the estimate; otherwise the tier's known bitrate over the cut's
+  // duration. High renders at an encoder-chosen rate — no estimate.
+  const estimateBytes = useMemo(() => {
+    if (controlledBitrate === null || totalSeconds <= 0) return null;
+    if (exportTargetSizeMB > 0) return exportTargetSizeMB * 1_000_000;
+    return estimateExportBytes(controlledBitrate, totalSeconds);
+  }, [controlledBitrate, exportTargetSizeMB, totalSeconds]);
 
   // ---- Preview transport (display state only — the native player owns timing).
   const [stageWidth, setStageWidth] = useState(0);
@@ -456,7 +544,16 @@ export default function ExportScreen() {
                 <Text style={styles.completionTitle}>Your video is ready</Text>
                 <Text style={styles.completionFacts}>
                   {formatTime(result.durationSeconds)} · {result.width} × {result.height}
+                  {typeof result.fileSizeBytes === 'number'
+                    ? ` · ${formatFileSize(result.fileSizeBytes)}`
+                    : ''}
                 </Text>
+                {typeof result.appliedGainDb === 'number' && Math.abs(result.appliedGainDb) >= 0.1 ? (
+                  <Text style={styles.completionFacts}>
+                    Volume adjusted {result.appliedGainDb >= 0 ? '+' : ''}
+                    {result.appliedGainDb.toFixed(1)} dB to hit the platform level
+                  </Text>
+                ) : null}
                 <Pressable
                   style={[styles.primaryButton, styles.completionAction, saved && styles.primaryButtonConfirmed]}
                   onPress={() => void handleSaveToPhotos()}
@@ -510,18 +607,67 @@ export default function ExportScreen() {
                     <SegmentedControl<ExportQualityPref>
                       options={[
                         { value: 'high', label: 'High' },
+                        { value: 'tiktok', label: 'TikTok' },
                         { value: 'balanced', label: 'Balanced' },
-                        { value: 'small', label: 'Small file' },
+                        { value: 'small', label: 'Small' },
                       ]}
                       value={exportQuality}
                       onChange={setExportQuality}
                       accessibilityLabel="Export quality"
                     />
                   </View>
+                  <View style={styles.optionBlock}>
+                    <Text style={styles.optionLabel}>File size</Text>
+                    <View
+                      pointerEvents={controlledBitrate === null ? 'none' : 'auto'}
+                      style={controlledBitrate === null ? styles.controlDisabled : undefined}>
+                      <SegmentedControl<number>
+                        options={[
+                          { value: 0, label: 'Off' },
+                          { value: 10, label: '10 MB' },
+                          { value: 20, label: '20 MB' },
+                          { value: 25, label: '25 MB' },
+                          { value: 50, label: '50 MB' },
+                        ]}
+                        value={exportTargetSizeMB}
+                        onChange={setExportTargetSizeMB}
+                        accessibilityLabel="Target file size"
+                      />
+                    </View>
+                    {controlledBitrate === null ? (
+                      <Text style={styles.blockHint}>
+                        Size control applies to TikTok, Balanced and Small — High keeps the
+                        encoder&apos;s full quality.
+                      </Text>
+                    ) : exportTargetSizeMB > 0 ? (
+                      <Text style={styles.blockHint}>
+                        The render is fitted to about {exportTargetSizeMB} MB.
+                      </Text>
+                    ) : null}
+                  </View>
+                  <View style={styles.optionBlock}>
+                    <View style={styles.switchRow}>
+                      <View style={styles.switchText}>
+                        <Text style={styles.optionLabel}>Auto volume</Text>
+                        <Text style={styles.blockHint}>
+                          Levels the song to the platform loudness, so posts don&apos;t come out
+                          quiet or blasted.
+                        </Text>
+                      </View>
+                      <Switch
+                        value={autoVolume}
+                        onValueChange={setAutoVolume}
+                        trackColor={{ true: colors.accent, false: colors.elevated }}
+                        thumbColor={autoVolume ? colors.onAccent : colors.label}
+                        accessibilityLabel="Auto volume"
+                      />
+                    </View>
+                  </View>
                 </View>
                 <Text style={styles.qualityCaption}>
                   {request.canvasWidth} × {request.canvasHeight} · {request.frameRate} fps · Portrait · Song only —
                   your takes&apos; camera sound is off · {QUALITY_CAPTIONS[exportQuality]}
+                  {estimateBytes !== null ? ` · File ≈ ${formatFileSize(estimateBytes)}` : ''}
                 </Text>
               </View>
             )}
@@ -714,6 +860,10 @@ const styles = StyleSheet.create({
   },
   optionBlock: { paddingVertical: spacing.md, gap: spacing.sm },
   optionLabel: { ...typeScale.headline, color: colors.label },
+  controlDisabled: { opacity: 0.45 },
+  blockHint: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 17 },
+  switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md },
+  switchText: { flex: 1, gap: 2 },
   qualityCaption: {
     ...typeScale.footnote,
     color: colors.labelSecondary,

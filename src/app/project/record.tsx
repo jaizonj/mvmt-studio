@@ -31,7 +31,9 @@ import {
   isCompositorAvailable,
   measureTakeSync,
   prepareSong,
+  setCaptureExposureLock,
   setCaptureQuality,
+  setCaptureStabilization,
   startCapture,
   stopCapture,
   type CompositeRequest,
@@ -77,15 +79,6 @@ type StopCaptureResult = Awaited<ReturnType<typeof stopCapture>>;
  * would shift every cut. See the measured-sync block in beginRecording.
  */
 const SYNC_MEASUREMENT_SANITY_SECONDS = 2;
-
-/** Video-length choices for the bottom-centre row (song-part lengths). */
-const LENGTH_PRESETS: { label: string; seconds: number | null }[] = [
-  { label: '15s', seconds: 15 },
-  { label: '30s', seconds: 30 },
-  { label: '1 min', seconds: 60 },
-  { label: '3 min', seconds: 180 },
-  { label: 'Full', seconds: null },
-];
 
 /**
  * Camera screen — Stage 1 (Record) of the guided flow. The app opens
@@ -211,6 +204,8 @@ export default function CameraScreen() {
     levelGuide,
     audioOffsetMs,
     captureQuality,
+    stabilization,
+    lockExposureWhileRecording,
     countInBeats,
     setCountInBeats,
     metronome,
@@ -335,6 +330,18 @@ export default function CameraScreen() {
     if (!isFocused || !useNativeCapture) return;
     void setCaptureQuality(captureQuality);
   }, [isFocused, captureQuality, useNativeCapture]);
+
+  // Capture enhancements (Settings): stabilization (auto) and the
+  // record-time exposure lock, pushed to the coordinator with the
+  // same best-effort pattern as the quality above.
+  useEffect(() => {
+    if (!isFocused || !useNativeCapture) return;
+    void setCaptureStabilization(stabilization);
+  }, [isFocused, stabilization, useNativeCapture]);
+  useEffect(() => {
+    if (!isFocused || !useNativeCapture) return;
+    void setCaptureExposureLock(lockExposureWhileRecording);
+  }, [isFocused, lockExposureWhileRecording, useNativeCapture]);
 
   // Keep the screen awake through the whole capture flow (Jaizon:
   // "it falls asleep while recording") — from the countdown through
@@ -1707,44 +1714,11 @@ export default function CameraScreen() {
         </View>
       ) : null}
 
-      {/* Video length — where the zoom buttons used to sit (Jaizon):
-          the bottom-centre row now picks how long each take records
-          (the length of the song part). Same value as the track sheet's
-          part picker; Full = the whole track. Hidden without a track. */}
-      {!recording && track ? (
-        <View style={[styles.lengthRow, { bottom: insets.bottom + 108 }]}>
-          {LENGTH_PRESETS.map((preset) => {
-            const tooLong = preset.seconds !== null && track.durationSeconds !== undefined && preset.seconds > track.durationSeconds;
-            const selected =
-              preset.seconds === null
-                ? studio.trackRegion.durationSeconds === null
-                : regionEffForLabel !== null && Math.abs(regionEffForLabel.lengthSeconds - preset.seconds) < 0.6;
-            return (
-              <Pressable
-                key={preset.label}
-                disabled={tooLong}
-                onPress={() => {
-                  const duration = track.durationSeconds ?? 0;
-                  if (preset.seconds === null || duration <= 0) {
-                    studio.setTrackRegion({ startSeconds: 0, durationSeconds: null });
-                    flashNotice('Video length: full track');
-                    return;
-                  }
-                  const length = Math.min(preset.seconds, duration);
-                  const start = Math.min(studio.trackRegion.startSeconds, Math.max(0, duration - length));
-                  studio.setTrackRegion({ startSeconds: start, durationSeconds: length });
-                  flashNotice(`Video length: ${preset.label} — takes stop right there`);
-                }}
-                style={[styles.zoomPill, selected && styles.zoomPillSelected, tooLong && styles.lengthPillDisabled]}
-                accessibilityRole="button"
-                accessibilityState={{ selected, disabled: tooLong }}
-                accessibilityLabel={`Video length ${preset.label}${tooLong ? ', longer than the track' : ''}`}>
-                <Text style={[styles.zoomText, selected && styles.zoomTextSelected]}>{preset.label}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
-      ) : null}
+      {/* No length UI on the camera (Jaizon, 2026-11-10): the song
+          part is chosen by start/end in the track sheet's waveform
+          editor, and recording stays hard-locked to that stored
+          region — the bottom-centre length chips that used to sit
+          here are gone entirely. */}
 
       {/* RIGHT-SIDE control column (Jaizon, 2026-11-08): zoom and the
           timers live together on the right, each a single collapsible
@@ -2177,24 +2151,6 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     minWidth: 46,
     alignItems: 'center',
-  },
-  lengthRow: {
-    position: 'absolute',
-    alignSelf: 'center',
-    flexDirection: 'row',
-    gap: 6,
-    backgroundColor: colors.material,
-    borderRadius: radius.pill,
-    padding: 4,
-  },
-  lengthPillDisabled: { opacity: 0.35 },
-  zoomPill: {
-    minWidth: 38,
-    height: 30,
-    borderRadius: radius.pill,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 8,
   },
   zoomPillSelected: { backgroundColor: 'rgba(255,255,255,0.92)' },
   zoomText: { color: colors.label, fontSize: 12, fontWeight: '600' },

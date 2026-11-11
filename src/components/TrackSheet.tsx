@@ -30,6 +30,12 @@ export function TrackSheet({ visible, onClose, onPickTrack }: TrackSheetProps) {
           </View>
           <Text style={styles.sectionLabel}>Choose the part</Text>
           <AudioRegionPicker />
+          {/* The region is stored live as the handles move; this is
+              the explicit confirm that closes the sheet — on first
+              pick and on every later change via the notes icon. */}
+          <Pressable style={styles.confirmButton} onPress={onClose} accessibilityRole="button">
+            <Text style={styles.confirmButtonText}>Use this part</Text>
+          </Pressable>
         </>
       ) : (
         <>
@@ -78,4 +84,14 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   addButtonText: { color: '#14141F', fontSize: 15, fontWeight: '700' },
+  confirmButton: {
+    marginTop: spacing.lg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.accent,
+    borderRadius: radius.md,
+    paddingVertical: 13,
+  },
+  confirmButtonText: { color: colors.onAccent, fontSize: 15, fontWeight: '700' },
 });

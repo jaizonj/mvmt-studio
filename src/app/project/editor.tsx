@@ -18,6 +18,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { LookPanel } from '../../components/LookPanel';
 import { LyricsOverlay } from '../../components/LyricsOverlay';
 import { LyricsPanel } from '../../components/LyricsPanel';
 import { NativePreview, type NativePreviewHandle } from '../../components/NativePreview';
@@ -47,6 +48,7 @@ import {
   type Edl,
   type EdlSegment,
 } from '../../lib/edl';
+import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import { buildEdlFromShuffle, validateAgainstAssets } from '../../lib/shuffleEdl';
@@ -542,14 +544,25 @@ function EditorWorkspace() {
     [studio.lyrics, studio.lyricsEnabled, regionStartFrame],
   );
 
+  // Look + auto volume: unlike the watermark/lyrics overlays, both
+  // are part of the COMPOSITION the engine builds (a CI grade on the
+  // frames, a gain on the song's mix parameters), so the preview
+  // request carries them — the editor must show and play exactly
+  // what the export will ship. The Export screen resolves the same
+  // store values into its own request, so the two never drift.
+  const resolvedLook = useMemo(() => resolveLookParams(studio.look), [studio.look]);
+
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
     try {
-      return edlToCompositeRequest(edlWithTakeCanvas(edl, takes), takeUriById);
+      return edlToCompositeRequest(edlWithTakeCanvas(edl, takes), takeUriById, {
+        look: resolvedLook,
+        normalizeVolume: studio.autoVolume,
+      });
     } catch {
       return null;
     }
-  }, [edl, takeUriById, takes]);
+  }, [edl, takeUriById, takes, resolvedLook, studio.autoVolume]);
   const previewKey = previewRequest ? `${JSON.stringify(previewRequest)}#${previewNonce}` : '';
 
   const handleProgress = useCallback((pos: number, playing: boolean) => {
@@ -1065,6 +1078,12 @@ function EditorWorkspace() {
               </View>
             </View>
           </View>
+
+          {/* Look — the project's grade (preset + intensity +
+              slider overrides). Creative, so Edit — and because the
+              grade lives in the composition, the preview above is
+              already showing it. */}
+          <LookPanel />
 
           {/* Lyrics — Whisper-detected lines on the song timeline,
               edited line by line, styled CapCut-style. A creative
