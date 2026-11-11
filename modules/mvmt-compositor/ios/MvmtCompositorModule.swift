@@ -1416,28 +1416,29 @@ private enum MvmtCompositorEngine {
     scale: CGFloat
   ) -> (image: CGImage, displaySize: CGSize)? {
     var strokeFraction = max(0, strokeFractionOfFont)
-    var effectiveStrokeColor = strokeColor
-    if boldStrokeFallback {
-      if effectiveStrokeColor == nil {
-        effectiveStrokeColor = fillColor
-      }
-      if strokeFraction <= 0 {
-        strokeFraction = 0.03
-      }
+    // The user's chosen outline (a real stroke colour) renders
+    // TWO passes, mirroring the JS preview's halo: a stroke-only
+    // pass (positive strokeWidth = hollow stroke, centred on the
+    // glyph path) at TWICE the fraction, so its outer edge lands
+    // strokeFraction × fontSize beyond the glyph — then the fill
+    // pass on top, glyph intact. The old single pass (negative
+    // strokeWidth, stroke centred) ate half the stroke's width
+    // out of the fill: heavy fonts printed as solid blobs and
+    // thin fonts as hollow outlines — never what the preview
+    // showed. The bold fallback keeps the single-pass behaviour:
+    // a hair of the FILL colour around the glyph to fake weight.
+    let hasRealStroke = strokeColor != nil && strokeFraction > 0
+    var fallbackStrokeFraction: CGFloat = 0
+    if !hasRealStroke, boldStrokeFallback {
+      fallbackStrokeFraction = strokeFraction > 0 ? strokeFraction : 0.03
     }
 
-    var attributes: [NSAttributedString.Key: Any] = [
+    let fillAttributes: [NSAttributedString.Key: Any] = [
       .font: font,
       .foregroundColor: fillColor,
     ]
-    if let stroke = effectiveStrokeColor, strokeFraction > 0 {
-      attributes[.strokeColor] = stroke
-      // NSAttributedString stroke width is a PERCENT of the font
-      // size; negative draws stroke AND fill (positive = hollow).
-      attributes[.strokeWidth] = NSNumber(value: -strokeFraction * 100)
-    }
-    let attributed = NSAttributedString(string: text, attributes: attributes)
-    let textSize = attributed.size()
+    let fillString = NSAttributedString(string: text, attributes: fillAttributes)
+    let textSize = fillString.size()
     guard textSize.width > 0, textSize.height > 0 else { return nil }
 
     // `pad` (caller-supplied) leaves room for the stroke's
@@ -1451,7 +1452,27 @@ private enum MvmtCompositorEngine {
     format.opaque = false
     let renderer = UIGraphicsImageRenderer(size: displaySize, format: format)
     let image = renderer.image { _ in
-      attributed.draw(at: CGPoint(x: pad, y: pad))
+      let origin = CGPoint(x: pad, y: pad)
+      if hasRealStroke, let strokeColor {
+        let strokeAttributes: [NSAttributedString.Key: Any] = [
+          .font: font,
+          .foregroundColor: strokeColor,
+          .strokeColor: strokeColor,
+          // Percent of the font size; positive = stroke only.
+          // Doubled: the stroke is centred on the path, so half
+          // its width lands outside the glyph.
+          .strokeWidth: NSNumber(value: Double(strokeFraction) * 200),
+        ]
+        NSAttributedString(string: text, attributes: strokeAttributes).draw(at: origin)
+        fillString.draw(at: origin)
+      } else if fallbackStrokeFraction > 0 {
+        var attributes = fillAttributes
+        attributes[.strokeColor] = fillColor
+        attributes[.strokeWidth] = NSNumber(value: -Double(fallbackStrokeFraction) * 100)
+        NSAttributedString(string: text, attributes: attributes).draw(at: origin)
+      } else {
+        fillString.draw(at: origin)
+      }
     }
     guard let cgImage = image.cgImage else { return nil }
     return (cgImage, displaySize)
@@ -3200,39 +3221,58 @@ private enum MvmtCompositorEngine {
 
     // The classic reader/writer pump: each input pulls from its
     // output on its own serial queue until the output runs dry.
+    // An input is marked finished ONLY at end-of-stream (the
+    // reader returns nil) or on append failure. The previous
+    // shape marked it finished the first time the while loop
+    // exited — including a mere back-pressure pause
+    // (isReadyForMoreMediaData == false) — so every transcode
+    // "completed" after a second or two of media and render()'s
+    // duration guard silently substituted the raw master: no
+    // size control, no codec conversion, no grade, ever. That
+    // was the root of the whole styled-export saga (the ~4s
+    // TikTok stubs were this pump's output, delivered before
+    // the guard existed).
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
       let group = DispatchGroup()
       group.enter()
-      var videoFinished = false
       videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "au.mvmtstudio.transcode.video")) {
-        if videoFinished { return }
         while videoInput.isReadyForMoreMediaData {
-          guard let buffer = videoOutput.copyNextSampleBuffer() else { break }
-          if !videoInput.append(buffer) { break }
+          guard let buffer = videoOutput.copyNextSampleBuffer() else {
+            videoInput.markAsFinished()
+            group.leave()
+            return
+          }
+          if !videoInput.append(buffer) {
+            videoInput.markAsFinished()
+            group.leave()
+            return
+          }
           let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
           let seconds = CMTimeGetSeconds(pts)
           if seconds.isFinite, durationSeconds > 0 {
             onProgress?(min(1, max(0, seconds / durationSeconds)))
           }
         }
-        videoFinished = true
-        videoInput.markAsFinished()
-        group.leave()
+        // Back-pressure pause: return WITHOUT finishing — the
+        // input calls this handler again when it wants more.
       }
       if let audioInput, let audioOutput {
         group.enter()
-        var audioFinished = false
         audioInput.requestMediaDataWhenReady(
           on: DispatchQueue(label: "au.mvmtstudio.transcode.audio")
         ) {
-          if audioFinished { return }
           while audioInput.isReadyForMoreMediaData {
-            guard let buffer = audioOutput.copyNextSampleBuffer() else { break }
-            if !audioInput.append(buffer) { break }
+            guard let buffer = audioOutput.copyNextSampleBuffer() else {
+              audioInput.markAsFinished()
+              group.leave()
+              return
+            }
+            if !audioInput.append(buffer) {
+              audioInput.markAsFinished()
+              group.leave()
+              return
+            }
           }
-          audioFinished = true
-          audioInput.markAsFinished()
-          group.leave()
         }
       }
       group.notify(queue: DispatchQueue(label: "au.mvmtstudio.transcode.done")) {
