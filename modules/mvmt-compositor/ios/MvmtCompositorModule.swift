@@ -144,6 +144,194 @@ struct LookParamsRecord: Record {
   var vignette: Double = 0
 }
 
+// MARK: - Preview look compositor
+
+/// The resolved look params the preview compositor grades with.
+/// The composition builder writes the slot whenever it builds a
+/// preview composition with a non-identity look (and points that
+/// composition's customVideoCompositorClass at
+/// LookVideoCompositor); the compositor reads the slot per request.
+/// A single slot is sound because this app has exactly ONE preview
+/// consumer at a time — PreviewStore's standing player — and every
+/// preview of a project shares that project's resolved look.
+/// Exports never read the slot: they grade in the render transcode
+/// (see the RULE in buildComposition). Lock-guarded: the builder
+/// writes from its queue while requests read on AVFoundation's
+/// compositor queue. A stale slot is never observable — a preview
+/// composition only runs the compositor when the builder just set
+/// both the class and the slot for it.
+enum LookCompositorStore {
+  private static let lock = NSLock()
+  private static var stored: LookParamsRecord?
+
+  static var current: LookParamsRecord? {
+    get {
+      lock.lock()
+      defer { lock.unlock() }
+      return stored
+    }
+    set {
+      lock.lock()
+      stored = newValue
+      lock.unlock()
+    }
+  }
+}
+
+/// Grades PREVIEW frames for the look system by compositing the
+/// EDL's layer instructions itself and running the shared CI grade
+/// chain (MvmtCompositorEngine.gradedImage) over the result.
+///
+/// Why a custom compositor at all: the factory CI-filter
+/// composition (applyingCIFiltersWithHandler) throws on this
+/// builder's compositions — previews AND exports crashed on device
+/// (2026-11-10) — while a custom AVVideoCompositing class is the
+/// supported way to post-process an arbitrary composition's frames.
+///
+/// FAILURE DISCIPLINE IS THE POINT: startRequest runs on
+/// AVFoundation's compositor queue, where an uncaught exception is
+/// a process abort (the exact SIGABRT this class replaces). There
+/// are no force unwraps and no throwing calls below: every failure
+/// degrades to the ungraded composite, and the worst case finishes
+/// with a plain black frame — never with no finish at all.
+final class LookVideoCompositor: NSObject, AVVideoCompositing {
+  /// The frames this compositor hands back (via the render
+  /// context's buffer pool): BGRA with IOSurface backing, the
+  /// shape CIContext renders into most cheaply.
+  var sourcePixelBufferAttributes: [String: Any] = [
+    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+    kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+  ]
+
+  /// Source frames are accepted as BGRA only — AVFoundation
+  /// converts the takes' native formats before handing them over,
+  /// so CIImage(cvPixelBuffer:) always sees a layout it reads
+  /// directly.
+  var requiredSourcePixelBufferAttributes: [String: Any] = [
+    kCVPixelBufferPixelFormatTypeKey as String: [Int(kCVPixelFormatType_32BGRA)],
+    kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+  ]
+
+  /// Sources are SDR camera files; no HDR frame handling.
+  var supportsHDRSourceFrames: Bool { false }
+
+  /// GPU-backed context reused across requests (CIContext is
+  /// thread-safe and requests arrive serially on the compositor
+  /// queue in practice). Recreated when the render context
+  /// changes, per the protocol's contract.
+  private var ciContext = CIContext(options: [.useSoftwareRenderer: false])
+  private var renderContext: AVVideoCompositionRenderContext?
+
+  func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {
+    renderContext = newRenderContext
+    ciContext = CIContext(options: [.useSoftwareRenderer: false])
+  }
+
+  func cancelAllPendingVideoCompositionRequests() {
+    // Requests complete synchronously inside startRequest, so
+    // there is never anything pending to cancel.
+  }
+
+  func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+    autoreleasepool {
+      let renderSize = request.renderContext.size
+      guard renderSize.width > 0, renderSize.height > 0,
+        let outputBuffer = request.renderContext.newPixelBuffer()
+      else {
+        // Nowhere to draw: still finish exactly once, with an
+        // error — an unfinished request stalls the pipeline.
+        request.finish(
+          with: NSError(domain: "MVMTLookCompositor", code: 1, userInfo: nil)
+        )
+        return
+      }
+      let renderExtent = CGRect(origin: .zero, size: renderSize)
+
+      // Composite the instruction's layers, in array order (later
+      // layers over earlier ones), onto a black base — the EDL
+      // shape is one full-frame layer at a time (sequential cuts),
+      // but the loop is the general one.
+      var composed = CIImage(color: .black).cropped(to: renderExtent)
+      let instruction = request.videoCompositionInstruction
+      let time = request.compositionTime
+      for layerInstruction in instruction.layerInstructions {
+        guard
+          let sourceBuffer = request.sourceFrame(byTrackID: layerInstruction.trackID)
+        else { continue }
+        let sourceImage = CIImage(cvPixelBuffer: sourceBuffer)
+        let sourceExtent = sourceImage.extent
+        var image = sourceImage
+
+        // Crop (the EDL builder never sets one — defensive
+        // generality for the general loop): the crop rect lives in
+        // AV space (top-left origin); convert to CI space
+        // (bottom-left origin) before applying.
+        let crop = layerInstruction.cropRectangle(at: time)
+        if !crop.isNull, !crop.isInfinite, crop.width > 0, crop.height > 0,
+          sourceExtent.width > 0, sourceExtent.height > 0
+        {
+          let ciCrop = CGRect(
+            x: crop.origin.x,
+            y: sourceExtent.height - crop.origin.y - crop.height,
+            width: crop.width,
+            height: crop.height
+          )
+          let clamped = ciCrop.intersection(sourceExtent)
+          if !clamped.isNull, clamped.width > 0, clamped.height > 0 {
+            image = image.cropped(to: clamped)
+          }
+        }
+
+        // Opacity: CI works premultiplied, so scale all four
+        // components — the over-composite then blends by exactly
+        // the layer's opacity factor.
+        let opacity = layerInstruction.opacity(at: time)
+        if opacity < 0.999 {
+          let factor = CGFloat(max(0, min(1, opacity)))
+          image = image.applyingFilter(
+            "CIColorMatrix",
+            parameters: [
+              "inputRVector": CIVector(x: factor, y: 0, z: 0, w: 0),
+              "inputGVector": CIVector(x: 0, y: factor, z: 0, w: 0),
+              "inputBVector": CIVector(x: 0, y: 0, z: factor, w: 0),
+              "inputAVector": CIVector(x: 0, y: 0, z: 0, w: factor),
+            ]
+          )
+        }
+
+        // Transform: the layer transform is expressed in AV space
+        // (top-left origin, y down) over both the source and the
+        // render canvas; CI space is bottom-left, y up. Conjugate
+        // by the two flips — flip(source) then the AV transform
+        // then flip(render) — so framing matches the default
+        // compositor's output exactly (identity in, identity out).
+        let avTransform = layerInstruction.transform(at: time)
+        let flipSource = CGAffineTransform(
+          a: 1, b: 0, c: 0, d: -1, tx: 0, ty: sourceExtent.height
+        )
+        let flipRender = CGAffineTransform(
+          a: 1, b: 0, c: 0, d: -1, tx: 0, ty: renderSize.height
+        )
+        let ciTransform =
+          flipSource.concatenating(avTransform).concatenating(flipRender)
+        image = image.transformed(by: ciTransform)
+
+        composed = image.composited(over: composed)
+      }
+
+      // Grade the finished composite with the same chain the
+      // export transcode applies. gradedImage pins its output to
+      // its input's extent, so hand it exactly the render frame.
+      var output = composed.cropped(to: renderExtent)
+      if let look = LookCompositorStore.current {
+        output = MvmtCompositorEngine.gradedImage(output, look: look)
+      }
+      ciContext.render(output, to: outputBuffer)
+      request.finish(withComposedVideoFrame: outputBuffer)
+    }
+  }
+}
+
 struct LyricWordRecord: Record {
   @Field
   var text: String
@@ -494,6 +682,13 @@ private struct BuiltComposition {
   /// measurement produced one. Surfaced on the render result; the
   /// preview path ignores it (it just plays the gained mix).
   let appliedGainDb: Double?
+  /// EXPORT builds only: the resolved look the render path must
+  /// still apply to the finished file (render grades it in the
+  /// post-render transcode — see the RULE at the builder's look
+  /// application). Always nil for preview builds: their video
+  /// composition grades at display time through
+  /// LookVideoCompositor instead.
+  let pendingGrade: LookParamsRecord?
 }
 
 // MARK: - Loudness measurement support (auto volume)
@@ -853,27 +1048,49 @@ private enum MvmtCompositorEngine {
     }
 
     // ---- Optional look (edit/export-stage grade) ----
-    // A CI filter chain over the COMPOSED frames, applied through a
-    // filtering video composition that inherits this composition's
-    // instructions, render size, frame duration AND animation tool
-    // — grade and overlays coexist on the one composition the caller
-    // receives (see applyingLook). Applies to preview builds too:
-    // the editor must show the grade it will export. Any failure
-    // falls back to the unfiltered composition — a grade must never
-    // break a preview or an export.
-    var finalVideoComposition = videoComposition
-    if let look = request.look, !lookIsIdentity(look),
-      let filtered = applyingLook(look, to: videoComposition, asset: composition)
-    {
-      finalVideoComposition = filtered
+    // RULE (device crashes, 2026-11-10): an EDL composition must
+    // NEVER be wrapped in the applyingCIFiltersWithHandler twin,
+    // and a CI-filter composition must never carry the animation
+    // tool. -[AVCoreImageFilterCustomVideoCompositor
+    // startVideoCompositionRequest:] threw on AVFoundation's own
+    // queue for BOTH kinds of build — EXC_CRASH/SIGABRT, outside
+    // avTry's reach: EXPORT builds died on the animation-tool
+    // conflict (crash log MVMTStudio-2026-11-10-181458, hit Export
+    // with the watermark on and a look active), and PREVIEW builds
+    // died too (Jaizon, entering Edit) — the factory compositor
+    // also rejects this builder's multi-segment EDL instructions
+    // themselves. So the grade has two homes, neither of them a
+    // wrapped composition:
+    //  • PREVIEW builds: a CUSTOM VIDEO COMPOSITOR
+    //    (LookVideoCompositor) hangs off this plain EDL composition
+    //    and grades each frame as the player requests it, reading
+    //    the resolved params from LookCompositorStore. Preview
+    //    compositions never carry the animation tool (see above),
+    //    and the editor must show the grade it will export.
+    //  • EXPORT builds: this composition is left EXACTLY as it was
+    //    before looks existed (animation tool and all); the
+    //    resolved params travel out as BuiltComposition.pendingGrade
+    //    and render() applies them in its post-render transcode,
+    //    through a factory filtering composition over the finished
+    //    file (watermark/lyrics already burned in — no tool
+    //    anywhere near the filter compositor).
+    var pendingGrade: LookParamsRecord?
+    if let look = request.look, !lookIsIdentity(look) {
+      if forExport {
+        pendingGrade = look
+      } else {
+        LookCompositorStore.current = look
+        videoComposition.customVideoCompositorClass = LookVideoCompositor.self
+      }
     }
 
     return BuiltComposition(
       composition: composition,
-      videoComposition: finalVideoComposition,
+      videoComposition: videoComposition,
       audioMix: audioMix,
       duration: totalDuration,
-      appliedGainDb: appliedGainDb
+      appliedGainDb: appliedGainDb,
+      pendingGrade: pendingGrade
     )
   }
 
@@ -1941,45 +2158,15 @@ private enum MvmtCompositorEngine {
       && abs(look.vignette) < 0.001
   }
 
-  /// Builds the filtering twin of `base`: a video composition made
-  /// by the CI factory (its compositor grades every composed frame
-  /// through gradedImage), with the base's instructions, render
-  /// size, frame duration and — critically — animation tool copied
-  /// over, so the watermark/lyrics tool and the grade coexist on
-  /// the composition the caller receives. Guarded (avTry) like every
-  /// validate-and-throw site; nil = the caller keeps `base`.
-  private static func applyingLook(
-    _ look: LookParamsRecord,
-    to base: AVMutableVideoComposition,
-    asset: AVAsset
-  ) -> AVMutableVideoComposition? {
-    var filtered: AVMutableVideoComposition?
-    let exception = avTry {
-      let composition = AVMutableVideoComposition(
-        asset: asset,
-        applyingCIFiltersWithHandler: { request in
-          let graded = gradedImage(request.sourceImage, look: look)
-          request.finish(with: graded, context: lookCIContext)
-        }
-      )
-      composition.instructions = base.instructions
-      composition.renderSize = base.renderSize
-      composition.frameDuration = base.frameDuration
-      composition.animationTool = base.animationTool
-      filtered = composition
-    }
-    if exception != nil {
-      return nil
-    }
-    return filtered
-  }
-
   /// The filter chain for one composed frame, built per request
   /// (CIFilter instances are not shared across the compositor's
   /// concurrent calls). Stages at identity values are skipped, in
   /// the fixed order: exposure → temperature → colour controls →
-  /// vibrance → sharpen → vignette.
-  private static func gradedImage(_ source: CIImage, look: LookParamsRecord) -> CIImage {
+  /// vibrance → sharpen → vignette. Shared by both grade homes:
+  /// LookVideoCompositor (previews) and the render transcode's
+  /// factory filtering composition (exports) — internal rather
+  /// than private so the compositor class can reach it.
+  static func gradedImage(_ source: CIImage, look: LookParamsRecord) -> CIImage {
     var image = source
     func apply(_ name: String, _ parameters: [String: Any]) {
       guard let filter = CIFilter(name: name) else { return }
@@ -2088,11 +2275,14 @@ private enum MvmtCompositorEngine {
       }
     }
 
-    // When a size-control transcode will follow, the export session
-    // owns only the first 80% of the progress bar — the transcode
+    // When a post-render transcode will follow (size control and/or
+    // a pending export grade — see below), the export session owns
+    // only the first 80% of the progress bar — the transcode
     // reports the rest, so the bar never sits at 100% mid-work.
-    let sizeControlPlanned = request.exportVideoBitrate != nil || request.exportTargetSizeMB != nil
-    let progressCeiling = sizeControlPlanned ? 0.8 : 1.0
+    let pendingGrade = built.pendingGrade
+    let transcodePlanned =
+      request.exportVideoBitrate != nil || request.exportTargetSizeMB != nil || pendingGrade != nil
+    let progressCeiling = transcodePlanned ? 0.8 : 1.0
 
     let progressTask: Task<Void, Never>? = (exportId != nil && onProgress != nil)
       ? Task {
@@ -2148,26 +2338,43 @@ private enum MvmtCompositorEngine {
     let measuredSeconds = CMTimeGetSeconds(measuredDuration)
     let renderSeconds = measuredSeconds.isFinite ? measuredSeconds : 0
 
-    // ---- Size control (render-only): transcode the finished file
-    // at an explicit video bitrate (see transcodeVideoFile). The
-    // composition is untouched — the preview built from this same
-    // request stays truthful, only the file's encoding changes. ANY
-    // failure delivers the original render: size control must never
-    // fail an export.
+    // ---- Post-render pass (render-only): transcode the finished
+    // file at an explicit video bitrate (see transcodeVideoFile),
+    // for size control and/or to apply the export grade the builder
+    // carried out as pendingGrade (a CI-filter composition must
+    // never carry the animation tool — the grade cannot ride the
+    // export composition itself; see the RULE in buildComposition).
+    // The composition is untouched — the preview built from this
+    // same request stays truthful, only the file's encoding (and,
+    // with a grade, its pixels) changes. ANY failure delivers the
+    // original render: this pass must never fail an export — a
+    // failed graded pass delivers the render UNGRADED rather than
+    // nothing.
     var finalURL = outputURL
     var appliedBitrate: Int? = nil
     var targetBitrate: Int? = nil
+    let transcodeCanvasSize = CGSize(
+      width: request.canvasWidth ?? Int(abs(outputDisplay.width).rounded()),
+      height: request.canvasHeight ?? Int(abs(outputDisplay.height).rounded())
+    )
+    let transcodeFrameRate = request.frameRate ?? 30
+    var transcodeCodec = request.exportCodec ?? "h264"
     if let targetMB = request.exportTargetSizeMB, targetMB > 0 {
       targetBitrate = videoBitrate(forTargetSizeMB: targetMB, durationSeconds: renderSeconds)
     } else if let fixed = request.exportVideoBitrate, fixed > 0 {
       targetBitrate = Int(fixed)
+    } else if pendingGrade != nil {
+      // Grade-only pass: no size fields were set, so the rate is
+      // chosen for transparency — 0.22 bits per pixel-frame clamped
+      // to 16–50 Mbps, one generation down from a HighestQuality
+      // master, at the render's own canvas/frame rate, H.264.
+      let pixels = Double(transcodeCanvasSize.width) * Double(transcodeCanvasSize.height)
+      targetBitrate = min(50_000_000, max(16_000_000, Int(pixels * transcodeFrameRate * 0.22)))
+      transcodeCodec = "h264"
     }
     if let targetBitrate {
-      let canvasSize = CGSize(
-        width: request.canvasWidth ?? Int(abs(outputDisplay.width).rounded()),
-        height: request.canvasHeight ?? Int(abs(outputDisplay.height).rounded())
-      )
-      let codec = request.exportCodec ?? "h264"
+      let canvasSize = transcodeCanvasSize
+      let codec = transcodeCodec
       let transcodeProgress: ((Double) -> Void)? =
         (exportId != nil && onProgress != nil)
         ? { fraction in onProgress?(0.8 + 0.2 * fraction) }
@@ -2177,7 +2384,8 @@ private enum MvmtCompositorEngine {
         videoBitrateBps: targetBitrate,
         codec: codec,
         canvasSize: canvasSize,
-        frameRate: request.frameRate ?? 30,
+        frameRate: transcodeFrameRate,
+        grade: pendingGrade,
         onProgress: transcodeProgress
       )
       var usedBitrate = targetBitrate
@@ -2199,7 +2407,8 @@ private enum MvmtCompositorEngine {
               videoBitrateBps: corrected,
               codec: codec,
               canvasSize: canvasSize,
-              frameRate: request.frameRate ?? 30,
+              frameRate: transcodeFrameRate,
+              grade: pendingGrade,
               onProgress: transcodeProgress
             )
           {
@@ -2282,16 +2491,21 @@ private enum MvmtCompositorEngine {
   /// AVAssetReader → AVAssetWriter. The composition is NOT involved:
   /// the source is a plain file (watermark/lyrics already burned
   /// in), re-framed onto the canvas with the builder's aspect-fill
-  /// normalisation at the target frame rate. Audio passes through
-  /// untouched when possible (the export session writes AAC);
-  /// otherwise it is re-encoded to AAC 192k stereo. Returns nil on
-  /// ANY failure — the caller delivers the original render.
+  /// normalisation at the target frame rate. When `grade` is set,
+  /// the reader side instead runs the factory CI-filter composition
+  /// over the file (see transcodeAttempt) — the export-side home of
+  /// the look, since a filtering composition must never carry the
+  /// animation tool the export composition needed. Audio passes
+  /// through untouched when possible (the export session writes
+  /// AAC); otherwise it is re-encoded to AAC 192k stereo. Returns
+  /// nil on ANY failure — the caller delivers the original render.
   private static func transcodeVideoFile(
     sourceURL: URL,
     videoBitrateBps: Int,
     codec: String,
     canvasSize: CGSize,
     frameRate: Double,
+    grade: LookParamsRecord? = nil,
     onProgress: ((Double) -> Void)? = nil
   ) async -> URL? {
     let asset = AVURLAsset(url: sourceURL)
@@ -2325,6 +2539,7 @@ private enum MvmtCompositorEngine {
         codec: codec,
         canvasSize: canvasSize,
         frameRate: frameRate,
+        grade: grade,
         passthroughAudio: passthroughAudio,
         onProgress: onProgress
       ) {
@@ -2350,6 +2565,7 @@ private enum MvmtCompositorEngine {
     codec: String,
     canvasSize: CGSize,
     frameRate: Double,
+    grade: LookParamsRecord?,
     passthroughAudio: Bool,
     onProgress: ((Double) -> Void)?
   ) async -> URL? {
@@ -2376,41 +2592,70 @@ private enum MvmtCompositorEngine {
         let createdWriter = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
         // Reader-side video composition: the target frame rate and
-        // canvas, with the builder's aspect-fill normalisation, so
-        // the transcoded file is framed exactly like the render.
-        let videoComposition = AVMutableVideoComposition()
-        videoComposition.renderSize = canvasSize
-        videoComposition.frameDuration = CMTime(
+        // canvas, so the transcoded file is framed exactly like the
+        // render. Two forms:
+        let targetFrameDuration = CMTime(
           value: 1,
           timescale: CMTimeScale(max(1.0, frameRate).rounded())
         )
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(
-          start: .zero,
-          duration: CMTime(seconds: durationSeconds, preferredTimescale: 600)
-        )
-        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
-        let displayRect = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
-        let displaySize = CGSize(width: abs(displayRect.width), height: abs(displayRect.height))
-        if displaySize.width > 0, displaySize.height > 0 {
-          let fillScale = max(
-            canvasSize.width / displaySize.width,
-            canvasSize.height / displaySize.height
+        let videoComposition: AVMutableVideoComposition
+        if let grade {
+          // GRADED: the CI factory composition in its supported
+          // form — its compositor runs every frame through the SAME
+          // gradedImage chain the preview compositor uses. Safe here
+          // because the source is the finished render: watermark
+          // and lyrics are already burned into its pixels and there
+          // is NO animation tool anywhere (the tool must never meet
+          // the filter compositor — see the RULE in
+          // buildComposition). The factory derives its instructions
+          // from the asset; the render's frames are already at the
+          // canvas, upright, so only the render size and frame
+          // duration need pinning to the transcode targets.
+          let factory = AVMutableVideoComposition(
+            asset: asset,
+            applyingCIFiltersWithHandler: { request in
+              let graded = gradedImage(request.sourceImage, look: grade)
+              request.finish(with: graded, context: lookCIContext)
+            }
           )
-          var transform = preferredTransform
-          transform = transform.concatenating(
-            CGAffineTransform(translationX: -displayRect.origin.x, y: -displayRect.origin.y)
+          factory.renderSize = canvasSize
+          factory.frameDuration = targetFrameDuration
+          videoComposition = factory
+        } else {
+          // UNGRADED: a hand-built composition carrying the
+          // builder's aspect-fill normalisation.
+          let plain = AVMutableVideoComposition()
+          plain.renderSize = canvasSize
+          plain.frameDuration = targetFrameDuration
+          let instruction = AVMutableVideoCompositionInstruction()
+          instruction.timeRange = CMTimeRange(
+            start: .zero,
+            duration: CMTime(seconds: durationSeconds, preferredTimescale: 600)
           )
-          transform = transform.concatenating(CGAffineTransform(scaleX: fillScale, y: fillScale))
-          let centreX = (canvasSize.width - displaySize.width * fillScale) / 2
-          let centreY = (canvasSize.height - displaySize.height * fillScale) / 2
-          transform = transform.concatenating(
-            CGAffineTransform(translationX: centreX, y: centreY)
-          )
-          layerInstruction.setTransform(transform, at: .zero)
+          let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+          let displayRect = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
+          let displaySize = CGSize(width: abs(displayRect.width), height: abs(displayRect.height))
+          if displaySize.width > 0, displaySize.height > 0 {
+            let fillScale = max(
+              canvasSize.width / displaySize.width,
+              canvasSize.height / displaySize.height
+            )
+            var transform = preferredTransform
+            transform = transform.concatenating(
+              CGAffineTransform(translationX: -displayRect.origin.x, y: -displayRect.origin.y)
+            )
+            transform = transform.concatenating(CGAffineTransform(scaleX: fillScale, y: fillScale))
+            let centreX = (canvasSize.width - displaySize.width * fillScale) / 2
+            let centreY = (canvasSize.height - displaySize.height * fillScale) / 2
+            transform = transform.concatenating(
+              CGAffineTransform(translationX: centreX, y: centreY)
+            )
+            layerInstruction.setTransform(transform, at: .zero)
+          }
+          instruction.layerInstructions = [layerInstruction]
+          plain.instructions = [instruction]
+          videoComposition = plain
         }
-        instruction.layerInstructions = [layerInstruction]
-        videoComposition.instructions = [instruction]
 
         let createdVideoOutput = AVAssetReaderVideoCompositionOutput(
           videoTracks: [videoTrack],
