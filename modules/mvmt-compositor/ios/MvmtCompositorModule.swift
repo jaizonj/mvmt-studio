@@ -835,7 +835,12 @@ private enum MvmtCompositorEngine {
 
   // MARK: Shared builder
 
-  static func buildComposition(_ request: CompositeRequestRecord, forExport: Bool) async throws -> BuiltComposition {
+  static func buildComposition(
+    _ request: CompositeRequestRecord,
+    forExport: Bool,
+    includeAnimationTool: Bool = true,
+    includeAudioMix: Bool = true
+  ) async throws -> BuiltComposition {
     let clips = request.clips
     guard !clips.isEmpty else {
       throw compositorError("At least one clip is required to build a composition.")
@@ -1070,7 +1075,7 @@ private enum MvmtCompositorEngine {
     }
 
     var audioMix: AVMutableAudioMix?
-    if !audioMixParameters.isEmpty {
+    if includeAudioMix, !audioMixParameters.isEmpty {
       let mix = AVMutableAudioMix()
       mix.inputParameters = audioMixParameters
       audioMix = mix
@@ -1090,7 +1095,7 @@ private enum MvmtCompositorEngine {
     // burn in through the SAME tool's layer tree — created for the
     // lyrics alone when the watermark is off — and degrade the same
     // way: any lyric problem renders without them.
-    if forExport,
+    if forExport, includeAnimationTool,
       let tool = makeAnimationTool(
         request: request,
         renderSize: canvasSize,
@@ -2266,6 +2271,56 @@ private enum MvmtCompositorEngine {
 
   // MARK: Export
 
+  /// Runs ONE export session for a built composition with no
+  /// progress reporting — the audio-repair ladder's runner (the
+  /// first render keeps render()'s own progress-wired session).
+  /// Creation and videoComposition assignment are validate-and-
+  /// throw territory, guarded like every other session here.
+  private static func runRepairSession(built: BuiltComposition, outputURL: URL) async throws {
+    var createdExporter: AVAssetExportSession?
+    let exporterException = avTry {
+      guard
+        let session = AVAssetExportSession(
+          asset: built.composition,
+          presetName: AVAssetExportPresetHighestQuality
+        )
+      else {
+        return
+      }
+      session.outputURL = outputURL
+      session.outputFileType = .mp4
+      session.shouldOptimizeForNetworkUse = false
+      session.videoComposition = built.videoComposition
+      if let audioMix = built.audioMix {
+        session.audioMix = audioMix
+      }
+      createdExporter = session
+    }
+    if let exporterException {
+      throw exceptionError("The export session rejected the composition", exporterException)
+    }
+    guard let exporter = createdExporter else {
+      throw compositorError("Could not create the export session.")
+    }
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      exporter.exportAsynchronously {
+        switch exporter.status {
+        case .completed:
+          continuation.resume()
+        case .failed, .cancelled:
+          continuation.resume(
+            throwing: exporter.error
+              ?? compositorError(
+                exporter.status == .cancelled ? "The export was cancelled." : "The video export failed."
+              )
+          )
+        default:
+          continuation.resume(throwing: compositorError("The video export ended unexpectedly."))
+        }
+      }
+    }
+  }
+
   static func render(
     _ request: CompositeRequestRecord,
     onProgress: ((Double) -> Void)? = nil
@@ -2383,9 +2438,76 @@ private enum MvmtCompositorEngine {
     }
     let outputNaturalSize = try await outputVideoTrack.load(.naturalSize)
     let outputTransform = try await outputVideoTrack.load(.preferredTransform)
-    let outputDisplay = outputNaturalSize.applying(outputTransform)
+    var outputDisplay = outputNaturalSize.applying(outputTransform)
     let measuredSeconds = CMTimeGetSeconds(measuredDuration)
-    let renderSeconds = measuredSeconds.isFinite ? measuredSeconds : 0
+    var renderSeconds = measuredSeconds.isFinite ? measuredSeconds : 0
+
+    // ---- Audio health check + repair ladder ----
+    // Device evidence (Jaizon, 2026-11-11): a master can come out
+    // of the export session with a full-length video track and an
+    // audio track truncated to a few seconds (measured: 2.4s of
+    // audio inside a 42s file, on the imported-video project —
+    // while other projects render whole). The session reports
+    // .completed either way, so the render must CHECK ITS OWN
+    // WORK: probe the master's audio track, and when it is short,
+    // re-render through progressively plainer builds — first
+    // without the animation tool, then also without the audio
+    // mix — keeping the first whole result (else the longest).
+    // A repaired master carries no burned overlays; the
+    // post-render pass below burns them in instead
+    // (overlaysPending), so a repair never costs the lyrics or
+    // the watermark — and a healthy first render is untouched.
+    var overlaysPending = false
+    var acceptedGainDb = built.appliedGainDb
+    let audioExpected = !(request.audioUri ?? "").isEmpty && request.audioVolume > 0
+    if audioExpected, renderSeconds > 0 {
+      let masterAudio = await trackDurationSeconds(outputURL, mediaType: .audio)
+      if masterAudio == nil || masterAudio! < renderSeconds * 0.85 {
+        var bestURL: URL? = nil
+        var bestAudio = masterAudio ?? 0
+        var bestGainDb: Double? = acceptedGainDb
+        // (includeAnimationTool, includeAudioMix) — plainest last.
+        for (withTool, withMix) in [(false, true), (false, false)] {
+          let repairURL = cachesDirectory.appendingPathComponent(
+            "mvmt-export-repair-\(UUID().uuidString).mp4"
+          )
+          do {
+            let repairBuilt = try await buildComposition(
+              request, forExport: true,
+              includeAnimationTool: withTool, includeAudioMix: withMix
+            )
+            try await runRepairSession(built: repairBuilt, outputURL: repairURL)
+            let repairAudio = await trackDurationSeconds(repairURL, mediaType: .audio) ?? 0
+            if repairAudio > bestAudio {
+              if let stale = bestURL {
+                try? FileManager.default.removeItem(at: stale)
+              }
+              bestURL = repairURL
+              bestAudio = repairAudio
+              bestGainDb = withMix ? repairBuilt.appliedGainDb : nil
+            } else {
+              try? FileManager.default.removeItem(at: repairURL)
+            }
+            if repairAudio >= renderSeconds * 0.85 {
+              break
+            }
+          } catch {
+            try? FileManager.default.removeItem(at: repairURL)
+            continue
+          }
+        }
+        if let bestURL {
+          try? FileManager.default.removeItem(at: outputURL)
+          try? FileManager.default.moveItem(at: bestURL, to: outputURL)
+          acceptedGainDb = bestGainDb
+          overlaysPending = true
+          if let remeasured = await measureRenderedFile(outputURL) {
+            renderSeconds = remeasured.seconds
+            outputDisplay = remeasured.display
+          }
+        }
+      }
+    }
 
     // ---- Post-render pass (render-only): transcode the finished
     // file at an explicit video bitrate (see transcodeVideoFile),
@@ -2421,6 +2543,24 @@ private enum MvmtCompositorEngine {
       targetBitrate = min(50_000_000, max(16_000_000, Int(pixels * transcodeFrameRate * 0.22)))
       transcodeCodec = "h264"
     }
+    // A repaired master carries no burned overlays — burn them in
+    // during the post-render pass, forcing a transparent pass when
+    // no size/grade work was planned (the tool then rides the
+    // pass's single-instruction composition, the same seat the
+    // export grade uses).
+    var burnTool: AVVideoCompositionCoreAnimationTool? = nil
+    if overlaysPending {
+      burnTool = makeAnimationTool(
+        request: request,
+        renderSize: CGSize(width: abs(outputDisplay.width), height: abs(outputDisplay.height)),
+        durationSeconds: renderSeconds
+      )
+      if targetBitrate == nil {
+        let pixels = Double(transcodeCanvasSize.width) * Double(transcodeCanvasSize.height)
+        targetBitrate = min(50_000_000, max(16_000_000, Int(pixels * transcodeFrameRate * 0.22)))
+        transcodeCodec = "h264"
+      }
+    }
     if let targetBitrate {
       let canvasSize = transcodeCanvasSize
       let codec = transcodeCodec
@@ -2435,7 +2575,7 @@ private enum MvmtCompositorEngine {
       // falls back to transcoding the original render, as before.
       var transcodeSourceURL = outputURL
       var flattenedURL: URL? = nil
-      if let lyrics = request.lyrics, !lyrics.lines.isEmpty,
+      if !overlaysPending, let lyrics = request.lyrics, !lyrics.lines.isEmpty,
         let flattened = await flattenRenderedFile(sourceURL: outputURL)
       {
         flattenedURL = flattened
@@ -2448,6 +2588,7 @@ private enum MvmtCompositorEngine {
         canvasSize: canvasSize,
         frameRate: transcodeFrameRate,
         grade: pendingGrade,
+        animationTool: burnTool,
         onProgress: transcodeProgress
       )
       var usedBitrate = targetBitrate
@@ -2471,6 +2612,7 @@ private enum MvmtCompositorEngine {
               canvasSize: canvasSize,
               frameRate: transcodeFrameRate,
               grade: pendingGrade,
+              animationTool: burnTool,
               onProgress: transcodeProgress
             )
           {
@@ -2489,6 +2631,24 @@ private enum MvmtCompositorEngine {
       if let candidate = accepted,
         let candidateSeconds = await mediaDurationSeconds(candidate),
         renderSeconds > 0, candidateSeconds < renderSeconds * 0.85
+      {
+        try? FileManager.default.removeItem(at: candidate)
+        accepted = nil
+        if let flattenedURL {
+          try? FileManager.default.removeItem(at: outputURL)
+          finalURL = flattenedURL
+        }
+      }
+      // Audio guard: the container check above follows the LONGEST
+      // track, so a candidate whose audio was truncated behind a
+      // full-length video would pass it. Compare audio tracks
+      // directly; a short-audio candidate is rejected for the
+      // master (or its flattened staging) exactly like a short
+      // container.
+      if let candidate = accepted,
+        let referenceAudio = await trackDurationSeconds(flattenedURL ?? outputURL, mediaType: .audio),
+        let candidateAudio = await trackDurationSeconds(candidate, mediaType: .audio),
+        referenceAudio > 0, candidateAudio < referenceAudio * 0.85
       {
         try? FileManager.default.removeItem(at: candidate)
         accepted = nil
@@ -2542,7 +2702,7 @@ private enum MvmtCompositorEngine {
     result.height = resultHeight
     result.fileSizeBytes = fileSizeBytes(finalURL) ?? 0
     result.appliedVideoBitrate = appliedBitrate
-    result.appliedGainDb = built.appliedGainDb
+    result.appliedGainDb = acceptedGainDb
     return result
   }
 
@@ -2578,6 +2738,41 @@ private enum MvmtCompositorEngine {
     guard let duration = try? await asset.load(.duration) else { return nil }
     let seconds = CMTimeGetSeconds(duration)
     return seconds.isFinite ? seconds : nil
+  }
+
+  /// One track's duration inside a finished file (nil when the
+  /// track is absent or unreadable) — the audio-health probe's
+  /// yardstick: a file's CONTAINER duration follows its longest
+  /// track, so a truncated audio track hides behind a full-length
+  /// video track unless the audio is measured on its own.
+  private static func trackDurationSeconds(_ url: URL, mediaType: AVMediaType) async -> Double? {
+    let asset = AVURLAsset(url: url)
+    guard
+      let track = (try? await asset.loadTracks(withMediaType: mediaType))?.first,
+      let range = try? await track.load(.timeRange)
+    else {
+      return nil
+    }
+    let seconds = CMTimeGetSeconds(range.duration)
+    return seconds.isFinite ? seconds : nil
+  }
+
+  /// A finished file's container duration + video display size
+  /// (nil when unreadable) — re-measure after a repair render
+  /// replaces the master file.
+  private static func measureRenderedFile(_ url: URL) async -> (seconds: Double, display: CGSize)? {
+    let asset = AVURLAsset(url: url)
+    guard
+      let duration = try? await asset.load(.duration),
+      let track = (try? await asset.loadTracks(withMediaType: .video))?.first,
+      let naturalSize = try? await track.load(.naturalSize),
+      let transform = try? await track.load(.preferredTransform)
+    else {
+      return nil
+    }
+    let display = naturalSize.applying(transform)
+    let seconds = CMTimeGetSeconds(duration)
+    return (seconds.isFinite ? seconds : 0, CGSize(width: abs(display.width), height: abs(display.height)))
   }
 
   /// Re-renders a finished export file through a PLAIN composition
@@ -2710,6 +2905,7 @@ private enum MvmtCompositorEngine {
     canvasSize: CGSize,
     frameRate: Double,
     grade: LookParamsRecord? = nil,
+    animationTool: AVVideoCompositionCoreAnimationTool? = nil,
     onProgress: ((Double) -> Void)? = nil
   ) async -> URL? {
     let asset = AVURLAsset(url: sourceURL)
@@ -2746,6 +2942,7 @@ private enum MvmtCompositorEngine {
         canvasSize: canvasSize,
         frameRate: frameRate,
         grade: grade,
+        animationTool: animationTool,
         passthroughAudio: passthroughAudio,
         onProgress: onProgress
       ) {
@@ -2772,6 +2969,7 @@ private enum MvmtCompositorEngine {
     canvasSize: CGSize,
     frameRate: Double,
     grade: LookParamsRecord?,
+    animationTool: AVVideoCompositionCoreAnimationTool?,
     passthroughAudio: Bool,
     onProgress: ((Double) -> Void)?
   ) async -> URL? {
@@ -2828,16 +3026,25 @@ private enum MvmtCompositorEngine {
             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         ]
         let createdVideoOutput: AVAssetReaderOutput
-        if grade != nil {
-          // GRADED: one instruction over the full duration, one
-          // layer carrying the aspect-fill normalisation, and
-          // LookVideoCompositor as the composition's custom
-          // compositor (its params were installed in
-          // LookCompositorStore at the start of this attempt).
+        if grade != nil || animationTool != nil {
+          // COMPOSITION pass: one instruction over the full
+          // duration, one layer carrying the aspect-fill
+          // normalisation. A grade installs LookVideoCompositor
+          // as the custom compositor (its params were installed
+          // in LookCompositorStore at the start of this attempt);
+          // an animation tool (a repaired master's overlay
+          // burn-in — see render()) rides the same composition.
+          // The two combine freely: grade the frames, then the
+          // tool composites its layers over them.
           let composition = AVMutableVideoComposition()
           composition.renderSize = canvasSize
           composition.frameDuration = targetFrameDuration
-          composition.customVideoCompositorClass = LookVideoCompositor.self
+          if grade != nil {
+            composition.customVideoCompositorClass = LookVideoCompositor.self
+          }
+          if let animationTool {
+            composition.animationTool = animationTool
+          }
           let instruction = AVMutableVideoCompositionInstruction()
           instruction.timeRange = CMTimeRange(
             start: .zero,
