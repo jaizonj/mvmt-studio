@@ -198,20 +198,22 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
   /// The frames this compositor hands back (via the render
   /// context's buffer pool): BGRA with IOSurface backing, the
   /// shape CIContext renders into most cheaply.
-  var sourcePixelBufferAttributes: [String: Any]? = [
+  var sourcePixelBufferAttributes: [String: any Sendable]? = [
     kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-    kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+    kCVPixelBufferIOSurfacePropertiesKey as String: [String: any Sendable](),
   ]
 
   /// Source frames are accepted as BGRA only — AVFoundation
   /// converts the takes' native formats before handing them over,
   /// so CIImage(cvPixelBuffer:) always sees a layout it reads
-  /// directly. (The protocol property's full name is
-  /// ...AttributesForRenderContext and both attribute properties
-  /// are Optional in the Swift overlay — CI 42939378886.)
-  var requiredSourcePixelBufferAttributesForRenderContext: [String: Any]? = [
+  /// directly. (Protocol spelling per the SDK header, learned from
+  /// CI 42939378886 + 42941498386: the property is
+  /// requiredPixelBufferAttributesForRenderContext — PixelBuffer,
+  /// not SourcePixelBuffer — both attribute properties are
+  /// Optional, and their values are Sendable-constrained.)
+  var requiredPixelBufferAttributesForRenderContext: [String: any Sendable]? = [
     kCVPixelBufferPixelFormatTypeKey as String: [Int(kCVPixelFormatType_32BGRA)],
-    kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+    kCVPixelBufferIOSurfacePropertiesKey as String: [String: any Sendable](),
   ]
 
   /// Sources are SDR camera files; no HDR frame handling.
@@ -271,25 +273,12 @@ final class LookVideoCompositor: NSObject, AVVideoCompositing {
         let sourceExtent = sourceImage.extent
         var image = sourceImage
 
-        // Crop (the EDL builder never sets one — defensive
-        // generality for the general loop): the crop rect lives in
-        // AV space (top-left origin); convert to CI space
-        // (bottom-left origin) before applying.
-        let crop = layerInstruction.cropRectangle(at: time)
-        if !crop.isNull, !crop.isInfinite, crop.width > 0, crop.height > 0,
-          sourceExtent.width > 0, sourceExtent.height > 0
-        {
-          let ciCrop = CGRect(
-            x: crop.origin.x,
-            y: sourceExtent.height - crop.origin.y - crop.height,
-            width: crop.width,
-            height: crop.height
-          )
-          let clamped = ciCrop.intersection(sourceExtent)
-          if !clamped.isNull, clamped.width > 0, clamped.height > 0 {
-            image = image.cropped(to: clamped)
-          }
-        }
+        // No crop handling: the EDL builder never sets a crop
+        // ramp on its layer instructions (full frames only), and
+        // this SDK's Swift overlay exposes no cropRectangle(at:)
+        // convenience on AVVideoCompositionLayerInstruction
+        // (CI 42941498386) — the ramp API would be dead code for
+        // a case that cannot occur in our compositions.
 
         // Opacity: CI works premultiplied, so scale all four
         // components — the over-composite then blends by exactly
