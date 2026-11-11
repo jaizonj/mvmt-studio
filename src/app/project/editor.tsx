@@ -31,6 +31,7 @@ import {
   type TimelineTrimDragEvent,
 } from '../../components/TimelineStrip';
 import { effectiveRegion, estimateTakeEnergies } from '../../lib/analysis';
+import { useEqSongUri } from '../../lib/autoEq';
 import { inspectAsset, isCompositorAvailable, type PreviewStatus } from '../../lib/compositor';
 import {
   DEFAULT_FPS,
@@ -552,17 +553,28 @@ function EditorWorkspace() {
   // store values into its own request, so the two never drift.
   const resolvedLook = useMemo(() => resolveLookParams(studio.look), [studio.look]);
 
+  // Auto EQ is part of the composition too — but where the look and
+  // the gain ride as parameters, EQ rides as the song FILE itself:
+  // the engine's prepared copy (harsh frequencies pulled down) swaps
+  // in for the original once it lands. The processed file is the
+  // full song at the identical duration, so the cut is unchanged;
+  // the request key below carries the URI, so the preview rebuilds
+  // on the EQ'd song when it arrives. Until then — and whenever the
+  // project has Auto EQ off — the original plays.
+  const eqSongUri = useEqSongUri(edl?.audio.uri, studio.autoEqEnabled);
+
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
     try {
       return edlToCompositeRequest(edlWithTakeCanvas(edl, takes), takeUriById, {
         look: resolvedLook,
         normalizeVolume: studio.autoVolume,
+        audioUri: eqSongUri,
       });
     } catch {
       return null;
     }
-  }, [edl, takeUriById, takes, resolvedLook, studio.autoVolume]);
+  }, [edl, takeUriById, takes, resolvedLook, studio.autoVolume, eqSongUri]);
   const previewKey = previewRequest ? `${JSON.stringify(previewRequest)}#${previewNonce}` : '';
 
   const handleProgress = useCallback((pos: number, playing: boolean) => {

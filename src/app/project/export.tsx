@@ -33,6 +33,7 @@ import {
   formatFileSize,
   TIER_DEFAULT_VIDEO_BITRATE_BPS,
 } from '../../lib/exportSize';
+import { useEqSongUri } from '../../lib/autoEq';
 import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { saveToPhotoLibrary, shareFile } from '../../lib/media';
@@ -103,6 +104,8 @@ export default function ExportScreen() {
     setExportTargetSizeMB,
     autoVolume,
     setAutoVolume,
+    autoEqEnabled,
+    setAutoEqEnabled,
     watermarkEnabled,
   } = studio;
 
@@ -118,6 +121,13 @@ export default function ExportScreen() {
   // engine applies (null = no grade). Shared with the Editor through
   // the store's effective look, so both screens grade identically.
   const resolvedLook = useMemo(() => resolveLookParams(studio.look), [studio.look]);
+
+  // Auto EQ: the song URI the ONE request below should carry — the
+  // engine's EQ-rendered copy (harsh frequencies pulled down) once
+  // prepared, the original until then and whenever the project has
+  // it off. Same swap the Editor preview makes, off the same store
+  // flag, so preview and export never drift.
+  const eqSongUri = useEqSongUri(edl?.audio.uri, autoEqEnabled);
 
   const engineAvailable = isCompositorAvailable();
   const noTakes = takes.length === 0;
@@ -221,6 +231,10 @@ export default function ExportScreen() {
         // inside the composition, so the preview plays at the level
         // the file will ship at.
         normalizeVolume: autoVolume,
+        // Auto EQ likewise: the processed song FILE rides the same
+        // shared request (it is the full song at the same duration,
+        // so nothing else about the request changes).
+        audioUri: eqSongUri,
       });
       // 'high' (null) renders at the cut's canvas — which follows the
       // takes, so 4K takes export at 4K; the other tiers are explicit
@@ -267,6 +281,7 @@ export default function ExportScreen() {
     lyricsPayload,
     resolvedLook,
     autoVolume,
+    eqSongUri,
     controlledBitrate,
     exportTargetSizeMB,
   ]);
@@ -660,6 +675,24 @@ export default function ExportScreen() {
                         trackColor={{ true: colors.accent, false: colors.elevated }}
                         thumbColor={autoVolume ? colors.onAccent : colors.label}
                         accessibilityLabel="Auto volume"
+                      />
+                    </View>
+                  </View>
+                  <View style={styles.optionBlock}>
+                    <View style={styles.switchRow}>
+                      <View style={styles.switchText}>
+                        <Text style={styles.optionLabel}>Auto EQ</Text>
+                        <Text style={styles.blockHint}>
+                          Tames harsh frequencies — the song is listened to and the shrill
+                          bands are pulled down. Cuts only, never boosts.
+                        </Text>
+                      </View>
+                      <Switch
+                        value={autoEqEnabled}
+                        onValueChange={setAutoEqEnabled}
+                        trackColor={{ true: colors.accent, false: colors.elevated }}
+                        thumbColor={autoEqEnabled ? colors.onAccent : colors.label}
+                        accessibilityLabel="Auto EQ"
                       />
                     </View>
                   </View>

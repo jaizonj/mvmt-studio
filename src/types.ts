@@ -355,6 +355,18 @@ export interface Project {
    * track changes.
    */
   look?: ProjectLook;
+  /**
+   * Auto EQ: the engine analyzes this project's song and renders a
+   * copy with the harsh frequencies pulled down (cuts only), which
+   * composition builds — editor/export preview AND the export
+   * render — then use in place of the original file
+   * (src/lib/autoEq.ts). Undefined = ON: projects persisted before
+   * the flag existed behave as enabled, and the store exposes the
+   * effective value (`autoEqEnabled` in StudioContext). Recording,
+   * record-time playback and sync measurement always use the
+   * original song regardless of this flag.
+   */
+  autoEqEnabled?: boolean;
   /** When the project's video was last successfully rendered (Export stamps it). */
   exportedAt?: number;
 }

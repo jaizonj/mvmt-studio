@@ -19,6 +19,7 @@ export {
   isCaptureAvailable,
   isCompositorAvailable,
   measureTakeSync,
+  prepareEqSong,
   prepareSong,
   setCaptureExposureLock,
   setCaptureQuality,

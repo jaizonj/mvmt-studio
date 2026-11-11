@@ -411,6 +411,7 @@ interface NativeMvmtCompositorModule {
     searchWindowSeconds: number,
   ): Promise<TakeSyncMeasurement>;
   waveformPeaks(uri: string, buckets: number): Promise<WaveformPeaks | null>;
+  prepareEqSong(uri: string): Promise<string>;
   isCaptureAvailable(): boolean;
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
@@ -540,6 +541,32 @@ export async function waveformPeaks(uri: string, buckets: number): Promise<Wavef
     return result;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Auto EQ: asks the engine to analyze the song and, when its harsh
+ * bands (2–8 kHz) measure hot against the song's own average band
+ * level, render a copy with those bands pulled down (cuts only,
+ * never boosts). Resolves to the URI composition builds should use:
+ * the processed copy (full song, exact same duration, cached on
+ * disk across launches) or — for a balanced song, an unreadable
+ * file, Expo Go, or any failure — the ORIGINAL uri. Never rejects:
+ * EQ must never block a preview or an export.
+ *
+ * Only composition builds consume the result. The recording path
+ * (capture, record-time playback, sync measurement) always keeps
+ * the original file.
+ *
+ * @param uri The original song file (`file://` URI or absolute path).
+ */
+export async function prepareEqSong(uri: string): Promise<string> {
+  if (!nativeModule || typeof nativeModule.prepareEqSong !== 'function') return uri;
+  try {
+    const result = await nativeModule.prepareEqSong(uri);
+    return typeof result === 'string' && result.length > 0 ? result : uri;
+  } catch {
+    return uri;
   }
 }
 

@@ -782,6 +782,61 @@ private final class LoudnessCache {
   }
 }
 
+/// Session-scoped Auto EQ render cache: source key (path + size +
+/// mtime + settings version) → the URI compositions should use (the
+/// rendered copy, or the original when the song needed no cut).
+/// Renders themselves are cached on disk (see eqCacheFileURL), so
+/// this only spares the file stat + existence check on rebuilds.
+private final class EqRenderCache {
+  static let shared = EqRenderCache()
+  private let lock = NSLock()
+  private var values: [String: String] = [:]
+
+  func get(_ key: String) -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return values[key]
+  }
+
+  func set(_ key: String, _ value: String) {
+    lock.lock()
+    values[key] = value
+    lock.unlock()
+  }
+}
+
+/// RBJ bandpass biquad (constant 0 dB peak gain) for one channel —
+/// the analysis filterbank for Auto EQ. Q = 1 keeps each band
+/// roughly an octave wide, matching the octave-ish centre spacing,
+/// so neighbouring bands overlap gently instead of tiling.
+private final class BandpassFilter {
+  private let b0: Double
+  private let b2: Double
+  private let a1: Double
+  private let a2: Double
+  private var x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0
+
+  init(centerHz: Double, sampleRate: Double) {
+    let q = 1.0
+    let w0 = 2.0 * Double.pi * centerHz / sampleRate
+    let alpha = sin(w0) / (2.0 * q)
+    let a0 = 1.0 + alpha
+    b0 = alpha / a0
+    b2 = -alpha / a0
+    a1 = -2.0 * cos(w0) / a0
+    a2 = (1.0 - alpha) / a0
+  }
+
+  func process(_ x: Double) -> Double {
+    let y = b0 * x + b2 * x2 - a1 * y1 - a2 * y2
+    x2 = x1
+    x1 = x
+    y2 = y1
+    y1 = y
+    return y
+  }
+}
+
 /// K-weighting for one channel: the two BS.1770 biquad stages
 /// (high-shelf pre-filter, then the RLB high-pass) with the standard
 /// 48 kHz coefficients. Applied at the asset's native rate — at
@@ -2228,6 +2283,365 @@ private enum MvmtCompositorEngine {
       lufs: integrated.isFinite ? integrated : -120,
       peakDbfs: peak > 0 ? 20.0 * log10(peak) : -120
     )
+  }
+
+  // MARK: Auto EQ (harshness taming)
+
+  /// Recipe version for the analysis + render below. Bumped whenever
+  /// the band layout, gain logic or render chain changes, so a cached
+  /// render from an older recipe is never reused (it is part of the
+  /// cache key).
+  private static let eqSettingsVersion = 1
+
+  /// Band centres (Hz): octave-ish spacing with extra resolution
+  /// through the harshness region (2–8 kHz), where the ear is most
+  /// sensitive and where harsh masters pile up energy.
+  private static let eqBandCentersHz: [Double] = [
+    125, 250, 500, 1_000, 2_000, 3_000, 4_000, 6_000, 8_000, 12_000,
+  ]
+
+  /// Indices into eqBandCentersHz that count as harsh (2–8 kHz).
+  private static let eqHarshBandIndices: Set<Int> = [4, 5, 6, 7, 8]
+
+  /// A harsh band must sit at least this far above the song's
+  /// average band level before any cut is taken — below that the
+  /// band is just part of the song's tone, not harshness.
+  private static let eqExcessThresholdDb = 2.0
+
+  /// The deepest cut Auto EQ will ever take.
+  private static let eqMaxCutDb = 6.0
+
+  /// At or below this broadband level the file counts as silence:
+  /// no cuts (never process noise into a "tone").
+  private static let eqSilenceDbfs = -60.0
+
+  /// Auto EQ entry point (bridge: `prepareEqSong`). Returns the URI
+  /// composition builds should use for this song: a cached,
+  /// EQ-rendered copy when the song measures harsh, or the ORIGINAL
+  /// uri when it doesn't — and the original on ANY failure. Never
+  /// throws, so a preview or export can never be blocked on EQ.
+  /// Only composition builds consume the result; capture, record-time
+  /// playback and the sync measurement always use the original file.
+  static func prepareEqSong(_ uri: String) async -> String {
+    let sourceURL = resolveURL(uri)
+    guard sourceURL.isFileURL else { return uri }
+    let attrs = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
+    let fileSize = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+    let fileMtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+    guard fileSize > 0 else { return uri }
+    let cacheKey =
+      "\(sourceURL.path)|\(fileSize)|\(fileMtime)|eqv\(eqSettingsVersion)"
+    if let cached = EqRenderCache.shared.get(cacheKey) {
+      return cached
+    }
+    guard let outputURL = eqCacheFileURL(cacheKey: cacheKey) else { return uri }
+    if FileManager.default.fileExists(atPath: outputURL.path) {
+      EqRenderCache.shared.set(cacheKey, outputURL.absoluteString)
+      return outputURL.absoluteString
+    }
+    guard let gainsDb = await analyzeEqGains(asset: AVURLAsset(url: sourceURL)) else {
+      return uri
+    }
+    // Nothing worth cutting: the original IS the answer (and what
+    // the session remembers, so the song isn't re-analyzed on every
+    // preview rebuild).
+    if gainsDb.allSatisfy({ $0 == 0 }) {
+      EqRenderCache.shared.set(cacheKey, uri)
+      return uri
+    }
+    guard renderEqSong(sourceURL: sourceURL, gainsDb: gainsDb, outputURL: outputURL) else {
+      return uri
+    }
+    EqRenderCache.shared.set(cacheKey, outputURL.absoluteString)
+    return outputURL.absoluteString
+  }
+
+  /// The on-disk home of one rendered song: Application Support,
+  /// keyed by an FNV-1a hash of the cache key (stable across
+  /// launches; no crypto import needed for a cache filename).
+  private static func eqCacheFileURL(cacheKey: String) -> URL? {
+    guard
+      let support = try? FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true
+      )
+    else { return nil }
+    let directory = support.appendingPathComponent("MVMTStudio/eq", isDirectory: true)
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in cacheKey.utf8 {
+      hash ^= UInt64(byte)
+      hash = hash &* 0x0000_0100_0000_01b3
+    }
+    return directory.appendingPathComponent(String(format: "eq-%016llx.wav", hash))
+  }
+
+  /// Measures the FULL song's per-band levels and turns them into
+  /// per-band gains in dB (cuts only, 0 … −6 dB). Nil when the file
+  /// can't be decoded — the caller keeps the original song.
+  ///
+  /// The logic: stream-decode once, run every channel (first two)
+  /// through the bandpass bank, and take each band's RMS level.
+  /// Harshness is RELATIVE: a harsh band's excess over the song's
+  /// average band level (the mean of all band levels) beyond a
+  /// gentle 2 dB threshold becomes its cut, clamped to 6 dB. Each
+  /// cut then shoulders half-strength onto its immediate neighbour
+  /// bands so the correction is smooth rather than notchy. A quiet
+  /// or spectrally balanced song measures no excess and gets all
+  /// zeros — no render, no change.
+  private static func analyzeEqGains(asset: AVURLAsset) async -> [Double]? {
+    let bandCount = eqBandCentersHz.count
+    let zeroGains = [Double](repeating: 0, count: bandCount)
+    guard let track = (try? await asset.loadTracks(withMediaType: .audio))?.first else {
+      return nil
+    }
+    var sampleRate = 48_000.0
+    var streamChannels = 2
+    if let descriptions = try? await track.load(.formatDescriptions),
+      let first = descriptions.first,
+      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(first)
+    {
+      if asbd.pointee.mSampleRate > 0 { sampleRate = asbd.pointee.mSampleRate }
+      if asbd.pointee.mChannelsPerFrame > 0 { streamChannels = Int(asbd.pointee.mChannelsPerFrame) }
+    }
+    let measuredChannels = max(1, min(2, streamChannels))
+    // Bands too close to Nyquist can't be designed or measured at
+    // this sample rate; they report no energy and take no cut.
+    let measurable = eqBandCentersHz.map { $0 < sampleRate * 0.45 }
+
+    var reader: AVAssetReader?
+    var output: AVAssetReaderTrackOutput?
+    let setupException = avTry {
+      do {
+        let createdReader = try AVAssetReader(asset: asset)
+        let outputSettings: [String: Any] = [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVLinearPCMBitDepthKey: 32,
+          AVLinearPCMIsFloatKey: true,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsNonInterleaved: false,
+        ]
+        let createdOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+        createdOutput.alwaysCopiesSampleData = false
+        if createdReader.canAdd(createdOutput) {
+          createdReader.add(createdOutput)
+          reader = createdReader
+          output = createdOutput
+        }
+      } catch {
+        // Unreadable — the guards below read nil as "unmeasurable".
+      }
+    }
+    guard setupException == nil, let reader, let output, reader.startReading() else {
+      return nil
+    }
+
+    let filters: [[BandpassFilter]] = (0..<measuredChannels).map { _ in
+      eqBandCentersHz.map { BandpassFilter(centerHz: $0, sampleRate: sampleRate) }
+    }
+    var bandSums = [[Double]](
+      repeating: [Double](repeating: 0, count: bandCount),
+      count: measuredChannels
+    )
+    var rawSums = [Double](repeating: 0, count: measuredChannels)
+    var frameCount = 0
+
+    while let sampleBuffer = output.copyNextSampleBuffer() {
+      guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+      let byteLength = CMBlockBufferGetDataLength(blockBuffer)
+      let floatCount = byteLength / 4
+      guard floatCount >= streamChannels else { continue }
+      var floats = [Float](repeating: 0, count: floatCount)
+      let copyStatus = floats.withUnsafeMutableBytes { pointer -> OSStatus in
+        guard let baseAddress = pointer.baseAddress else { return OSStatus(-1) }
+        return CMBlockBufferCopyDataBytes(
+          blockBuffer,
+          atOffset: 0,
+          dataLength: floatCount * 4,
+          destination: baseAddress
+        )
+      }
+      guard copyStatus == noErr else { return nil }
+      let frames = floatCount / streamChannels
+      for frame in 0..<frames {
+        let base = frame * streamChannels
+        for channel in 0..<measuredChannels {
+          let sample = Double(floats[base + channel])
+          rawSums[channel] += sample * sample
+          for band in 0..<bandCount where measurable[band] {
+            let filtered = filters[channel][band].process(sample)
+            bandSums[channel][band] += filtered * filtered
+          }
+        }
+      }
+      frameCount += frames
+    }
+    if reader.status == .failed {
+      return nil
+    }
+    guard frameCount > 0 else { return nil }
+
+    // Broadband level: silence (or digital black) takes no cuts.
+    let broadbandEnergy =
+      rawSums.reduce(0, +) / Double(measuredChannels) / Double(frameCount)
+    guard broadbandEnergy > 0 else { return zeroGains }
+    let broadbandDb = 10.0 * log10(broadbandEnergy)
+    guard broadbandDb >= eqSilenceDbfs else { return zeroGains }
+
+    // Per-band levels (channels averaged in the energy domain).
+    // Levels are floored at −80 dB before averaging into the
+    // reference so a band with essentially no content (e.g. 12 kHz
+    // in a lo-fi recording) can't drag the reference down and make
+    // every other band look "excessive".
+    var bandLevels = [Double](repeating: -120, count: bandCount)
+    for band in 0..<bandCount where measurable[band] {
+      var energy = 0.0
+      for channel in 0..<measuredChannels {
+        energy += bandSums[channel][band]
+      }
+      energy /= Double(measuredChannels) * Double(frameCount)
+      if energy > 0 {
+        bandLevels[band] = 10.0 * log10(energy)
+      }
+    }
+    let flooredLevels = bandLevels.map { max($0, -80) }
+    let referenceDb = flooredLevels.reduce(0, +) / Double(bandCount)
+
+    // Raw cuts: harsh bands only, excess over the threshold.
+    var rawCuts = [Double](repeating: 0, count: bandCount)
+    for band in eqHarshBandIndices where measurable[band] {
+      let excess = bandLevels[band] - referenceDb - eqExcessThresholdDb
+      rawCuts[band] = min(eqMaxCutDb, max(0, excess))
+    }
+    // Smooth: every band also takes half of its strongest
+    // neighbour's raw cut, so the correction shoulders gently into
+    // the bands beside the harsh region (1 kHz and 12 kHz included)
+    // instead of stepping at the region's edges.
+    var gainsDb = [Double](repeating: 0, count: bandCount)
+    for band in 0..<bandCount {
+      var cut = rawCuts[band]
+      if band > 0 { cut = max(cut, rawCuts[band - 1] / 2) }
+      if band < bandCount - 1 { cut = max(cut, rawCuts[band + 1] / 2) }
+      gainsDb[band] = -min(eqMaxCutDb, cut)
+    }
+    return gainsDb
+  }
+
+  /// Renders the full song through an AVAudioUnitEQ in AVAudioEngine
+  /// offline (manual-rendering) mode into `outputURL`, preserving
+  /// the source's EXACT frame count. The output is LPCM WAV — no
+  /// encoder delay or priming samples — so the processed song lines
+  /// up sample-for-sample with the original: region starts, cut
+  /// timing and sync are untouched. Renders to a temp file and moves
+  /// it into place only when complete, so a partial render is never
+  /// served from the cache. False on any failure; the caller falls
+  /// back to the original song.
+  private static func renderEqSong(
+    sourceURL: URL,
+    gainsDb: [Double],
+    outputURL: URL
+  ) -> Bool {
+    let tempURL = outputURL.deletingPathExtension()
+      .appendingPathExtension("tmp-\(UUID().uuidString).wav")
+    defer { try? FileManager.default.removeItem(at: tempURL) }
+    do {
+      let sourceFile = try AVAudioFile(forReading: sourceURL)
+      let format = sourceFile.processingFormat
+      let totalFrames = sourceFile.length
+      guard totalFrames > 0, format.sampleRate > 0, format.channelCount > 0 else {
+        return false
+      }
+
+      let engine = AVAudioEngine()
+      let player = AVAudioPlayerNode()
+      let eq = AVAudioUnitEQ(numberOfBands: eqBandCentersHz.count)
+      engine.attach(player)
+      engine.attach(eq)
+      engine.connect(player, to: eq, format: format)
+      engine.connect(eq, to: engine.mainMixerNode, format: format)
+      for (index, band) in eq.bands.enumerated() {
+        band.filterType = .parametric
+        // Clamp under Nyquist for very low sample rates; the
+        // analysis already measured nothing up there in that case.
+        band.frequency = Float(min(eqBandCentersHz[index], format.sampleRate * 0.45))
+        band.bandwidth = 1.0  // octaves — matches the analysis width
+        band.gain = Float(gainsDb[index])
+        band.bypass = gainsDb[index] == 0
+      }
+      eq.globalGain = 0  // cuts only — no makeup boost, ever
+
+      let outputSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: format.sampleRate,
+        AVNumberOfChannelsKey: format.channelCount,
+        AVLinearPCMBitDepthKey: 32,
+        AVLinearPCMIsFloatKey: true,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: !format.isInterleaved,
+      ]
+      let outputFile = try AVAudioFile(
+        forWriting: tempURL,
+        settings: outputSettings,
+        commonFormat: format.commonFormat,
+        interleaved: format.isInterleaved
+      )
+
+      try engine.enableManualRenderingMode(
+        .offline,
+        format: format,
+        maximumFrameCount: 4096
+      )
+      player.scheduleFile(sourceFile, at: nil)
+      try engine.start()
+      player.play()
+
+      guard
+        let buffer = AVAudioPCMBuffer(
+          pcmFormat: engine.manualRenderingFormat,
+          frameCapacity: 4096
+        )
+      else {
+        engine.stop()
+        return false
+      }
+      var written: AVAudioFramePosition = 0
+      var stalledRenders = 0
+      while written < totalFrames {
+        let framesToRender = AVAudioFrameCount(
+          min(4096, AVAudioFramePosition(totalFrames - written))
+        )
+        let status = try engine.renderOffline(framesToRender, to: buffer)
+        switch status {
+        case .success, .insufficientDataFromInputNode:
+          if buffer.frameLength > 0 {
+            try outputFile.write(from: buffer)
+            written += AVAudioFramePosition(buffer.frameLength)
+            stalledRenders = 0
+          } else {
+            stalledRenders += 1
+            if stalledRenders > 8 { engine.stop(); return false }
+          }
+        case .cannotDoInCurrentContext:
+          // Transient by contract, but never spin forever on it.
+          stalledRenders += 1
+          if stalledRenders > 64 { engine.stop(); return false }
+        case .error:
+          engine.stop()
+          return false
+        @unknown default:
+          engine.stop()
+          return false
+        }
+      }
+      engine.stop()
+      guard written == totalFrames else { return false }
+      try FileManager.default.moveItem(at: tempURL, to: outputURL)
+      return true
+    } catch {
+      return false
+    }
   }
 
   // MARK: Look (CI grade on the composed frames)
@@ -6191,6 +6605,10 @@ public class MvmtCompositorModule: Module {
 
     AsyncFunction("waveformPeaks") { (uri: String, buckets: Int) -> WaveformPeaksRecord? in
       await MvmtCompositorEngine.waveformPeaks(uri: uri, buckets: buckets)
+    }
+
+    AsyncFunction("prepareEqSong") { (uri: String) -> String in
+      await MvmtCompositorEngine.prepareEqSong(uri)
     }
 
     Function("isCaptureAvailable") { () -> Bool in

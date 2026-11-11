@@ -266,6 +266,16 @@ export function edlToCompositeRequest(
      * look it rides preview AND export — what you hear is what ships.
      */
     normalizeVolume?: boolean;
+    /**
+     * Override for the master song URI (composition builds only).
+     * Auto EQ passes the EQ-rendered copy of the song here once it
+     * has been prepared (src/lib/autoEq.ts); the EDL itself always
+     * keeps the original URI, so recording, record-time playback and
+     * sync measurement are never affected. The processed file is the
+     * full song at the identical duration, so every region/start
+     * semantic of the request is unchanged.
+     */
+    audioUri?: string | null;
   } = {},
 ): CompositeRequest {
   const clips = edl.segments.map((segment) => {
@@ -281,7 +291,7 @@ export function edlToCompositeRequest(
   });
   return {
     clips,
-    audioUri: edl.audio.uri,
+    audioUri: options.audioUri ?? edl.audio.uri,
     audioStartSeconds: framesToSeconds(edl.audio.regionStartFrame, edl.fps),
     audioVolume: edl.audio.volume,
     canvasWidth: edl.canvas.width,

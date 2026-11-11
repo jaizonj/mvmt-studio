@@ -1,6 +1,7 @@
 import type { CameraType, VideoQuality } from 'expo-camera';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
+import { warmUpEqSong } from '../lib/autoEq';
 import type { Edl } from '../lib/edl';
 import { effectiveLook } from '../lib/looks';
 import { cleanDetectedLyrics, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
@@ -150,6 +151,14 @@ interface StudioState {
    *  win; projects saved before the flag existed read as ON. */
   watermarkEnabled: boolean;
   setWatermarkEnabled: (enabled: boolean) => void;
+
+  /** Effective Auto EQ flag for the active project — stored values
+   *  win; projects saved before the flag existed read as ON. When
+   *  on, composition builds use the EQ-rendered copy of the song
+   *  (harsh frequencies pulled down) once the engine has prepared
+   *  it; recording always uses the original. */
+  autoEqEnabled: boolean;
+  setAutoEqEnabled: (enabled: boolean) => void;
 
   /** The active project's lyrics (song-frame timed lines + style). */
   lyrics: ProjectLyrics | null;
@@ -418,6 +427,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         lyricsEnabled: undefined,
       });
       setTrackSections([]);
+      // Auto EQ warm-up: start analyzing/rendering the new song in
+      // the background so the processed copy is ready when the
+      // editor/export screens build their compositions. Fire and
+      // forget — if it never lands, compositions use the original.
+      warmUpEqSong(next?.uri);
       },
     [patchActiveProject],
   );
@@ -457,6 +471,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const setWatermarkEnabled = useCallback(
     (enabled: boolean) => patchActiveProject({ watermarkEnabled: enabled }),
+    [patchActiveProject],
+  );
+
+  // Auto EQ, same shape as the watermark flag: the persisted field
+  // is optional and the effective value defaults to ON.
+  const autoEqEnabled = activeProject?.autoEqEnabled ?? true;
+
+  const setAutoEqEnabled = useCallback(
+    (enabled: boolean) => patchActiveProject({ autoEqEnabled: enabled }),
     [patchActiveProject],
   );
 
@@ -717,6 +740,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setShuffleFrequency,
       watermarkEnabled,
       setWatermarkEnabled,
+      autoEqEnabled,
+      setAutoEqEnabled,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,
@@ -799,6 +824,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setShuffleFrequency,
       watermarkEnabled,
       setWatermarkEnabled,
+      autoEqEnabled,
+      setAutoEqEnabled,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,
