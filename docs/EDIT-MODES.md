@@ -1,10 +1,13 @@
 # Edit Modes & Clip Speed
 
 Authorised by Jaizon, 2026-11-12. Programme doc — the working plan.
-This is the replacement for what Auto Edit was FOR (making a cut feel
-edited) without being Auto Edit: everything here is an explicit,
-user-applied action in Edit mode, with undo. Nothing auto-generates
-a cut on open, and nothing re-runs by itself.
+Auto Edit (Shuffle) STAYS, completely — Jaizon reversed its removal
+the same day (revert commit 63f532f). These modes sit ALONGSIDE it:
+the auto-shuffle still generates a cut on open when the user wants
+it, and the modes below are extra tools — per-clip speed and
+one-tap rhythm/arrange patterns the user applies in Edit mode, with
+undo. No mode runs automatically; only the auto-shuffle does, as
+before.
 
 ## 1. What exists today (audit, 2026-11-12)
 
@@ -70,12 +73,13 @@ the native preview.
    (v1, opacity animation on the composition — cheap and safe);
    true cross-dissolve (v2, needs overlapping video tracks in the
    composition — feasibility check in Stage 3).
-7. **Arrange modes** ("shuffle modes", Jaizon's words — but
-   on-demand, never automatic): **Alternate** (cycle takes
-   A-B-A-B across the timeline), **Randomize order** (shuffle the
-   segment order once, keeping each segment's length),
-   **Reverse** (play the segment order backwards). These replace
-   the old auto-shuffle's job with explicit, one-tap actions.
+7. **Arrange modes** ("shuffle modes", Jaizon's words — one-tap
+   actions in Edit mode): **Alternate** (cycle takes A-B-A-B
+   across the timeline), **Randomize order** (shuffle the segment
+   order once, keeping each segment's length), **Reverse** (play
+   the segment order backwards). These complement the auto-shuffle
+   — the auto-shuffle builds a cut from the takes, these re-shape
+   a cut that already exists.
 
 ## 4. Interface
 
@@ -102,5 +106,6 @@ the native preview.
   with the song still in sync (song is 1x, video speed is
   independent).
 - Modes are one-tap, visible in the preview immediately, and
-  undoable. No mode runs automatically.
+  undoable. No mode runs automatically — the auto-shuffle is the
+  only automatic cut, and it stays exactly as it was.
 - No regression to recording, sync, lyrics, looks, or export.
