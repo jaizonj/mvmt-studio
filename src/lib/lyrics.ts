@@ -498,6 +498,7 @@ export function resolveLyricStyle(style: LyricStyle): ResolvedLyricStyle {
     backgroundColor: style.backgroundColor,
     position: style.position,
     verticalOffsetRatio: style.verticalOffsetRatio ?? 0,
+    maxWidthRatio: style.maxWidthRatio ?? 0.88,
     bold: style.bold,
     animation: resolveAnimationParams(style.animationId),
   };

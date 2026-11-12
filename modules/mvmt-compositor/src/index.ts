@@ -84,6 +84,9 @@ export interface ResolvedLyricStyle {
   /** Fine vertical nudge, fraction of the canvas height,
    * positive = up. Always emitted (0 when unset). */
   verticalOffsetRatio: number;
+  /** Maximum line width, fraction of the canvas width.
+   * Always emitted (0.88 when unset). */
+  maxWidthRatio: number;
   bold: boolean;
   animation: LyricAnimationParams;
 }

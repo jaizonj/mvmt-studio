@@ -270,6 +270,12 @@ export interface LyricStyle {
    * Jaizon, 2026-11-11: move all the words up or down slightly
    * while keeping the Top/Center/Bottom choice. Undefined = 0. */
   verticalOffsetRatio?: number;
+  /** Maximum line width as a fraction of the canvas WIDTH.
+   * Lines wider than this WRAP onto more rows instead of
+   * running off the frame's edges (Jaizon, 2026-11-12: lyrics
+   * were cutting off the screen in TikTok/Instagram posts).
+   * Undefined = 0.88. */
+  maxWidthRatio?: number;
   /** Animation preset id (src/lib/lyricAnimations.ts). */
   animationId: string;
   bold: boolean;

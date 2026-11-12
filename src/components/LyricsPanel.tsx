@@ -124,6 +124,7 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [sizeDraft, setSizeDraft] = useState<number | null>(null);
+  const [widthDraft, setWidthDraft] = useState<number | null>(null);
   const [offsetDraft, setOffsetDraft] = useState<number | null>(null);
   const [strokeDraft, setStrokeDraft] = useState<number | null>(null);
   const [nudgeDraft, setNudgeDraft] = useState<number | null>(null);
@@ -555,6 +556,35 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                       thumbTintColor={colors.label}
                       accessibilityLabel="Lyric size"
                     />
+
+                    {/* Width — how wide a line may run before it
+                        wraps onto the next row (Jaizon, 2026-11-12:
+                        long lines were running off the frame in
+                        TikTok/Instagram posts). */}
+                    <View style={styles.sliderLabelRow}>
+                      <Text style={styles.sliderLabel}>Width</Text>
+                      <Text style={styles.sliderValue}>
+                        {Math.round((widthDraft ?? style.maxWidthRatio ?? 0.88) * 100)}%
+                      </Text>
+                    </View>
+                    <Slider
+                      value={widthDraft ?? style.maxWidthRatio ?? 0.88}
+                      minimumValue={0.5}
+                      maximumValue={0.9}
+                      step={0.01}
+                      onValueChange={(v) => {
+                        setWidthDraft(v);
+                        studio.setLyricStyle({ maxWidthRatio: v });
+                      }}
+                      onSlidingComplete={() => setWidthDraft(null)}
+                      minimumTrackTintColor={colors.accent}
+                      maximumTrackTintColor={colors.elevated}
+                      thumbTintColor={colors.label}
+                      accessibilityLabel="Lyric line width"
+                    />
+                    <Text style={styles.caption}>
+                      Narrower lines wrap sooner — nothing runs off the edges.
+                    </Text>
 
                     <Text style={styles.sliderLabel}>Colour</Text>
                     <SwatchRow

@@ -257,7 +257,10 @@ export function LyricsOverlay({
         },
       ]}>
       <View
-        style={[styles.lineBox, pillStyle]}
+        // Width cap (Jaizon, 2026-11-12): the line box never
+        // exceeds maxWidthRatio of the stage — the word row wraps
+        // inside it, mirroring the native burn-in's wrap.
+        style={[styles.lineBox, pillStyle, { maxWidth: width * (style.maxWidthRatio ?? 0.88) }]}
         onLayout={(e) => {
           const { width: w, height: h } = e.nativeEvent.layout;
           if (Math.abs(w - lineSize.w) > 1 || Math.abs(h - lineSize.h) > 1) setLineSize({ w, h });

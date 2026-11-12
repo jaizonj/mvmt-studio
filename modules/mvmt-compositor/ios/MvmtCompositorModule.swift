@@ -491,6 +491,11 @@ struct LyricStyleRecord: Record {
   @Field
   var verticalOffsetRatio: Double? = nil
 
+  /// Maximum line width as a fraction of the canvas width.
+  /// Lines wider than this wrap onto more rows.
+  @Field
+  var maxWidthRatio: Double? = nil
+
   @Field
   var bold: Bool = false
 
@@ -1845,13 +1850,22 @@ private enum MvmtCompositorEngine {
       ? animation.wordMode
       : "none"
 
-    // Font, shrunk to fit 92% of the canvas width.
-    let maxTextWidth = renderSize.width * 0.92
+    // Line width (Jaizon, 2026-11-12): a line never runs past
+    // this fraction of the canvas width — it wraps onto more
+    // rows instead of clipping at the frame's edges (the old
+    // shrink-to-fit also ignored the per-word image pads, so
+    // long lines still overflowed). The font stays at the
+    // style's sizeRatio; wrapping is what keeps a long line
+    // readable at the chosen size.
+    let maxTextWidth = renderSize.width
+      * CGFloat(lyricClamp(lyricFinite(style.maxWidthRatio ?? 0.88, 0.88), 0.3, 1.0))
     var font = lyricFont(postScriptName: style.fontPostScriptName, size: baseFontSize, bold: style.bold)
     let initialMeasure: [NSAttributedString.Key: Any] = [.font: font]
     let measured = NSAttributedString(string: text, attributes: initialMeasure).size()
     guard measured.width > 0, measured.height > 0 else { return nil }
-    if measured.width > maxTextWidth {
+    // One unbreakable word wider than the limit is shrunk to
+    // fit; a multi-word line wraps instead (below).
+    if measured.width > maxTextWidth, text.split(separator: " ").count <= 1 {
       let scaledSize = baseFontSize * (maxTextWidth / measured.width)
       font = lyricFont(postScriptName: style.fontPostScriptName, size: scaledSize, bold: style.bold)
     }
@@ -1882,6 +1896,23 @@ private enum MvmtCompositorEngine {
         }
       }
     }
+    // A line with no word timings that is wider than the limit
+    // is tokenised so the word path below can wrap it; its words
+    // enter as a group (the inner layer's enter still applies —
+    // see the applyEnter condition below).
+    if words.isEmpty, measured.width > maxTextWidth {
+      let tokens = text.split(separator: " ").map(String.init)
+      if tokens.count > 1 {
+        let slot = lineDuration / Double(tokens.count)
+        words = tokens.enumerated().map { index, token in
+          (
+            text: token,
+            start: start + slot * Double(index),
+            end: start + slot * Double(index + 1)
+          )
+        }
+      }
+    }
     let useWords = !words.isEmpty
 
     // Image padding around the measured text (room for the
@@ -1904,13 +1935,16 @@ private enum MvmtCompositorEngine {
     var contentSize = CGSize.zero
     var singleLayer: CALayer?
     var wordEntries: [(
-      layer: CALayer, highlight: CALayer?, centerX: CGFloat, wordStart: Double, index: Int
+      layer: CALayer, highlight: CALayer?, centerX: CGFloat, centerY: CGFloat, row: Int, wordStart: Double, index: Int
     )] = []
+    var rowWidths: [CGFloat] = []
 
     if useWords {
       let spaceWidth = NSAttributedString(string: " ", attributes: measureAttributes).size().width
       var cursorX: CGFloat = 0
-      var maxHeight: CGFloat = 0
+      var rowY: CGFloat = 0
+      var rowHeight: CGFloat = 0
+      var rowIndex = 0
       for (index, word) in words.enumerated() {
         let isKaraoke = wordMode == "karaoke"
         // Karaoke colour-swap: unsung words render in the style
@@ -1958,18 +1992,34 @@ private enum MvmtCompositorEngine {
           highlightLayer = layer
         }
 
+        // Wrap: a word that would run past the limit starts a
+        // new row (unless the row is empty — one wide word).
+        let wordWidth = rendered.displaySize.width
+        if cursorX > 0, cursorX + wordWidth > maxTextWidth {
+          rowWidths.append(cursorX - spaceWidth)
+          rowY += rowHeight
+          rowIndex += 1
+          cursorX = 0
+          rowHeight = 0
+        }
         wordEntries.append((
           layer: wordLayer,
           highlight: highlightLayer,
-          centerX: cursorX + rendered.displaySize.width / 2,
+          centerX: cursorX + wordWidth / 2,
+          centerY: rowY + rendered.displaySize.height / 2,
+          row: rowIndex,
           wordStart: word.start,
           index: index
         ))
-        cursorX += rendered.displaySize.width + spaceWidth
-        maxHeight = max(maxHeight, rendered.displaySize.height)
+        cursorX += wordWidth + spaceWidth
+        rowHeight = max(rowHeight, rendered.displaySize.height)
       }
       guard !wordEntries.isEmpty else { return nil }
-      contentSize = CGSize(width: cursorX - spaceWidth, height: maxHeight)
+      rowWidths.append(cursorX - spaceWidth)
+      contentSize = CGSize(
+        width: rowWidths.max() ?? 0,
+        height: rowY + rowHeight
+      )
     } else {
       guard
         let rendered = lyricTextImage(
@@ -2053,11 +2103,14 @@ private enum MvmtCompositorEngine {
       singleLayer.position = contentCentre
       innerLayer.addSublayer(singleLayer)
     }
-    let contentOriginX = (containerSize.width - contentSize.width) / 2
     for entry in wordEntries {
+      // Each row is centred within the content width; centerY is
+      // measured from the content's top (layer space is y-up, so
+      // it flips here).
+      let rowOriginX = (containerSize.width - rowWidths[entry.row]) / 2
       let position = CGPoint(
-        x: contentOriginX + entry.centerX,
-        y: contentCentre.y
+        x: rowOriginX + entry.centerX,
+        y: contentCentre.y + (contentSize.height / 2 - entry.centerY)
       )
       entry.layer.position = position
       innerLayer.addSublayer(entry.layer)
@@ -2102,7 +2155,7 @@ private enum MvmtCompositorEngine {
     addLyricLineAnimations(
       to: innerLayer,
       animation: animation,
-      applyEnter: !useWords || wordMode == "karaoke",
+      applyEnter: wordMode == "none" || wordMode == "karaoke",
       start: start,
       lineDuration: lineDuration,
       lineHeight: contentSize.height,
