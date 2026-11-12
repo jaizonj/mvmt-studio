@@ -76,6 +76,13 @@ awaits Jaizon's device pass (`docs/TEST_MATRIX.md`) before merging to
 - [x] Post-overhaul round: takes rail on Record + camera polish, Editor
   rebuild (scrolling, drag-trim, duplicate/reorder, sync anchor),
   near-fullscreen Export — shipped in CI run 42470406509.
+- [x] Shuffle/auto-edit REMOVED (2026-11-12, Jaizon: "auto edit is
+  out"): `src/lib/shuffle.ts`, `src/lib/shuffleEdl.ts` and
+  `tests/shuffle.test.cjs` deleted; the editor opens straight into
+  Edit mode and builds the EDL chronologically — takes in recording
+  order, each at full length, laid end-to-end and clipped to the
+  song region (`buildEdlChronological` in `src/lib/edl.ts`). The
+  flow is now Record → Edit → Export.
 - [ ] Jaizon's device pass → merge `overhaul` into `master`.
 
 ## Verification reality (read before claiming anything)

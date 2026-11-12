@@ -24,7 +24,7 @@ export interface Take {
    * default when the field is absent, so every pre-import take reads
    * as recorded) or 'imported' (picked from Photos/Files and synced
    * to the song after the fact). Imported takes are first-class takes
-   * for the shuffle/editor/export, but two things treat them
+   * for the editor/export, but two things treat them
    * specially: they never vote on the EDL canvas (canvasForTakes —
    * a landscape or 4K import conforms to the project's canvas instead
    * of hijacking it), and their sync offset may legitimately be
@@ -38,15 +38,8 @@ export interface Take {
    * EDL canvas follows the largest take so 4K takes export at 4K. */
   width?: number;
   height?: number;
-  /** Size of the recorded file in bytes (used by the v1 energy heuristic). */
+  /** Size of the recorded file in bytes (shown on the export summary). */
   fileSizeBytes?: number;
-  /**
-   * Overall motion/energy estimate for this take, 0 (calm/static) to 1
-   * (intense movement). v1 heuristic — see src/lib/analysis.ts. The shuffle
-   * engine only reads this number, so a real motion analyser can replace
-   * the heuristic without touching the engine.
-   */
-  energy?: number;
   /**
    * Offset (seconds) into the track at which this take was meant to start
    * (the region start it was recorded against).
@@ -58,9 +51,8 @@ export interface Take {
    * frames were captured — measured, not assumed (see `syncSource`
    * for how: player sample, file correlation, or the native capture
    * module's first-frame report). Positive = the camera effectively
-   * started late. Consumed by the EDL bridge (src/lib/shuffleEdl.ts)
-   * via the single mapping in src/lib/edl.ts. Undefined = not
-   * measured (older takes).
+   * started late. Consumed via the single mapping in src/lib/edl.ts.
+   * Undefined = not measured (older takes).
    */
   syncOffsetSeconds?: number;
   /**
@@ -68,7 +60,7 @@ export interface Take {
    * fps (30) — Jaizon's by-ear/eye correction when automatic sync is
    * still imperfect. Added to the measured offset inside the ONE shared
    * offset function (`takeSyncOffsetSeconds` in src/lib/edl.ts), so the
-   * shuffle bridge, the editor's sync anchor, preview and export all
+   * editor's sync anchor, preview and export all
    * honour it identically. Same sign convention as syncOffsetSeconds:
    * positive = the capture is treated as having started later (the
    * footage for a given song position is read earlier in the file).
@@ -115,43 +107,7 @@ export interface Take {
   seq?: number;
 }
 
-/**
- * A musical section of the track (phrase-aligned), with an energy estimate.
- * Built by src/lib/analysis.ts and cached in the studio store — the shuffle
- * engine is a pure table lookup over these, never a re-analysis.
- */
-export interface MusicalSection {
-  index: number;
-  startSeconds: number;
-  endSeconds: number;
-  /** 0 (silence/intro) to 1 (loudest phrase), RMS-derived when sampled. */
-  energy: number;
-}
-
-/** Record of the last shuffle, shown as the "Best of N · score X" caption. */
-export interface ShuffleResultInfo {
-  score: number;
-  candidatesEvaluated: number;
-  /** Take ids in timeline order — used to guarantee the next shuffle differs. */
-  takeSequence: string[];
-}
-
 export type CountdownSeconds = 0 | 3 | 5 | 10;
-
-/**
- * How often Shuffle changes clip — the target length of each shuffled
- * section. At the assumed 120 BPM grid: chill = a full 8-beat phrase
- * (~4s), normal = half a phrase (~2s), fast = 2 beats (~1s),
- * rapid = every beat (~0.5s).
- */
-export type ShuffleFrequency = 'chill' | 'normal' | 'fast' | 'rapid';
-
-export const SHUFFLE_FREQUENCY_LENGTHS: Record<ShuffleFrequency, number> = {
-  chill: 4,
-  normal: 2,
-  fast: 1,
-  rapid: 0.5,
-};
 
 /** Settings-only configuration types (no creative tools — they live in the Editor). */
 export type FrameRatePref = 30 | 60;
@@ -208,7 +164,7 @@ export interface ProjectLook {
 /**
  * The selected part of the track — THE single source of truth for "which
  * bit of the song are we performing". Recording plays exactly this region,
- * shuffle sections are built inside it, and the editor previews it.
+ * and the editor previews it.
  * durationSeconds = null means "to the end of the track".
  */
 export interface AudioRegion {
@@ -231,7 +187,7 @@ export interface LyricWord {
  * One lyric line, timed on the SONG timeline (NOT the composition
  * timeline): `startFrame`/`endFrame` are song-absolute frames at the
  * EDL fps. Because the master song plays continuously through every
- * cut, pinning lines to the song clock means shuffle edits can never
+ * cut, pinning lines to the song clock means edits can never
  * knock lyrics out of sync — the song↔timeline mapping happens once,
  * at the native boundary (src/lib/lyrics.ts).
  */
@@ -328,11 +284,8 @@ export interface Project {
   track: AudioTrack | null;
   trackRegion: AudioRegion;
   takes: Take[];
-  /** The canonical edit. Null until the first shuffle/manual edit. */
+  /** The canonical edit. Null until the first edit exists. */
   edl: import('./lib/edl').Edl | null;
-  /** Take-id sequence of the current EDL — guarantees the next shuffle differs. */
-  lastShuffleSequence: string[] | null;
-  shuffleFrequency: ShuffleFrequency;
   /**
    * Whether the MVMT studio logo watermark (assets/logo-lockup.png) is
    * stamped onto this project's videos — preview and export alike,

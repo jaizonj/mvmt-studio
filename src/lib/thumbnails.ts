@@ -5,8 +5,8 @@ import { createVideoPlayer, type VideoPlayer, type VideoThumbnail } from 'expo-v
  *
  * Uses expo-video's built-in `generateThumbnailsAsync` on a throwaway
  * player per source video — no extra native dependency. Results are
- * cached module-wide keyed by (uri, time) so re-renders and re-shuffles
- * don't regenerate frames; a cached `null` means "generation failed /
+ * cached module-wide keyed by (uri, time) so re-renders and
+ * re-edits don't regenerate frames; a cached `null` means "generation failed /
  * no frame there" and the strip falls back to its colour placeholder.
  *
  * Players are kept alive in a small LRU (takes are few) and released

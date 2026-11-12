@@ -16,7 +16,7 @@ import type { WhisperSegment } from './whisper';
  * timeline in integer frames at the project fps (song-absolute, the
  * same clock as `Edl.audio.regionStartFrame`). The master song plays
  * continuously through every cut, so lines pinned to the song can
- * never be knocked out of sync by shuffle edits. The ONE mapping to
+ * never be knocked out of sync by edits. The ONE mapping to
  * composition time happens here, at the native/overlay boundary:
  *
  *   timelineFrame = songFrame − regionStartFrame

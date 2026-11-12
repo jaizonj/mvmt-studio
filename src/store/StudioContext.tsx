@@ -16,11 +16,9 @@ import type {
   FrameRatePref,
   LyricLine,
   LyricStyle,
-  MusicalSection,
   Project,
   ProjectLook,
   ProjectLyrics,
-  ShuffleFrequency,
   SongLibraryEntry,
   Take,
 } from '../types';
@@ -29,7 +27,7 @@ import type {
  * Studio store — Overhaul Wave 2 (lead).
  *
  * PROJECTS are now the unit of work: creative state (track, region,
- * takes, the canonical EDL, shuffle state) lives inside the ACTIVE
+ * takes, the canonical EDL) lives inside the ACTIVE
  * project and is persisted to disk (src/lib/persistence.ts) — before
  * this, everything was useState-only and a restart lost the whole
  * studio (QA audit F-2). Camera/settings preferences stay global.
@@ -90,8 +88,6 @@ export function createEmptyProject(name: string): Project {
     trackRegion: { startSeconds: 0, durationSeconds: null },
     takes: [],
     edl: null,
-    lastShuffleSequence: null,
-    shuffleFrequency: 'normal',
     watermarkEnabled: true,
   };
 }
@@ -125,8 +121,8 @@ interface StudioState {
   /** The canonical edit (frame-based EDL). Null until the first edit exists. */
   edl: Edl | null;
   setEdl: (edl: Edl | null) => void;
-  /** Apply a freshly generated edit + record its take sequence (so the next shuffle differs). */
-  applyEdl: (edl: Edl, shuffleSequence?: string[]) => void;
+  /** Apply a freshly generated or edited EDL to the active project. */
+  applyEdl: (edl: Edl) => void;
 
   setTrack: (track: AudioTrack | null) => void;
   setTrackDuration: (seconds: number) => void;
@@ -139,13 +135,6 @@ interface StudioState {
   removeTake: (takeId: string) => void;
   /** Patch a take in place (rename, measured sync/duration updates…). */
   updateTake: (takeId: string, patch: Partial<Take>) => void;
-
-  /** Cached phrase/energy analysis of the current track (see analysis.ts). */
-  trackSections: MusicalSection[];
-  setTrackSections: (sections: MusicalSection[]) => void;
-
-  shuffleFrequency: ShuffleFrequency;
-  setShuffleFrequency: (v: ShuffleFrequency) => void;
 
   /** Effective watermark flag for the active project — stored values
    *  win; projects saved before the flag existed read as ON. */
@@ -261,9 +250,6 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [hydrated, setHydrated] = useState(false);
   const [songLibrary, setSongLibrary] = useState<SongLibraryEntry[]>([]);
 
-  // Transient (never persisted): the track analysis cache.
-  const [trackSections, setTrackSections] = useState<MusicalSection[]>([]);
-
   // Global preferences.
   const [facing, setFacing] = useState<CameraType>('back');
   const [torch, setTorch] = useState(false);
@@ -355,7 +341,6 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     const project = createEmptyProject(name?.trim() || 'Untitled project');
     setProjects((current) => [project, ...current]);
     setActiveProjectId(project.id);
-    setTrackSections([]);
     return project.id;
   }, []);
 
@@ -363,8 +348,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     (id: string) => {
       if (!projects.some((p) => p.id === id)) return;
       setActiveProjectId(id);
-            setTrackSections([]);
-      },
+    },
     [projects],
   );
 
@@ -399,7 +383,6 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [activeProject],
   );
   const edl = activeProject?.edl ?? null;
-  const shuffleFrequency = activeProject?.shuffleFrequency ?? 'normal';
 
   const setEdl = useCallback(
     (next: Edl | null) => patchActiveProject({ edl: next }),
@@ -407,11 +390,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   );
 
   const applyEdl = useCallback(
-    (next: Edl, shuffleSequence?: string[]) =>
-      patchActiveProject({
-        edl: next,
-        lastShuffleSequence: shuffleSequence ?? activeProjectRef.current?.lastShuffleSequence ?? null,
-      }),
+    (next: Edl) => patchActiveProject({ edl: next }),
     [patchActiveProject],
   );
 
@@ -420,13 +399,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       patchActiveProject({
         track: next,
         trackRegion: { startSeconds: 0, durationSeconds: null },
-        lastShuffleSequence: null,
         // Lyrics are timed against THIS song's clock — a new song
         // invalidates them, so they clear with the track.
         lyrics: undefined,
         lyricsEnabled: undefined,
       });
-      setTrackSections([]);
       // Auto EQ warm-up: start analyzing/rendering the new song in
       // the background so the processed copy is ready when the
       // editor/export screens build their compositions. Fire and
@@ -454,14 +431,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           durationSeconds: region.durationSeconds === null ? null : Math.max(1, region.durationSeconds),
         },
       });
-      // Region changed — any sampled section table belongs to the old region.
-      setTrackSections([]);
     },
-    [patchActiveProject],
-  );
-
-  const setShuffleFrequency = useCallback(
-    (v: ShuffleFrequency) => patchActiveProject({ shuffleFrequency: v }),
     [patchActiveProject],
   );
 
@@ -734,10 +704,6 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       addTake,
       removeTake,
       updateTake,
-      trackSections,
-      setTrackSections,
-      shuffleFrequency,
-      setShuffleFrequency,
       watermarkEnabled,
       setWatermarkEnabled,
       autoEqEnabled,
@@ -819,9 +785,6 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       addTake,
       removeTake,
       updateTake,
-      trackSections,
-      shuffleFrequency,
-      setShuffleFrequency,
       watermarkEnabled,
       setWatermarkEnabled,
       autoEqEnabled,

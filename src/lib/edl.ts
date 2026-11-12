@@ -14,7 +14,7 @@ import type { CompositeRequest, ResolvedLookParams } from '../../modules/mvmt-co
  * - Every segment's source range is expressed in frames INSIDE its take,
  *   with the take's synchronization offset already applied by
  *   `sourceFrameForTimelineFrame` — the single shared mapping, so the
- *   shuffle, the editor, the preview and the exporter can never disagree
+ *   editor, the preview and the exporter can never disagree
  *   about where a cut's footage comes from.
  * - The EDL is validated against MEASURED asset durations before it is
  *   allowed anywhere near a player or an exporter (`validateEdl`).
@@ -112,9 +112,9 @@ export function sourceFrameForTimelineFrame(
  * capture started late, so the footage for a given timeline frame
  * lives earlier inside the file (see sourceFrameForTimelineFrame).
  *
- * The shuffle→EDL bridge, the editor's sync anchor and the calibration
- * UI all read THIS function; record.tsx is the write side only (it
- * produces the measured fields, it never maps with them). Nobody else
+ * The editor's sync anchor and the calibration UI all read THIS
+ * function; record.tsx is the write side only (it produces the
+ * measured fields, it never maps with them). Nobody else
  * does this math. `syncDriftSeconds` deliberately never enters here:
  * it is a diagnostic dominated by capture-start latency, not clock
  * drift (2026-11-09 audit).
@@ -309,6 +309,98 @@ export function edlToCompositeRequest(
     look: options.look ?? null,
     normalizeVolume: options.normalizeVolume ?? false,
   };
+}
+
+/**
+ * Chronological EDL builder (2026-11-12, Jaizon: the Shuffle/auto-edit
+ * is removed): takes in recording order, each segment = that take's
+ * full duration laid end-to-end, clipped to the song region's length.
+ *
+ * Clipping mirrors what the old shuffle bridge did: segments are
+ * positioned on the timeline relative to the region start and
+ * converted through secondsToFrames, and each segment's source
+ * start comes from the ONE shared mapping
+ * (sourceFrameForTimelineFrame with takeSyncOffsetSeconds), so the
+ * editor's sync anchor, preview and export all agree. The result is
+ * still validated against measured asset durations before it reaches
+ * a player or the exporter (validateEdl / validateAgainstAssets),
+ * which clamps any segment whose anchored source range overruns its
+ * take's real length.
+ */
+export interface ChronologicalEdlTake {
+  id: string;
+  /** Absolute track time (seconds) at which this take's recording window began. */
+  trackOffsetSeconds: number;
+  /** Optional MEASURED sync correction in seconds (positive = capture started late). */
+  syncOffsetSeconds?: number;
+  /** Optional manual sync calibration in integer frames at the project fps. */
+  syncAdjustFrames?: number;
+  /** Recorded length in seconds. A take without one contributes nothing. */
+  durationSeconds?: number;
+}
+
+export interface BuildEdlChronologicalInput {
+  takes: ChronologicalEdlTake[];
+  /** Absolute track time (seconds) where the used region starts. */
+  regionStartSeconds: number;
+  /** Length of the used region, seconds — the edit never runs past it. */
+  regionLengthSeconds: number;
+  /** Master track URI for the EDL's audio (null = silent project). */
+  audioUri: string | null;
+  /** Project output canvas. Defaults to the EDL default (1080×1920). */
+  canvas?: { width: number; height: number };
+}
+
+export function buildEdlChronological(input: BuildEdlChronologicalInput): Edl {
+  const { takes, regionStartSeconds, regionLengthSeconds, audioUri, canvas } = input;
+  const fps = DEFAULT_FPS;
+  const regionFrames = Math.max(0, secondsToFrames(regionLengthSeconds, fps));
+  const base: Edl = {
+    ...emptyEdl(fps),
+    ...(canvas ? { canvas: { width: canvas.width, height: canvas.height } } : {}),
+    audio: { uri: audioUri, regionStartFrame: secondsToFrames(regionStartSeconds, fps), volume: 1 },
+  };
+  let cursor = 0;
+  const partials: { id: string; takeId: string; sourceStartFrame: number; durationFrames: number }[] = [];
+  for (const take of takes) {
+    if (cursor >= regionFrames) break;
+    const takeFrames = secondsToFrames(take.durationSeconds ?? 0, fps);
+    const durationFrames = Math.min(takeFrames, regionFrames - cursor);
+    if (durationFrames <= 0) continue;
+    const offsetSeconds = takeSyncOffsetSeconds(take, regionStartSeconds, fps);
+    partials.push({
+      // Positional ids: stable across identical runs and unique within the edit.
+      id: `seg-${partials.length + 1}`,
+      takeId: take.id,
+      sourceStartFrame: Math.max(0, sourceFrameForTimelineFrame(cursor, offsetSeconds, fps)),
+      durationFrames,
+    });
+    cursor += durationFrames;
+  }
+  return layoutSegments(partials, base);
+}
+
+/**
+ * Validate an EDL against take durations known on the JS side
+ * (seconds → frames at `fps`), via the canonical validateEdl.
+ *
+ * These durations are an approximation (record-time measurement /
+ * best-effort probe). Native `inspectAsset` measures SUPERSEDE them:
+ * when native measures are available, build AssetMeasure[] from those
+ * and call validateEdl directly instead. A take with no known duration
+ * is treated as zero-length — its segments are dropped with errors
+ * rather than passed through unchecked.
+ */
+export function validateAgainstAssets(
+  edl: Edl,
+  takes: { id: string; durationSeconds?: number }[],
+  fps: number,
+): EdlValidation {
+  const assets: AssetMeasure[] = takes.map((t) => ({
+    takeId: t.id,
+    durationFrames: Math.max(0, secondsToFrames(t.durationSeconds ?? 0, fps)),
+  }));
+  return validateEdl(edl, assets);
 }
 
 /** The segment under a timeline frame, or null past the end. */

@@ -1,15 +1,24 @@
 /**
- * Node tests for the shuffle → EDL bridge (src/lib/shuffleEdl.ts) and
- * the canonical EDL contract it targets (src/lib/edl.ts).
+ * Node tests for the chronological EDL builder (buildEdlChronological
+ * in src/lib/edl.ts) and the canonical EDL contract it targets.
+ *
+ * The Shuffle/auto-edit was removed 2026-11-12 (Jaizon: "auto edit is
+ * out"): the editor builds the EDL chronologically — takes in
+ * recording order, each at full length, laid end-to-end and clipped
+ * to the song region. The sync contract below (ONE shared offset,
+ * drift exclusion, manual frame calibration, legacy safety) is
+ * unchanged — it is the same mapping, exercised through the new
+ * builder instead of the old shuffle bridge.
+ *
  * Run with: npm run test:edl
  * (tsc compiles the pure modules into tests/.build-edl, then node --test
  * runs this file against the compiled JS.)
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildEdlFromShuffle, validateAgainstAssets, sequenceKey } = require('./.build-edl/src/lib/shuffleEdl.js');
-const { buildSections } = require('./.build-edl/src/lib/analysis.js');
 const {
+  buildEdlChronological,
+  validateAgainstAssets,
   sourceFrameForTimelineFrame,
   takeSyncOffsetSeconds,
   secondsToFrames,
@@ -19,30 +28,23 @@ const {
 } = require('./.build-edl/src/lib/edl.js');
 
 const FPS = DEFAULT_FPS; // 30
-const REGION_SECONDS = 15;
-const REGION_FRAMES = REGION_SECONDS * FPS; // 450
+const REGION_SECONDS = 40;
+const REGION_FRAMES = REGION_SECONDS * FPS; // 1200
 
-/** Three takes recorded over a region starting at `regionStart` (absolute track time). */
+/** Three 15s takes recorded over a region starting at `regionStart` (absolute track time). */
 function makeTakes(regionStart = 0) {
   return [
-    { id: 'calm', energy: 0.15, trackOffsetSeconds: regionStart, durationSeconds: REGION_SECONDS },
-    { id: 'mid', energy: 0.5, trackOffsetSeconds: regionStart, durationSeconds: REGION_SECONDS },
-    { id: 'wild', energy: 0.9, trackOffsetSeconds: regionStart, durationSeconds: REGION_SECONDS },
+    { id: 'calm', trackOffsetSeconds: regionStart, durationSeconds: 15 },
+    { id: 'mid', trackOffsetSeconds: regionStart, durationSeconds: 15 },
+    { id: 'wild', trackOffsetSeconds: regionStart, durationSeconds: 15 },
   ];
 }
 
-/** Phrase-length sections (4s @120bpm) over 15s starting at `regionStart`, like the app's sampled sections. */
-function makeSections(regionStart = 0) {
-  return buildSections(REGION_SECONDS, 120, regionStart);
-}
-
 function build(overrides = {}) {
-  return buildEdlFromShuffle({
-    sections: makeSections(0),
+  return buildEdlChronological({
     takes: makeTakes(0),
-    frequency: 'normal',
-    seed: 42,
     regionStartSeconds: 0,
+    regionLengthSeconds: REGION_SECONDS,
     audioUri: 'file:///track.mp3',
     ...overrides,
   });
@@ -61,39 +63,66 @@ function assertGapless(edl, expectedTotalFrames) {
   }
 }
 
-test('determinism: same seed reproduces the identical EDL byte-for-byte', () => {
+test('determinism: the same takes and region reproduce the identical EDL byte-for-byte', () => {
   const a = build();
   const b = build();
   assert.equal(JSON.stringify(a), JSON.stringify(b));
-  assert.ok(a.shuffleInfo);
-  assert.equal(a.shuffleInfo.candidatesEvaluated, 32);
-  assert.deepEqual(a.shuffleInfo.takeSequence, a.edl.segments.map((s) => s.takeId));
-
-  const other = build({ seed: 1337 });
-  assert.notEqual(sequenceKey(other.edl), sequenceKey(a.edl), 'a different seed should produce a different edit');
 });
 
-test('gapless coverage: every frequency covers the whole region, contiguously', () => {
-  for (const frequency of ['chill', 'normal', 'fast', 'rapid']) {
-    const { edl, shuffleInfo } = build({ frequency });
-    assert.ok(shuffleInfo, `${frequency}: shuffle should succeed`);
-    assert.ok(edl.segments.length > 0, `${frequency}: segments expected`);
-    assertGapless(edl, REGION_FRAMES);
-    assert.equal(edl.fps, FPS);
-    assert.equal(edl.canvas.width, 1080);
-    assert.equal(edl.canvas.height, 1920);
-    assert.equal(edl.audio.uri, 'file:///track.mp3');
-    assert.equal(edl.audio.regionStartFrame, 0);
-    assert.equal(edl.audio.volume, 1);
-    for (const segment of edl.segments) {
-      assert.ok(segment.sourceStartFrame >= 0, `${frequency}/${segment.id}: source start clamped at 0`);
-    }
+test('chronological order: takes in recording order, each at full length, laid end-to-end', () => {
+  const edl = build();
+  assert.equal(edl.segments.length, 3);
+  assert.deepEqual(
+    edl.segments.map((s) => s.takeId),
+    ['calm', 'mid', 'wild'],
+  );
+  assert.deepEqual(
+    edl.segments.map((s) => s.durationFrames),
+    [15 * FPS, 15 * FPS, 10 * FPS],
+    'the third take is clipped to the 40s region',
+  );
+  assertGapless(edl, REGION_FRAMES);
+  assert.equal(edl.fps, FPS);
+  assert.equal(edl.canvas.width, 1080);
+  assert.equal(edl.canvas.height, 1920);
+  assert.equal(edl.audio.uri, 'file:///track.mp3');
+  assert.equal(edl.audio.regionStartFrame, 0);
+  assert.equal(edl.audio.volume, 1);
+  for (const segment of edl.segments) {
+    assert.ok(segment.sourceStartFrame >= 0, `${segment.id}: source start clamped at 0`);
   }
 });
 
+test('clipping: the edit never runs past the region, and ends early when the takes run out', () => {
+  // Region shorter than the first take: one segment, clipped to 15s.
+  const short = build({ regionLengthSeconds: 15 });
+  assert.equal(short.segments.length, 1);
+  assert.equal(short.segments[0].takeId, 'calm');
+  assertGapless(short, 15 * FPS);
+
+  // Region longer than all takes combined (45s of takes): the edit
+  // ends at 45s, not at the 100s region.
+  const long = build({ regionLengthSeconds: 100 });
+  assert.equal(long.segments.length, 3);
+  assertGapless(long, 45 * FPS);
+
+  // Zero-length region: nothing to lay out.
+  const zero = build({ regionLengthSeconds: 0 });
+  assert.deepEqual(zero.segments, []);
+  assert.equal(zero.totalFrames, 0);
+  assert.equal(zero.audio.uri, 'file:///track.mp3');
+});
+
+test('canvas: defaults to 1080x1920; an explicit canvas passes through', () => {
+  assert.deepEqual(build().canvas, { width: 1080, height: 1920 });
+  assert.deepEqual(build({ canvas: { width: 2160, height: 3840 } }).canvas, {
+    width: 2160,
+    height: 3840,
+  });
+});
+
 test('region offset: timeline is region-relative, audio keeps the absolute region start', () => {
-  const { edl } = build({
-    sections: makeSections(10),
+  const edl = build({
     takes: makeTakes(10),
     regionStartSeconds: 10,
   });
@@ -108,7 +137,7 @@ test('region offset: timeline is region-relative, audio keeps the absolute regio
 test('source mapping: every segment follows the shared timeline→source formula', () => {
   const takes = makeTakes(0);
   takes[1].syncOffsetSeconds = 0.5; // 'mid' measured half a second late
-  const { edl } = build({ takes });
+  const edl = build({ takes });
   const byId = new Map(takes.map((t) => [t.id, t]));
   for (const segment of edl.segments) {
     const take = byId.get(segment.takeId);
@@ -124,11 +153,14 @@ test('source mapping: a measured sync offset shifts only that take, by exactly o
   shiftedTakes[1].syncOffsetSeconds = 0.5; // 'mid'
   const shifted = build({ takes: shiftedTakes });
 
-  // Sync metadata must not change WHICH takes the shuffle picks.
-  assert.equal(sequenceKey(shifted.edl), sequenceKey(base.edl));
-  assert.equal(shifted.edl.segments.length, base.edl.segments.length);
-  shifted.edl.segments.forEach((segment, i) => {
-    const before = base.edl.segments[i];
+  // Sync metadata must not change WHICH takes the edit uses.
+  assert.deepEqual(
+    shifted.segments.map((s) => s.takeId),
+    base.segments.map((s) => s.takeId),
+  );
+  assert.equal(shifted.segments.length, base.segments.length);
+  shifted.segments.forEach((segment, i) => {
+    const before = base.segments[i];
     assert.equal(segment.timelineStartFrame, before.timelineStartFrame);
     assert.equal(segment.durationFrames, before.durationFrames);
     if (segment.takeId === 'mid') {
@@ -140,92 +172,77 @@ test('source mapping: a measured sync offset shifts only that take, by exactly o
 });
 
 test('validation: honest durations pass unchanged; short takes clamp, unknown takes drop', () => {
-  const { edl } = build();
+  // Honest fixture: a 10s take followed by a 40s take over a 40s
+  // region. The first take covers song [0,10]; the second covers
+  // song [10,40] from its own file [10,40] — every source range fits
+  // its asset, so validation passes the edit through untouched.
+  const honestTakes = [
+    { id: 'short', trackOffsetSeconds: 0, durationSeconds: 10 },
+    { id: 'full', trackOffsetSeconds: 0, durationSeconds: 40 },
+  ];
+  const edl = build({ takes: honestTakes });
+  assert.equal(edl.segments.length, 2);
+  assertGapless(edl, REGION_FRAMES);
 
-  const honest = validateAgainstAssets(edl, makeTakes(0), FPS);
+  const honest = validateAgainstAssets(edl, honestTakes, FPS);
   assert.equal(honest.ok, true);
   assert.deepEqual(honest.errors, []);
   assert.deepEqual(honest.edl.segments, edl.segments);
 
-  // 'mid' only really has 2s of footage: its source ranges must clamp
-  // to 60 frames, with errors reported and the edit kept gapless.
+  // 'full' only really has 15s of footage: its segment starts at
+  // timeline 10s (source 10s) and must clamp to the 5s it actually
+  // holds ([10,15]), with errors reported and the edit kept gapless.
   const short = validateAgainstAssets(
     edl,
-    makeTakes(0).map((t) => (t.id === 'mid' ? { ...t, durationSeconds: 2 } : t)),
+    honestTakes.map((t) => (t.id === 'full' ? { ...t, durationSeconds: 15 } : t)),
     FPS,
   );
   assert.equal(short.ok, false);
   assert.ok(short.errors.length > 0);
-  assertGapless(short.edl);
+  assertGapless(short.edl, 15 * FPS);
   for (const segment of short.edl.segments) {
-    if (segment.takeId === 'mid') {
-      assert.ok(segment.sourceStartFrame + segment.durationFrames <= 2 * FPS, 'mid range inside its real 2s');
+    if (segment.takeId === 'full') {
+      assert.ok(segment.sourceStartFrame + segment.durationFrames <= 15 * FPS, 'full range inside its real 15s');
     }
   }
 
   // A take missing from the measures is dropped, never passed through.
-  const unknown = validateAgainstAssets(edl, makeTakes(0).filter((t) => t.id !== 'wild'), FPS);
+  const unknown = validateAgainstAssets(edl, honestTakes.filter((t) => t.id !== 'full'), FPS);
   assert.equal(unknown.ok, false);
-  assert.ok(unknown.errors.some((e) => e.includes('wild')));
-  assert.ok(unknown.edl.segments.every((s) => s.takeId !== 'wild'));
+  assert.ok(unknown.errors.some((e) => e.includes('full')));
+  assert.ok(unknown.edl.segments.every((s) => s.takeId !== 'full'));
   assertGapless(unknown.edl);
 
   // Zero known duration = zero usable footage.
   const zero = validateAgainstAssets(
     edl,
-    makeTakes(0).map((t) => (t.id === 'mid' ? { ...t, durationSeconds: undefined } : t)),
+    honestTakes.map((t) => (t.id === 'full' ? { ...t, durationSeconds: undefined } : t)),
     FPS,
   );
   assert.equal(zero.ok, false);
-  assert.ok(zero.edl.segments.every((s) => s.takeId !== 'mid'));
+  assert.ok(zero.edl.segments.every((s) => s.takeId !== 'full'));
   assertGapless(zero.edl);
 });
 
-test('frequency sanity: faster frequencies cut more over the same 15s', () => {
-  const counts = {};
-  for (const frequency of ['chill', 'normal', 'fast', 'rapid']) {
-    counts[frequency] = build({ frequency }).edl.segments.length;
-  }
-  assert.ok(counts.rapid > counts.fast, JSON.stringify(counts));
-  assert.ok(counts.fast > counts.normal, JSON.stringify(counts));
-  assert.ok(counts.normal > counts.chill, JSON.stringify(counts));
-  assert.ok(counts.rapid >= 15, `rapid should cut almost every beat, got ${counts.rapid}`);
+test('degenerate inputs: no takes yields an empty EDL; one take yields one segment', () => {
+  const none = build({ takes: [] });
+  assert.deepEqual(none.segments, []);
+  assert.equal(none.totalFrames, 0);
+  assert.equal(none.audio.uri, 'file:///track.mp3');
+
+  const one = build({ takes: makeTakes(0).slice(0, 1) });
+  assert.equal(one.segments.length, 1);
+  assert.equal(one.segments[0].takeId, 'calm');
+  assertGapless(one, 15 * FPS);
 });
 
-test('no adjacent repeats beyond chance at rapid across seeds', () => {
-  let same = 0;
-  let pairs = 0;
-  for (let seed = 1; seed <= 8; seed++) {
-    const { edl } = build({ frequency: 'rapid', seed });
-    for (let i = 1; i < edl.segments.length; i++) {
-      pairs += 1;
-      if (edl.segments[i].takeId === edl.segments[i - 1].takeId) same += 1;
-    }
-  }
-  assert.ok(pairs > 100, `expected a large sample of cut pairs, got ${pairs}`);
-  assert.ok(same / pairs < 0.2, `adjacent same-take rate ${same}/${pairs} is too high`);
-});
-
-test('novelty: feeding the previous sequence back produces a different edit', () => {
-  const first = build();
-  const second = build({ previousSequence: first.shuffleInfo.takeSequence });
-  assert.ok(second.shuffleInfo);
-  assert.equal(second.shuffleInfo.isRepeatOfPrevious, false);
-  assert.notEqual(sequenceKey(second.edl), sequenceKey(first.edl));
-});
-
-test('degenerate inputs: fewer than 2 takes yields an empty EDL and null info', () => {
-  const { edl, shuffleInfo } = build({ takes: makeTakes(0).slice(0, 1) });
-  assert.equal(shuffleInfo, null);
-  assert.deepEqual(edl.segments, []);
-  assert.equal(edl.totalFrames, 0);
-  assert.equal(edl.audio.uri, 'file:///track.mp3');
-});
-
-test('fallback: with no sampled sections, the grid is built from take durations', () => {
-  const { edl, shuffleInfo } = build({ sections: [] });
-  assert.ok(shuffleInfo);
-  assertGapless(edl, REGION_FRAMES);
+test('input takes are not mutated by the builder', () => {
+  const takes = makeTakes(0);
+  takes[1].syncOffsetSeconds = 0.5;
+  const snapshot = JSON.stringify(takes);
+  build({ takes });
+  build({ takes });
+  assert.equal(JSON.stringify(takes), snapshot);
 });
 
 // ---------------------------------------------------------------------
@@ -270,13 +287,13 @@ test('alignment: takes with different capture-start delays point at the same son
   assert.equal(songOf(punctual, sPunctual), framesToSeconds(F, FPS));
   assert.equal(songOf(delayed, sDelayed), framesToSeconds(F, FPS));
 
-  // End to end through the bridge: every (unclamped) segment of every
+  // End to end through the builder: every (unclamped) segment of every
   // take satisfies the same identity against its timeline position.
   const takes = makeTakes(0);
   takes[0].syncOffsetSeconds = 0.2;
   takes[1].syncOffsetSeconds = 0.7;
   takes[2].syncOffsetSeconds = -0.1; // captured slightly early
-  const { edl } = build({ takes });
+  const edl = build({ takes });
   const byId = new Map(takes.map((t) => [t.id, t]));
   let checked = 0;
   for (const segment of edl.segments) {
@@ -288,7 +305,7 @@ test('alignment: takes with different capture-start delays point at the same son
     );
     checked += 1;
   }
-  assert.ok(checked >= 3, `expected several segments to verify, got ${checked}`);
+  assert.ok(checked >= 2, `expected several segments to verify, got ${checked}`);
 });
 
 test('drift invariance: syncDriftSeconds never enters the mapping', () => {
@@ -298,11 +315,11 @@ test('drift invariance: syncDriftSeconds never enters the mapping', () => {
   const driftPlusMinus = makeTakes(0).map((t, i) => ({ ...t, syncDriftSeconds: i === 0 ? 5 : -5 }));
   const driftHuge = makeTakes(0).map((t) => ({ ...t, syncDriftSeconds: 123.456 }));
   const plain = build();
-  assert.equal(JSON.stringify(build({ takes: driftPlusMinus }).edl), JSON.stringify(plain.edl));
-  assert.equal(JSON.stringify(build({ takes: driftHuge }).edl), JSON.stringify(plain.edl));
+  assert.equal(JSON.stringify(build({ takes: driftPlusMinus })), JSON.stringify(plain));
+  assert.equal(JSON.stringify(build({ takes: driftHuge })), JSON.stringify(plain));
 });
 
-test('calibration: syncAdjustFrames shifts the source by whole frames, honoured on every shuffle', () => {
+test('calibration: syncAdjustFrames shifts the source by whole frames, honoured in every build', () => {
   // Sign, per the formula: the adjustment ADDS to the offset, and the
   // offset is SUBTRACTED from the timeline frame — so +3 frames of
   // calibration reads the footage 3 frames EARLIER in the file.
@@ -320,14 +337,17 @@ test('calibration: syncAdjustFrames shifts the source by whole frames, honoured 
   assert.equal(adjusted, unadjusted - 3);
 
   // End to end: only the calibrated take's segments move, by exactly
-  // −3 frames (clamped at 0); take selection is unchanged.
+  // −3 frames (clamped at 0); take order is unchanged.
   const base = build();
   const calTakes = makeTakes(0);
   calTakes[1].syncAdjustFrames = 3; // 'mid'
   const cal = build({ takes: calTakes });
-  assert.equal(sequenceKey(cal.edl), sequenceKey(base.edl));
-  cal.edl.segments.forEach((segment, i) => {
-    const before = base.edl.segments[i];
+  assert.deepEqual(
+    cal.segments.map((s) => s.takeId),
+    base.segments.map((s) => s.takeId),
+  );
+  cal.segments.forEach((segment, i) => {
+    const before = base.segments[i];
     if (segment.takeId === 'mid') {
       assert.equal(segment.sourceStartFrame, Math.max(0, before.sourceStartFrame - 3));
     } else {
@@ -335,12 +355,12 @@ test('calibration: syncAdjustFrames shifts the source by whole frames, honoured 
     }
   });
 
-  // Re-shuffling with other seeds must not mutate the input takes,
-  // and the calibration is honoured in every resulting edit.
+  // Rebuilding must not mutate the input takes, and the calibration
+  // is honoured in every resulting edit.
   const snapshot = JSON.stringify(calTakes);
   let midChecked = 0;
-  for (const seed of [7, 99]) {
-    const { edl } = build({ takes: calTakes, seed });
+  for (let i = 0; i < 2; i++) {
+    const edl = build({ takes: calTakes });
     for (const segment of edl.segments) {
       if (segment.takeId !== 'mid') continue;
       const expected = Math.max(
@@ -355,19 +375,21 @@ test('calibration: syncAdjustFrames shifts the source by whole frames, honoured 
       midChecked += 1;
     }
   }
-  assert.ok(midChecked > 0, 'expected at least one mid segment across the re-shuffles');
-  assert.equal(JSON.stringify(calTakes), snapshot, 'the bridge must not mutate its input takes');
+  assert.ok(midChecked > 0, 'expected at least one mid segment across the rebuilds');
+  assert.equal(JSON.stringify(calTakes), snapshot, 'the builder must not mutate its input takes');
 });
 
 test('legacy safety: takes with no sync metadata build and validate exactly as before', () => {
   // The default fixture carries NO sync fields at all (pre-measurement
   // takes): the offset collapses to trackOffset − regionStart.
-  const { edl, shuffleInfo } = build({
-    sections: makeSections(10),
+  // (15s region, so the first 15s take fills it and every source
+  // range fits its asset.)
+  const edl = build({
     takes: makeTakes(10),
     regionStartSeconds: 10,
+    regionLengthSeconds: 15,
   });
-  assert.ok(shuffleInfo);
+  assert.equal(edl.segments.length, 1);
   assert.equal(edl.segments[0].sourceStartFrame, 0);
   const validated = validateAgainstAssets(edl, makeTakes(10), FPS);
   assert.equal(validated.ok, true);
