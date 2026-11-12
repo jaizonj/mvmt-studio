@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import Slider from '@react-native-community/slider';
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -11,12 +11,25 @@ import {
   Text,
   TextInput,
   View,
+  type TextStyle,
 } from 'react-native';
 
 import { SegmentedControl } from './SegmentedControl';
 import { DEFAULT_FPS, framesToSeconds } from '../lib/edl';
-import { LYRIC_ANIMATIONS } from '../lib/lyricAnimations';
-import { LYRIC_FONTS } from '../lib/lyricFonts';
+import {
+  LYRIC_ANIMATION_CATEGORIES,
+  PICKER_ANIMATIONS,
+  lyricAnimationById,
+  type LyricAnimation,
+  type LyricAnimationCategory,
+} from '../lib/lyricAnimations';
+import {
+  LYRIC_FONT_CATEGORIES,
+  LYRIC_FONTS,
+  lyricFontById,
+  type LyricFont,
+  type LyricFontCategory,
+} from '../lib/lyricFonts';
 import {
   defaultLyricStyle,
   groupWhisperSegments,
@@ -42,9 +55,11 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../theme
  * progress, and the show/hide switch; below it, two tabs.
  * - Lines: the line-by-line editor (text, ±0.1s / ±1-frame nudges,
  *   split, merge, delete, global shift) plus tap-to-sync.
- * - Style: ONE shared style for ALL lines — 50 fonts, outline,
- *   position and 50 animations. There is no per-line style by design:
- *   the controls are grouped under an "All lines" header so it reads
+ * - Style: ONE shared style for ALL lines — fonts and animations
+ *   in browse categories with search and per-project favorites
+ *   (Styles Redesign Stage 1), plus outline, position and the other
+ *   global controls. There is no per-line style by design: the
+ *   controls are grouped under an "All lines" header so it reads
  *   as global, and every change flows through the one resolved style
  *   into the preview overlay (all lines, immediately) and the export
  *   payload.
@@ -111,6 +126,180 @@ function isHexColor(value: string): boolean {
   return /^#[0-9a-fA-F]{6}$/.test(value.trim());
 }
 
+/** Favorites sort to the top of a list; catalog order is kept within each group. */
+function favoritesFirst<T extends { id: string }>(items: T[], favoriteIds: string[]): T[] {
+  return [...items].sort((a, b) => Number(favoriteIds.includes(b.id)) - Number(favoriteIds.includes(a.id)));
+}
+
+/** Horizontal category chips above a picker list (Styles Redesign Stage 1). */
+function CategoryChips<T extends string>({
+  categories,
+  value,
+  onChange,
+  label,
+}: {
+  categories: readonly T[];
+  value: 'All' | T;
+  onChange: (c: 'All' | T) => void;
+  label: string;
+}) {
+  return (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
+      <View style={styles.chipRow}>
+        {(['All', ...categories] as ('All' | T)[]).map((c) => {
+          const isCurrent = value === c;
+          return (
+            <Pressable
+              key={c}
+              onPress={() => onChange(c)}
+              accessibilityRole="button"
+              accessibilityState={{ selected: isCurrent }}
+              accessibilityLabel={`${label} category ${c}`}
+              style={[styles.categoryChip, isCurrent && styles.chipCurrent]}>
+              <Text style={[styles.categoryChipText, isCurrent && styles.categoryChipTextCurrent]}>{c}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    </ScrollView>
+  );
+}
+
+/** One picker chip: the label picks the style, the heart favorites it.
+ *  Two sibling Pressables (never nested) so a heart tap never also
+ *  picks the style. */
+function StylePickChip({
+  label,
+  labelStyle,
+  selected,
+  favorite,
+  onPick,
+  onToggleFavorite,
+  accessibilityLabel,
+}: {
+  label: string;
+  labelStyle: TextStyle;
+  selected: boolean;
+  favorite: boolean;
+  onPick: () => void;
+  onToggleFavorite: () => void;
+  accessibilityLabel: string;
+}) {
+  return (
+    <View style={[styles.pickChip, selected && styles.chipCurrent]}>
+      <Pressable
+        onPress={onPick}
+        accessibilityRole="button"
+        accessibilityState={{ selected }}
+        accessibilityLabel={accessibilityLabel}
+        style={styles.pickChipLabel}>
+        <Text style={labelStyle}>{label}</Text>
+      </Pressable>
+      <Pressable
+        onPress={onToggleFavorite}
+        accessibilityRole="button"
+        accessibilityState={{ selected: favorite }}
+        accessibilityLabel={`${favorite ? 'Unfavorite' : 'Favorite'} ${label}`}
+        hitSlop={6}
+        style={styles.pickChipHeart}>
+        <Ionicons
+          name={favorite ? 'heart' : 'heart-outline'}
+          size={14}
+          color={favorite ? colors.accent : colors.labelTertiary}
+        />
+      </Pressable>
+    </View>
+  );
+}
+
+/** A grouped section inside the Style tab (category header + wrapping chips). */
+function StyleSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <View style={styles.styleSection}>
+      <Text style={styles.sectionHeader}>{title}</Text>
+      {children}
+    </View>
+  );
+}
+
+function FontChips({
+  fonts,
+  currentId,
+  bold,
+  favoriteIds,
+  onPick,
+  onToggleFavorite,
+}: {
+  fonts: LyricFont[];
+  currentId: string;
+  bold: boolean;
+  favoriteIds: string[];
+  onPick: (id: string) => void;
+  onToggleFavorite: (id: string) => void;
+}) {
+  return (
+    <View style={styles.pickRow}>
+      {fonts.map((font) => {
+        const isCurrent = currentId === font.id;
+        return (
+          <StylePickChip
+            key={font.id}
+            label={font.displayName}
+            labelStyle={{
+              fontFamily: font.family,
+              fontWeight: bold && font.kind === 'system' ? '700' : '400',
+              fontSize: 15,
+              color: isCurrent ? colors.accent : colors.label,
+            }}
+            selected={isCurrent}
+            favorite={favoriteIds.includes(font.id)}
+            onPick={() => onPick(font.id)}
+            onToggleFavorite={() => onToggleFavorite(font.id)}
+            accessibilityLabel={`Font ${font.displayName}`}
+          />
+        );
+      })}
+    </View>
+  );
+}
+
+function AnimationChips({
+  animations,
+  currentId,
+  favoriteIds,
+  onPick,
+  onToggleFavorite,
+}: {
+  animations: LyricAnimation[];
+  currentId: string;
+  favoriteIds: string[];
+  onPick: (id: string) => void;
+  onToggleFavorite: (id: string) => void;
+}) {
+  return (
+    <View style={styles.pickRow}>
+      {animations.map((animation) => {
+        const isCurrent = currentId === animation.id;
+        return (
+          <StylePickChip
+            key={animation.id}
+            label={animation.name}
+            labelStyle={{
+              fontSize: 13,
+              color: isCurrent ? colors.accent : colors.label,
+            }}
+            selected={isCurrent}
+            favorite={favoriteIds.includes(animation.id)}
+            onPick={() => onPick(animation.id)}
+            onToggleFavorite={() => onToggleFavorite(animation.id)}
+            accessibilityLabel={`Animation ${animation.name}`}
+          />
+        );
+      })}
+    </View>
+  );
+}
+
 export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSeek, onPlay, onPause }: LyricsPanelProps) {
   const studio = useStudio();
   const { track, lyrics } = studio;
@@ -129,12 +318,40 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const [strokeDraft, setStrokeDraft] = useState<number | null>(null);
   const [nudgeDraft, setNudgeDraft] = useState<number | null>(null);
   const [hexDraft, setHexDraft] = useState('');
+  // Style tab: search + category filters (Styles Redesign Stage 1).
+  const [styleSearch, setStyleSearch] = useState('');
+  const [fontCategory, setFontCategory] = useState<'All' | LyricFontCategory>('All');
+  const [animationCategory, setAnimationCategory] = useState<'All' | LyricAnimationCategory>('All');
 
   const selectedIndex = lines.findIndex((l) => l.id === selectedId);
   const selected = selectedIndex >= 0 ? lines[selectedIndex] : null;
   const playheadSongFrame = Math.round(positionSeconds * DEFAULT_FPS) + regionStartFrame;
   const compSecondsOf = (songFrame: number) =>
     Math.max(0, framesToSeconds(songFrame - regionStartFrame, DEFAULT_FPS));
+
+  // ---- Style tab derived lists ---------------------------------------
+  // The stored ids resolve through the catalogs, so a project styled
+  // with an aliased animation still highlights its survivor.
+  const favoriteFontIds = lyrics?.favoriteFontIds ?? [];
+  const favoriteAnimationIds = lyrics?.favoriteAnimationIds ?? [];
+  const effectiveFontId = style ? lyricFontById(style.fontId).id : '';
+  const effectiveAnimationId = style ? lyricAnimationById(style.animationId).id : '';
+  const styleQuery = styleSearch.trim().toLowerCase();
+  const fontMatches = LYRIC_FONTS.filter(
+    (f) =>
+      (fontCategory === 'All' || f.category === fontCategory) &&
+      (styleQuery === '' || f.displayName.toLowerCase().includes(styleQuery)),
+  );
+  const animationMatches = PICKER_ANIMATIONS.filter(
+    (a) =>
+      (animationCategory === 'All' || a.category === animationCategory) &&
+      (styleQuery === '' || a.name.toLowerCase().includes(styleQuery)),
+  );
+  // Grouped sections only when browsing everything unfiltered.
+  const showFontGroups = fontCategory === 'All' && styleQuery === '';
+  const showAnimationGroups = animationCategory === 'All' && styleQuery === '';
+  const favoriteFonts = LYRIC_FONTS.filter((f) => favoriteFontIds.includes(f.id));
+  const favoriteAnimations = PICKER_ANIMATIONS.filter((a) => favoriteAnimationIds.includes(a.id));
 
   // ---- Detection -----------------------------------------------------
   const runDetect = () => {
@@ -505,33 +722,70 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                       once — watch the preview above change as you pick.
                     </Text>
 
+                    {/* Search — filters fonts and animations by name. */}
+                    <View style={styles.searchRow}>
+                      <Ionicons name="search" size={15} color={colors.labelTertiary} />
+                      <TextInput
+                        value={styleSearch}
+                        onChangeText={setStyleSearch}
+                        placeholder="Search fonts & animations"
+                        placeholderTextColor={colors.labelTertiary}
+                        autoCorrect={false}
+                        style={styles.searchInput}
+                        accessibilityLabel="Search fonts and animations"
+                        clearButtonMode="while-editing"
+                      />
+                    </View>
+
                     <Text style={styles.fieldLabel}>Font</Text>
-                    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
-                      <View style={styles.chipRow}>
-                        {LYRIC_FONTS.map((font) => {
-                          const isCurrent = style.fontId === font.id;
-                          return (
-                            <Pressable
-                              key={font.id}
-                              onPress={() => studio.setLyricStyle({ fontId: font.id })}
-                              accessibilityRole="button"
-                              accessibilityState={{ selected: isCurrent }}
-                              accessibilityLabel={`Font ${font.displayName}`}
-                              style={[styles.fontChip, isCurrent && styles.chipCurrent]}>
-                              <Text
-                                style={{
-                                  fontFamily: font.family,
-                                  fontWeight: style.bold && font.kind === 'system' ? '700' : '400',
-                                  fontSize: 15,
-                                  color: isCurrent ? colors.accent : colors.label,
-                                }}>
-                                {font.displayName}
-                              </Text>
-                            </Pressable>
-                          );
-                        })}
-                      </View>
-                    </ScrollView>
+                    <CategoryChips
+                      categories={LYRIC_FONT_CATEGORIES}
+                      value={fontCategory}
+                      onChange={setFontCategory}
+                      label="Font"
+                    />
+                    {showFontGroups ? (
+                      <>
+                        {favoriteFonts.length > 0 ? (
+                          <StyleSection title="★ Favorites">
+                            <FontChips
+                              fonts={favoriteFonts}
+                              currentId={effectiveFontId}
+                              bold={style.bold}
+                              favoriteIds={favoriteFontIds}
+                              onPick={(id) => studio.setLyricStyle({ fontId: id })}
+                              onToggleFavorite={(id) => studio.toggleFavoriteLyricFont(id)}
+                            />
+                          </StyleSection>
+                        ) : null}
+                        {LYRIC_FONT_CATEGORIES.map((category) => (
+                          <StyleSection key={category} title={category}>
+                            <FontChips
+                              fonts={favoritesFirst(
+                                LYRIC_FONTS.filter((f) => f.category === category),
+                                favoriteFontIds,
+                              )}
+                              currentId={effectiveFontId}
+                              bold={style.bold}
+                              favoriteIds={favoriteFontIds}
+                              onPick={(id) => studio.setLyricStyle({ fontId: id })}
+                              onToggleFavorite={(id) => studio.toggleFavoriteLyricFont(id)}
+                            />
+                          </StyleSection>
+                        ))}
+                      </>
+                    ) : fontMatches.length === 0 ? (
+                      <Text style={styles.caption}>No fonts match “{styleSearch.trim()}”.</Text>
+                    ) : (
+                      <FontChips
+                        fonts={favoritesFirst(fontMatches, favoriteFontIds)}
+                        currentId={effectiveFontId}
+                        bold={style.bold}
+                        favoriteIds={favoriteFontIds}
+                        onPick={(id) => studio.setLyricStyle({ fontId: id })}
+                        onToggleFavorite={(id) => studio.toggleFavoriteLyricFont(id)}
+                      />
+                    )}
 
                     <Text style={styles.fieldLabel}>Text</Text>
                     <View style={styles.sliderLabelRow}>
@@ -731,24 +985,51 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                     </Text>
 
                     <Text style={styles.fieldLabel}>Animation</Text>
-                    <View style={styles.animationGrid}>
-                      {LYRIC_ANIMATIONS.map((animation) => {
-                        const isCurrent = style.animationId === animation.id;
-                        return (
-                          <Pressable
-                            key={animation.id}
-                            onPress={() => previewAnimation(animation.id)}
-                            accessibilityRole="button"
-                            accessibilityState={{ selected: isCurrent }}
-                            accessibilityLabel={`Animation ${animation.name}`}
-                            style={[styles.animationChip, isCurrent && styles.chipCurrent]}>
-                            <Text style={[styles.animationChipText, isCurrent && styles.animationChipTextCurrent]}>
-                              {animation.name}
-                            </Text>
-                          </Pressable>
-                        );
-                      })}
-                    </View>
+                    <CategoryChips
+                      categories={LYRIC_ANIMATION_CATEGORIES}
+                      value={animationCategory}
+                      onChange={setAnimationCategory}
+                      label="Animation"
+                    />
+                    {showAnimationGroups ? (
+                      <>
+                        {favoriteAnimations.length > 0 ? (
+                          <StyleSection title="★ Favorites">
+                            <AnimationChips
+                              animations={favoriteAnimations}
+                              currentId={effectiveAnimationId}
+                              favoriteIds={favoriteAnimationIds}
+                              onPick={previewAnimation}
+                              onToggleFavorite={(id) => studio.toggleFavoriteLyricAnimation(id)}
+                            />
+                          </StyleSection>
+                        ) : null}
+                        {LYRIC_ANIMATION_CATEGORIES.map((category) => (
+                          <StyleSection key={category} title={category}>
+                            <AnimationChips
+                              animations={favoritesFirst(
+                                PICKER_ANIMATIONS.filter((a) => a.category === category),
+                                favoriteAnimationIds,
+                              )}
+                              currentId={effectiveAnimationId}
+                              favoriteIds={favoriteAnimationIds}
+                              onPick={previewAnimation}
+                              onToggleFavorite={(id) => studio.toggleFavoriteLyricAnimation(id)}
+                            />
+                          </StyleSection>
+                        ))}
+                      </>
+                    ) : animationMatches.length === 0 ? (
+                      <Text style={styles.caption}>No animations match “{styleSearch.trim()}”.</Text>
+                    ) : (
+                      <AnimationChips
+                        animations={favoritesFirst(animationMatches, favoriteAnimationIds)}
+                        currentId={effectiveAnimationId}
+                        favoriteIds={favoriteAnimationIds}
+                        onPick={previewAnimation}
+                        onToggleFavorite={(id) => studio.toggleFavoriteLyricAnimation(id)}
+                      />
+                    )}
                     <Text style={styles.caption}>
                       Tap an animation to preview it on the current line in the player above.
                     </Text>
@@ -1060,17 +1341,47 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     alignItems: 'center',
   },
-  fontChip: {
+  chipCurrent: { borderColor: colors.accent, borderWidth: 2, backgroundColor: colors.accentDim },
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.elevated,
+    borderRadius: radius.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  searchInput: { flex: 1, ...typeScale.subhead, color: colors.label },
+  categoryChip: {
     backgroundColor: colors.card,
     borderWidth: 1,
     borderColor: colors.separator,
     borderRadius: radius.pill,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  chipCurrent: { borderColor: colors.accent, borderWidth: 2, backgroundColor: colors.accentDim },
+  categoryChipText: { ...typeScale.caption, color: colors.label },
+  categoryChipTextCurrent: { color: colors.accent },
+  styleSection: { gap: spacing.xs },
+  sectionHeader: { ...typeScale.subhead, color: colors.label, fontWeight: '600', marginTop: spacing.xs },
+  pickRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
+  // One picker chip: label button + heart button side by side in a
+  // pill, so a heart tap never also picks the style.
+  pickChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.separator,
+    borderRadius: radius.pill,
+    paddingLeft: 12,
+    paddingRight: 6,
+    paddingVertical: 5,
+  },
+  pickChipLabel: { paddingVertical: 3, paddingRight: 4 },
+  pickChipHeart: { padding: 4 },
   swatchRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
   swatch: {
     width: 34,
@@ -1094,15 +1405,4 @@ const styles = StyleSheet.create({
   },
   hexApply: { backgroundColor: colors.card, borderRadius: radius.sm, paddingHorizontal: 14, paddingVertical: 9 },
   hexApplyText: { ...typeScale.subhead, color: colors.label, fontWeight: '600' },
-  animationGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
-  animationChip: {
-    backgroundColor: colors.card,
-    borderWidth: 1,
-    borderColor: colors.separator,
-    borderRadius: radius.pill,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  animationChipText: { ...typeScale.caption, color: colors.label },
-  animationChipTextCurrent: { color: colors.accent },
 });

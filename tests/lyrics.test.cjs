@@ -745,3 +745,131 @@ test('composite lyric line keys match the Swift LyricLineRecord fields', () => {
   }
   assert.deepEqual(Object.keys(payload).sort(), swiftRecordFields('LyricsRecord'));
 });
+
+// ── Style catalog contract (Styles Redesign Stage 1) ─────────────
+// Fonts and animations carry exactly one browse category each, and
+// near-duplicate animations are hidden from the picker behind an
+// alias map — but a project that stored the old id must still
+// render, as the survivor.
+const {
+  LYRIC_ANIMATIONS,
+  LYRIC_ANIMATION_ALIASES,
+  LYRIC_ANIMATION_CATEGORIES,
+  PICKER_ANIMATIONS,
+  lyricAnimationById,
+  resolveAnimationParams,
+} = require('./.build-lyrics/src/lib/lyricAnimations.js');
+const {
+  LYRIC_FONTS,
+  LYRIC_FONT_CATEGORIES,
+  lyricFontById,
+} = require('./.build-lyrics/src/lib/lyricFonts.js');
+
+test('catalog: 50 fonts, each in exactly one of the 6 font categories', () => {
+  assert.equal(LYRIC_FONTS.length, 50);
+  assert.equal(new Set(LYRIC_FONTS.map((f) => f.id)).size, 50);
+  for (const font of LYRIC_FONTS) {
+    assert.ok(
+      LYRIC_FONT_CATEGORIES.includes(font.category),
+      `${font.id} has no valid category`,
+    );
+  }
+  const counts = {};
+  for (const f of LYRIC_FONTS) counts[f.category] = (counts[f.category] ?? 0) + 1;
+  assert.deepEqual(counts, {
+    'Clean Sans': 13,
+    'Serif & Elegant': 12,
+    'Handwritten & Playful': 12,
+    'Display & Impact': 7,
+    'Typewriter & Mono': 3,
+    Script: 3,
+  });
+});
+
+test('catalog: 50 animations, each in exactly one of the 6 animation categories', () => {
+  assert.equal(LYRIC_ANIMATIONS.length, 50);
+  assert.equal(new Set(LYRIC_ANIMATIONS.map((a) => a.id)).size, 50);
+  for (const a of LYRIC_ANIMATIONS) {
+    assert.ok(
+      LYRIC_ANIMATION_CATEGORIES.includes(a.category),
+      `${a.id} has no valid category`,
+    );
+  }
+});
+
+test('catalog: every animation alias points at a real survivor, never at another alias', () => {
+  for (const [alias, target] of Object.entries(LYRIC_ANIMATION_ALIASES)) {
+    assert.ok(
+      LYRIC_ANIMATIONS.some((a) => a.id === alias),
+      `alias source ${alias} is not a catalog id`,
+    );
+    assert.ok(
+      LYRIC_ANIMATIONS.some((a) => a.id === target),
+      `alias target ${target} is not a catalog id`,
+    );
+    assert.ok(!(target in LYRIC_ANIMATION_ALIASES), `alias ${alias} chains to ${target}`);
+    assert.notEqual(alias, target);
+  }
+});
+
+test('catalog: the picker shows 34 animations — every survivor, no alias', () => {
+  assert.equal(
+    PICKER_ANIMATIONS.length,
+    LYRIC_ANIMATIONS.length - Object.keys(LYRIC_ANIMATION_ALIASES).length,
+  );
+  const pickerIds = new Set(PICKER_ANIMATIONS.map((a) => a.id));
+  for (const alias of Object.keys(LYRIC_ANIMATION_ALIASES)) {
+    assert.ok(!pickerIds.has(alias), `picker still shows aliased ${alias}`);
+  }
+  for (const a of LYRIC_ANIMATIONS) {
+    if (!(a.id in LYRIC_ANIMATION_ALIASES)) assert.ok(pickerIds.has(a.id), `picker hides survivor ${a.id}`);
+  }
+});
+
+test('catalog: an aliased animation id resolves to its survivor', () => {
+  const cases = {
+    'soft-rise': 'rise',
+    'float-up': 'float',
+    'slide-fade-left': 'slide-left',
+    'slide-fade-right': 'slide-right',
+    'swing-left': 'swing',
+    'swing-right': 'swing',
+    'zoom-far': 'zoom',
+    'impact-soft': 'impact',
+    'shrink-out': 'zoom',
+    'karaoke-rise': 'karaoke',
+    'highlight-sweep': 'karaoke',
+    'typewriter-fast': 'typewriter',
+    'word-drop': 'word-rise',
+    'cascade-down': 'cascade',
+    'fade-slow': 'fade',
+    'glow-pulse': 'pulse',
+  };
+  assert.equal(Object.keys(cases).length, Object.keys(LYRIC_ANIMATION_ALIASES).length);
+  for (const [alias, survivor] of Object.entries(cases)) {
+    assert.equal(lyricAnimationById(alias).id, survivor, `${alias} should resolve to ${survivor}`);
+    assert.deepEqual(resolveAnimationParams(alias), resolveAnimationParams(survivor));
+  }
+  // Unknown ids still fall back to the default preset.
+  assert.equal(lyricAnimationById('not-a-preset').id, 'karaoke');
+});
+
+test('catalog: aliased ids still render through the composite payload', () => {
+  const payload = buildCompositeLyrics(
+    payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }], { animationId: 'soft-rise' }),
+    0,
+    FPS,
+  );
+  assert.equal(payload.style.animation.enterSecs, 0.4); // rise's params, not soft-rise's
+  assert.equal(payload.style.animation.wordMode, 'none');
+  const glow = buildCompositeLyrics(
+    payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }], { animationId: 'glow-pulse' }),
+    0,
+    FPS,
+  );
+  assert.equal(glow.style.animation.emphasisScale, 1.08); // pulse's params
+});
+
+test('catalog: unknown font ids fall back to the default font', () => {
+  assert.equal(lyricFontById('not-a-font').id, 'avenir-next');
+});

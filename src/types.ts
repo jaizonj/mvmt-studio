@@ -286,6 +286,14 @@ export interface ProjectLyrics {
   lines: LyricLine[];
   style: LyricStyle;
   /**
+   * Style-tab favorites (Styles Redesign Stage 1): font / animation
+   * ids hearted in the picker. Persisted with the project (and its
+   * song-library copy) so they survive restarts; favorites sort to
+   * the top of their lists. Undefined = none.
+   */
+  favoriteFontIds?: string[];
+  favoriteAnimationIds?: string[];
+  /**
    * Global fine offset, in song-timeline frames, applied to EVERY
    * line (and word) when the lyrics are rendered — the Lyrics
    * panel's drag bar (Jaizon, 2026-11-11: "if they seem off by half

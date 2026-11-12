@@ -177,6 +177,10 @@ interface StudioState {
   addLyricLine: (line: LyricLine) => void;
   deleteLyricLine: (lineId: string) => void;
   setLyricStyle: (patch: Partial<LyricStyle>) => void;
+  /** Heart/unheart a font in the Style tab picker (per-project favorite). */
+  toggleFavoriteLyricFont: (fontId: string) => void;
+  /** Heart/unheart an animation in the Style tab picker (per-project favorite). */
+  toggleFavoriteLyricAnimation: (animationId: string) => void;
   /** Shift every line (and its words) by a frame delta. */
   shiftAllLyrics: (frames: number) => void;
   /** The active lyrics' fine offset in frames (0 when unset) — the
@@ -611,6 +615,35 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchLyrics],
   );
 
+  /** Toggle one id in a favorites list (add if absent, remove if present). */
+  const toggleFavoriteLyricFont = useCallback(
+    (fontId: string) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      const favs = current.favoriteFontIds ?? [];
+      patchLyrics({
+        ...current,
+        favoriteFontIds: favs.includes(fontId) ? favs.filter((f) => f !== fontId) : [...favs, fontId],
+      });
+    },
+    [patchLyrics],
+  );
+
+  const toggleFavoriteLyricAnimation = useCallback(
+    (animationId: string) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      const favs = current.favoriteAnimationIds ?? [];
+      patchLyrics({
+        ...current,
+        favoriteAnimationIds: favs.includes(animationId)
+          ? favs.filter((f) => f !== animationId)
+          : [...favs, animationId],
+      });
+    },
+    [patchLyrics],
+  );
+
   // ---- Lyric fine offset + song library ----
   const lyricsOffsetFrames = activeProject?.lyrics?.offsetFrames ?? 0;
 
@@ -750,6 +783,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       addLyricLine,
       deleteLyricLine,
       setLyricStyle,
+      toggleFavoriteLyricFont,
+      toggleFavoriteLyricAnimation,
       shiftAllLyrics,
       lyricsOffsetFrames,
       setLyricsOffset,
@@ -834,6 +869,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       addLyricLine,
       deleteLyricLine,
       setLyricStyle,
+      toggleFavoriteLyricFont,
+      toggleFavoriteLyricAnimation,
       shiftAllLyrics,
       lyricsOffsetFrames,
       setLyricsOffset,

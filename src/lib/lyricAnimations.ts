@@ -48,6 +48,24 @@
  */
 export type LyricWordMode = 'none' | 'stagger' | 'karaoke' | 'typewriter';
 
+/** Browse categories for the Style tab picker (docs/STYLES-REDESIGN.md §1). */
+export type LyricAnimationCategory =
+  | 'Entrances'
+  | 'Word by Word'
+  | 'Karaoke & Highlight'
+  | 'Big Impact'
+  | 'Soft & Cinematic'
+  | 'Playful & Glitch';
+
+export const LYRIC_ANIMATION_CATEGORIES: LyricAnimationCategory[] = [
+  'Entrances',
+  'Word by Word',
+  'Karaoke & Highlight',
+  'Big Impact',
+  'Soft & Cinematic',
+  'Playful & Glitch',
+];
+
 export interface LyricAnimationParams {
   enterSecs: number;
   exitSecs: number;
@@ -69,6 +87,8 @@ export interface LyricAnimationParams {
 export interface LyricAnimation extends LyricAnimationParams {
   id: string;
   name: string;
+  /** Browse category for the Style tab picker. */
+  category: LyricAnimationCategory;
 }
 
 const base: LyricAnimationParams = {
@@ -84,102 +104,151 @@ const base: LyricAnimationParams = {
   emphasisScale: 1,
 };
 
-function preset(id: string, name: string, overrides: Partial<LyricAnimationParams>): LyricAnimation {
-  return { id, name, ...base, ...overrides };
+function preset(
+  id: string,
+  name: string,
+  category: LyricAnimationCategory,
+  overrides: Partial<LyricAnimationParams>,
+): LyricAnimation {
+  return { id, name, category, ...base, ...overrides };
 }
 
 export const LYRIC_ANIMATIONS: LyricAnimation[] = [
-  preset('static', 'Static', { enterSecs: 0, exitSecs: 0 }),
-  preset('fade', 'Fade', { enterSecs: 0.35, fromOpacity: 0 }),
-  preset('rise', 'Rise', { enterSecs: 0.4, fromOpacity: 0, fromYOffsetFrac: 0.8 }),
-  preset('drop', 'Drop', { enterSecs: 0.4, fromOpacity: 0, fromYOffsetFrac: -0.8 }),
-  preset('slide-left', 'Slide In Left', { enterSecs: 0.45, fromOpacity: 0, fromXOffsetFrac: -1.2 }),
-  preset('slide-right', 'Slide In Right', { enterSecs: 0.45, fromOpacity: 0, fromXOffsetFrac: 1.2 }),
-  preset('pop', 'Pop', { enterSecs: 0.25, exitSecs: 0.2, fromOpacity: 0, fromScale: 0.5, emphasisScale: 1.05 }),
-  preset('bounce', 'Bounce', { enterSecs: 0.6, fromOpacity: 0, fromScale: 0.3, fromYOffsetFrac: 0.3 }),
-  preset('zoom', 'Zoom', { enterSecs: 0.5, exitSecs: 0.4, fromOpacity: 0, fromScale: 1.6 }),
+  preset('static', 'Static', 'Entrances', { enterSecs: 0, exitSecs: 0 }),
+  preset('fade', 'Fade', 'Entrances', { enterSecs: 0.35, fromOpacity: 0 }),
+  preset('rise', 'Rise', 'Entrances', { enterSecs: 0.4, fromOpacity: 0, fromYOffsetFrac: 0.8 }),
+  preset('drop', 'Drop', 'Entrances', { enterSecs: 0.4, fromOpacity: 0, fromYOffsetFrac: -0.8 }),
+  preset('slide-left', 'Slide In Left', 'Entrances', { enterSecs: 0.45, fromOpacity: 0, fromXOffsetFrac: -1.2 }),
+  preset('slide-right', 'Slide In Right', 'Entrances', { enterSecs: 0.45, fromOpacity: 0, fromXOffsetFrac: 1.2 }),
+  preset('pop', 'Pop', 'Entrances', { enterSecs: 0.25, exitSecs: 0.2, fromOpacity: 0, fromScale: 0.5, emphasisScale: 1.05 }),
+  preset('bounce', 'Bounce', 'Playful & Glitch', { enterSecs: 0.6, fromOpacity: 0, fromScale: 0.3, fromYOffsetFrac: 0.3 }),
+  preset('zoom', 'Zoom', 'Big Impact', { enterSecs: 0.5, exitSecs: 0.4, fromOpacity: 0, fromScale: 1.6 }),
   // Blur In — approximated via opacity + overscale settle (see header).
-  preset('blur-in', 'Blur In', { enterSecs: 0.55, fromOpacity: 0, fromScale: 1.12 }),
+  preset('blur-in', 'Blur In', 'Entrances', { enterSecs: 0.55, fromOpacity: 0, fromScale: 1.12 }),
   // Flip — 2D rotation + scale stand in for the 3D flip.
-  preset('flip', 'Flip', { enterSecs: 0.45, fromOpacity: 0, fromScale: 0.2, fromRotateDeg: -18 }),
-  preset('spin', 'Spin', { enterSecs: 0.5, fromOpacity: 0, fromScale: 0.4, fromRotateDeg: 160 }),
+  preset('flip', 'Flip', 'Entrances', { enterSecs: 0.45, fromOpacity: 0, fromScale: 0.2, fromRotateDeg: -18 }),
+  preset('spin', 'Spin', 'Big Impact', { enterSecs: 0.5, fromOpacity: 0, fromScale: 0.4, fromRotateDeg: 160 }),
   // Shake — rotation offset enter + emphasis pulse carry it.
-  preset('shake', 'Shake', { enterSecs: 0.3, fromXOffsetFrac: 0.06, fromRotateDeg: 5, emphasisScale: 1.04 }),
-  preset('pulse', 'Pulse', { enterSecs: 0.3, fromOpacity: 0, emphasisScale: 1.08 }),
+  preset('shake', 'Shake', 'Playful & Glitch', { enterSecs: 0.3, fromXOffsetFrac: 0.06, fromRotateDeg: 5, emphasisScale: 1.04 }),
+  preset('pulse', 'Pulse', 'Playful & Glitch', { enterSecs: 0.3, fromOpacity: 0, emphasisScale: 1.08 }),
   // Glow Pulse — emphasis pulse stands in for the glow swell.
-  preset('glow-pulse', 'Glow Pulse', { enterSecs: 0.4, fromOpacity: 0, emphasisScale: 1.05 }),
-  preset('typewriter', 'Typewriter', { wordMode: 'typewriter', enterSecs: 0, exitSecs: 0.25, fromOpacity: 0 }),
-  preset('karaoke', 'Karaoke', { wordMode: 'karaoke', enterSecs: 0.25, fromOpacity: 0, emphasisScale: 1.18 }),
-  preset('word-pop', 'Word Pop', { wordMode: 'stagger', enterSecs: 0.22, fromOpacity: 0, fromScale: 0.4, wordStaggerSecs: 0.09, emphasisScale: 1.1 }),
-  preset('word-rise', 'Word Rise', { wordMode: 'stagger', enterSecs: 0.3, fromOpacity: 0, fromYOffsetFrac: 0.7, wordStaggerSecs: 0.08 }),
-  preset('word-fade', 'Word Fade', { wordMode: 'stagger', enterSecs: 0.35, fromOpacity: 0, wordStaggerSecs: 0.07 }),
-  preset('highlight-sweep', 'Highlight Sweep', { wordMode: 'karaoke', enterSecs: 0.2, fromOpacity: 0, emphasisScale: 1 }),
-  preset('cascade', 'Cascade', { wordMode: 'stagger', enterSecs: 0.4, fromOpacity: 0, fromYOffsetFrac: 1, wordStaggerSecs: 0.14 }),
-  preset('wave', 'Wave', { wordMode: 'stagger', enterSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 0.45, fromRotateDeg: 6, wordStaggerSecs: 0.06 }),
-  preset('swing', 'Swing', { enterSecs: 0.55, fromOpacity: 0, fromYOffsetFrac: -0.4, fromRotateDeg: -14 }),
+  preset('glow-pulse', 'Glow Pulse', 'Playful & Glitch', { enterSecs: 0.4, fromOpacity: 0, emphasisScale: 1.05 }),
+  preset('typewriter', 'Typewriter', 'Word by Word', { wordMode: 'typewriter', enterSecs: 0, exitSecs: 0.25, fromOpacity: 0 }),
+  preset('karaoke', 'Karaoke', 'Karaoke & Highlight', { wordMode: 'karaoke', enterSecs: 0.25, fromOpacity: 0, emphasisScale: 1.18 }),
+  preset('word-pop', 'Word Pop', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.22, fromOpacity: 0, fromScale: 0.4, wordStaggerSecs: 0.09, emphasisScale: 1.1 }),
+  preset('word-rise', 'Word Rise', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.3, fromOpacity: 0, fromYOffsetFrac: 0.7, wordStaggerSecs: 0.08 }),
+  preset('word-fade', 'Word Fade', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.35, fromOpacity: 0, wordStaggerSecs: 0.07 }),
+  preset('highlight-sweep', 'Highlight Sweep', 'Karaoke & Highlight', { wordMode: 'karaoke', enterSecs: 0.2, fromOpacity: 0, emphasisScale: 1 }),
+  preset('cascade', 'Cascade', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.4, fromOpacity: 0, fromYOffsetFrac: 1, wordStaggerSecs: 0.14 }),
+  preset('wave', 'Wave', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 0.45, fromRotateDeg: 6, wordStaggerSecs: 0.06 }),
+  preset('swing', 'Swing', 'Playful & Glitch', { enterSecs: 0.55, fromOpacity: 0, fromYOffsetFrac: -0.4, fromRotateDeg: -14 }),
   // Expand — scale-in stands in for letter-spacing expansion.
-  preset('expand', 'Expand', { enterSecs: 0.5, fromOpacity: 0, fromScale: 0.6 }),
+  preset('expand', 'Expand', 'Entrances', { enterSecs: 0.5, fromOpacity: 0, fromScale: 0.6 }),
   // Jitter — tiny offsets + fast emphasis pulse read as jitter.
-  preset('jitter', 'Jitter', { enterSecs: 0.18, fromXOffsetFrac: 0.03, fromYOffsetFrac: 0.05, fromRotateDeg: 2, emphasisScale: 1.03 }),
+  preset('jitter', 'Jitter', 'Playful & Glitch', { enterSecs: 0.18, fromXOffsetFrac: 0.03, fromYOffsetFrac: 0.05, fromRotateDeg: 2, emphasisScale: 1.03 }),
   // Roll In — horizontal slide + 2D rotation.
-  preset('roll-in', 'Roll In', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: -1, fromRotateDeg: -24 }),
-  preset('soft-rise', 'Soft Rise', { enterSecs: 0.7, exitSecs: 0.5, fromOpacity: 0, fromYOffsetFrac: 0.35 }),
-  preset('impact', 'Impact', { enterSecs: 0.16, exitSecs: 0.2, fromOpacity: 0, fromScale: 2.4, emphasisScale: 1.02 }),
-  preset('float', 'Float', { enterSecs: 0.9, exitSecs: 0.6, fromOpacity: 0, fromYOffsetFrac: 0.5, emphasisScale: 1.02 }),
+  preset('roll-in', 'Roll In', 'Entrances', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: -1, fromRotateDeg: -24 }),
+  preset('soft-rise', 'Soft Rise', 'Soft & Cinematic', { enterSecs: 0.7, exitSecs: 0.5, fromOpacity: 0, fromYOffsetFrac: 0.35 }),
+  preset('impact', 'Impact', 'Big Impact', { enterSecs: 0.16, exitSecs: 0.2, fromOpacity: 0, fromScale: 2.4, emphasisScale: 1.02 }),
+  preset('float', 'Float', 'Soft & Cinematic', { enterSecs: 0.9, exitSecs: 0.6, fromOpacity: 0, fromYOffsetFrac: 0.5, emphasisScale: 1.02 }),
 
   // ---- Expansion set (50-preset pass) — same parametric model, new
   // motion characters: faster/slower timings, opposite directions,
   // scale direction flips, and word-mode interplay. ----
   // Rise's snappy sibling: half the travel, under half the time.
-  preset('rise-fast', 'Rise Fast', { enterSecs: 0.18, exitSecs: 0.15, fromOpacity: 0, fromYOffsetFrac: 0.6 }),
+  preset('rise-fast', 'Rise Fast', 'Entrances', { enterSecs: 0.18, exitSecs: 0.15, fromOpacity: 0, fromYOffsetFrac: 0.6 }),
   // Drop, but slamming: more travel than Drop, slight oversize, pulse.
-  preset('drop-heavy', 'Drop Heavy', { enterSecs: 0.22, fromOpacity: 0, fromYOffsetFrac: -1.4, fromScale: 1.15, emphasisScale: 1.06 }),
+  preset('drop-heavy', 'Drop Heavy', 'Big Impact', { enterSecs: 0.22, fromOpacity: 0, fromYOffsetFrac: -1.4, fromScale: 1.15, emphasisScale: 1.06 }),
   // Half-width drifts (Slide In travels a full line width; these glide).
-  preset('slide-fade-left', 'Slide Fade Left', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: -0.5 }),
-  preset('slide-fade-right', 'Slide Fade Right', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: 0.5 }),
+  preset('slide-fade-left', 'Slide Fade Left', 'Entrances', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: -0.5 }),
+  preset('slide-fade-right', 'Slide Fade Right', 'Entrances', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: 0.5 }),
   // Words rain in from above, quick stagger (Word Rise's mirror).
-  preset('word-drop', 'Word Drop', { wordMode: 'stagger', enterSecs: 0.28, fromOpacity: 0, fromYOffsetFrac: -0.9, wordStaggerSecs: 0.07 }),
+  preset('word-drop', 'Word Drop', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.28, fromOpacity: 0, fromYOffsetFrac: -0.9, wordStaggerSecs: 0.07 }),
   // Each word rotates 90° into place while scaling up.
-  preset('word-spin', 'Word Spin', { wordMode: 'stagger', enterSecs: 0.35, fromOpacity: 0, fromScale: 0.5, fromRotateDeg: 90, wordStaggerSecs: 0.08 }),
+  preset('word-spin', 'Word Spin', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.35, fromOpacity: 0, fromScale: 0.5, fromRotateDeg: 90, wordStaggerSecs: 0.08 }),
   // Karaoke with a bigger current-word pop than Karaoke (1.18 → 1.3).
-  preset('karaoke-pop', 'Karaoke Pop', { wordMode: 'karaoke', enterSecs: 0.15, fromOpacity: 0, emphasisScale: 1.3 }),
+  preset('karaoke-pop', 'Karaoke Pop', 'Karaoke & Highlight', { wordMode: 'karaoke', enterSecs: 0.15, fromOpacity: 0, emphasisScale: 1.3 }),
   // Typewriter with a fast cut out (0.12s exit vs 0.25s).
-  preset('typewriter-fast', 'Typewriter Fast', { wordMode: 'typewriter', enterSecs: 0, exitSecs: 0.12, fromOpacity: 0 }),
+  preset('typewriter-fast', 'Typewriter Fast', 'Word by Word', { wordMode: 'typewriter', enterSecs: 0, exitSecs: 0.12, fromOpacity: 0 }),
   // The slow cinematic zoom: starts 3.2× and settles over 0.7s
   // (Zoom is 1.6×/0.5s; Impact is 2.4× but slams in 0.16s).
-  preset('zoom-far', 'Zoom Far', { enterSecs: 0.7, exitSecs: 0.4, fromOpacity: 0, fromScale: 3.2 }),
+  preset('zoom-far', 'Zoom Far', 'Big Impact', { enterSecs: 0.7, exitSecs: 0.4, fromOpacity: 0, fromScale: 3.2 }),
   // Exit-led: pops in quick, then shrinks + fades away over 0.55s
   // (the exit replays the from-state, so it ends small and ghosted).
-  preset('shrink-out', 'Shrink Out', { enterSecs: 0.2, exitSecs: 0.55, fromOpacity: 0, fromScale: 0.85 }),
+  preset('shrink-out', 'Shrink Out', 'Entrances', { enterSecs: 0.2, exitSecs: 0.55, fromOpacity: 0, fromScale: 0.85 }),
   // Pendulum swings from each side (Swing hangs from centre-top).
-  preset('swing-left', 'Swing Left', { enterSecs: 0.6, fromOpacity: 0, fromXOffsetFrac: -0.4, fromYOffsetFrac: -0.3, fromRotateDeg: 18 }),
-  preset('swing-right', 'Swing Right', { enterSecs: 0.6, fromOpacity: 0, fromXOffsetFrac: 0.4, fromYOffsetFrac: -0.3, fromRotateDeg: -18 }),
+  preset('swing-left', 'Swing Left', 'Playful & Glitch', { enterSecs: 0.6, fromOpacity: 0, fromXOffsetFrac: -0.4, fromYOffsetFrac: -0.3, fromRotateDeg: 18 }),
+  preset('swing-right', 'Swing Right', 'Playful & Glitch', { enterSecs: 0.6, fromOpacity: 0, fromXOffsetFrac: 0.4, fromYOffsetFrac: -0.3, fromRotateDeg: -18 }),
   // Cascade's downward mirror: words fall in sequence from above.
-  preset('cascade-down', 'Cascade Down', { wordMode: 'stagger', enterSecs: 0.32, fromOpacity: 0, fromYOffsetFrac: -0.8, wordStaggerSecs: 0.12 }),
+  preset('cascade-down', 'Cascade Down', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.32, fromOpacity: 0, fromYOffsetFrac: -0.8, wordStaggerSecs: 0.12 }),
   // Impact at half strength: 1.5× settle over 0.35s instead of a slam.
-  preset('impact-soft', 'Impact Soft', { enterSecs: 0.35, exitSecs: 0.25, fromOpacity: 0, fromScale: 1.5, emphasisScale: 1.03 }),
+  preset('impact-soft', 'Impact Soft', 'Big Impact', { enterSecs: 0.35, exitSecs: 0.25, fromOpacity: 0, fromScale: 1.5, emphasisScale: 1.03 }),
   // Float Up: a full line-height of upward travel, quicker than Float,
   // with a stronger breathing pulse.
-  preset('float-up', 'Float Up', { enterSecs: 0.55, exitSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 1.1, emphasisScale: 1.05 }),
+  preset('float-up', 'Float Up', 'Soft & Cinematic', { enterSecs: 0.55, exitSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 1.1, emphasisScale: 1.05 }),
   // Roll In's mirror: rolls in from the right, opposite rotation.
-  preset('roll-down', 'Roll Down', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: 1, fromRotateDeg: 24 }),
+  preset('roll-down', 'Roll Down', 'Entrances', { enterSecs: 0.5, fromOpacity: 0, fromXOffsetFrac: 1, fromRotateDeg: 24 }),
   // Fade stretched to a slow cinematic crossfade (1.1s in, 0.9s out).
-  preset('fade-slow', 'Fade Slow', { enterSecs: 1.1, exitSecs: 0.9, fromOpacity: 0 }),
+  preset('fade-slow', 'Fade Slow', 'Entrances', { enterSecs: 1.1, exitSecs: 0.9, fromOpacity: 0 }),
   // Words shrink down from 1.8× one by one (Word Pop grows from 0.4×).
-  preset('word-zoom', 'Word Zoom', { wordMode: 'stagger', enterSecs: 0.3, fromOpacity: 0, fromScale: 1.8, wordStaggerSecs: 0.08 }),
+  preset('word-zoom', 'Word Zoom', 'Word by Word', { wordMode: 'stagger', enterSecs: 0.3, fromOpacity: 0, fromScale: 1.8, wordStaggerSecs: 0.08 }),
   // Karaoke, but the whole line also rises in as the words light up.
-  preset('karaoke-rise', 'Karaoke Rise', { wordMode: 'karaoke', enterSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 0.6, emphasisScale: 1.12 }),
+  preset('karaoke-rise', 'Karaoke Rise', 'Karaoke & Highlight', { wordMode: 'karaoke', enterSecs: 0.35, fromOpacity: 0, fromYOffsetFrac: 0.6, emphasisScale: 1.12 }),
   // A subtle skewed settle: slight rotation + near-full scale, no travel.
-  preset('tilt-in', 'Tilt In', { enterSecs: 0.45, fromOpacity: 0, fromScale: 0.9, fromRotateDeg: -8 }),
+  preset('tilt-in', 'Tilt In', 'Entrances', { enterSecs: 0.45, fromOpacity: 0, fromScale: 0.9, fromRotateDeg: -8 }),
 ];
 
 export const DEFAULT_ANIMATION_ID = 'karaoke';
 
+/**
+ * Dedupe aliases (Styles Redesign Stage 1, docs/STYLES-REDESIGN.md
+ * §1): near-duplicate presets are hidden from the picker but their
+ * ids KEEP resolving — projects store animationId, so an old id
+ * must still render, as its survivor. Never delete a catalog id;
+ * alias it here instead.
+ */
+export const LYRIC_ANIMATION_ALIASES: Record<string, string> = {
+  // Rise family → keep rise, rise-fast, float.
+  'soft-rise': 'rise',
+  'float-up': 'float',
+  // Slide family → keep the two full slides.
+  'slide-fade-left': 'slide-left',
+  'slide-fade-right': 'slide-right',
+  // Swing family → keep swing.
+  'swing-left': 'swing',
+  'swing-right': 'swing',
+  // Zoom/Impact family → keep zoom, impact.
+  'zoom-far': 'zoom',
+  'impact-soft': 'impact',
+  'shrink-out': 'zoom',
+  // Karaoke family → keep karaoke, karaoke-pop.
+  'karaoke-rise': 'karaoke',
+  'highlight-sweep': 'karaoke',
+  // Typewriter pair → keep typewriter.
+  'typewriter-fast': 'typewriter',
+  // Word-rise mirrors → keep word-rise, cascade.
+  'word-drop': 'word-rise',
+  'cascade-down': 'cascade',
+  // Fade pair → keep fade.
+  'fade-slow': 'fade',
+  // Glow Pulse has no real glow in this model — keep pulse.
+  'glow-pulse': 'pulse',
+};
+
+/** The presets the picker shows: every catalog entry except aliases. */
+export const PICKER_ANIMATIONS: LyricAnimation[] = LYRIC_ANIMATIONS.filter(
+  (a) => !(a.id in LYRIC_ANIMATION_ALIASES),
+);
+
 const byId = new Map(LYRIC_ANIMATIONS.map((a) => [a.id, a]));
 
-/** Catalog lookup; unknown ids fall back to the default preset. */
+/**
+ * Catalog lookup; an aliased id resolves to its survivor, and an
+ * unknown id falls back to the default preset.
+ */
 export function lyricAnimationById(id: string): LyricAnimation {
-  return byId.get(id) ?? byId.get(DEFAULT_ANIMATION_ID)!;
+  const resolvedId = LYRIC_ANIMATION_ALIASES[id] ?? id;
+  return byId.get(resolvedId) ?? byId.get(DEFAULT_ANIMATION_ID)!;
 }
 
 /** The plain parameter object the composite request carries. */
