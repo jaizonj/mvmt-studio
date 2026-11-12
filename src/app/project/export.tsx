@@ -24,7 +24,6 @@ import {
   edlToCompositeRequest,
   edlWithTakeCanvas,
   secondsToFrames,
-  validateAgainstAssets,
   validateEdl,
   type AssetMeasure,
   type Edl,
@@ -38,14 +37,15 @@ import { useEqSongUri } from '../../lib/autoEq';
 import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { saveToPhotoLibrary, shareFile } from '../../lib/media';
+import { validateAgainstAssets } from '../../lib/shuffleEdl';
 import { resolveWatermarkUri } from '../../lib/watermark';
 import { useStudio } from '../../store/StudioContext';
 import type { ExportQualityPref } from '../../types';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
 /**
- * Export — the finishing stage of the workspace (Record → Editor →
- * Export), rebuilt on the canonical EDL + native engine v2
+ * Export — the finishing stage of the workspace (Record → Takes →
+ * Editor → Export), rebuilt on the canonical EDL + native engine v2
  * (docs/DESIGN_SYSTEM.md §3.6). This is a deliberate final production
  * step: one final preview, one quality choice, one render — then the
  * MEASURED result, presented as the completion of the project.
@@ -462,7 +462,7 @@ export default function ExportScreen() {
             <Ionicons name="alert-circle-outline" size={30} color={colors.labelSecondary} />
             <Text style={styles.emptyTitle}>This cut can&apos;t be exported</Text>
             <Text style={styles.emptyBody}>
-              Every cut in it points at a take that&apos;s no longer there. Rebuild it in the Editor.
+              Every cut in it points at a take that&apos;s no longer there. Re-shuffle in the Editor to rebuild it.
             </Text>
             <Pressable
               style={styles.primaryButton}

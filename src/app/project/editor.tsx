@@ -1,10 +1,13 @@
 import { Ionicons } from '@expo/vector-icons';
 import { Image } from 'expo-image';
+import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Easing,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -21,17 +24,17 @@ import { LyricsPanel } from '../../components/LyricsPanel';
 import { NativePreview, type NativePreviewHandle } from '../../components/NativePreview';
 import { useLyricFonts } from '../../components/useLyricFonts';
 import { WatermarkOverlay } from '../../components/WatermarkOverlay';
+import { SegmentedControl } from '../../components/SegmentedControl';
 import {
   TimelineStrip,
   type TimelineStripClip,
   type TimelineTrimDragEvent,
 } from '../../components/TimelineStrip';
-import { effectiveRegion } from '../../lib/analysis';
+import { effectiveRegion, estimateTakeEnergies } from '../../lib/analysis';
 import { useEqSongUri } from '../../lib/autoEq';
 import { inspectAsset, isCompositorAvailable, type PreviewStatus } from '../../lib/compositor';
 import {
   DEFAULT_FPS,
-  buildEdlChronological,
   edlDurationSeconds,
   canvasForTakes,
   edlToCompositeRequest,
@@ -41,7 +44,6 @@ import {
   secondsToFrames,
   sourceFrameForTimelineFrame,
   takeSyncOffsetSeconds,
-  validateAgainstAssets,
   validateEdl,
   type AssetMeasure,
   type Edl,
@@ -50,8 +52,9 @@ import {
 import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
+import { buildEdlFromShuffle, validateAgainstAssets } from '../../lib/shuffleEdl';
 import { useStudio } from '../../store/StudioContext';
-import type { Take } from '../../types';
+import type { ShuffleFrequency, Take } from '../../types';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
 
 /**
@@ -60,26 +63,29 @@ import { colors, formatTime, radius, spacing, type as typeScale } from '../../th
  * One screen, ONE timeline: the canonical frame-based EDL
  * (src/lib/edl.ts). The timeline is directly
  * interactive by default — tap a cut to select it, swap its take from
- * the chips below, drag its ends to trim. Every
+ * the chips below, drag its ends to trim; the shuffle (the
+ * shuffle→EDL bridge) lives in its own section underneath. Every
  * mutation flows through `commitEdl`, which re-anchors (see the sync
  * invariant there), validates against measured asset durations and
- * records an undo snapshot. When the project has no edit yet, the
- * EDL is built chronologically on open — takes in recording order,
- * each at full length, laid end-to-end and clipped to the song
- * region (buildEdlChronological in src/lib/edl.ts); the Shuffle /
- * auto-edit that used to build it was removed 2026-11-12 (Jaizon:
- * "auto edit is out").
+ * records an undo snapshot.
  *
- * Layout: a FIXED header, then ONE vertical ScrollView
- * holding the preview, transport, timeline, selected-cut panel,
- * watermark, look and lyrics panels — every control is reachable by
- * scrolling on any iPhone (the previous fixed-flex layout clipped
- * the lower panels on real devices).
+ * Layout (Edit mode): a FIXED header, then ONE vertical ScrollView
+ * holding the preview, transport, timeline, selected-cut panel and
+ * shuffle section — every control is reachable by scrolling on any
+ * iPhone (the previous fixed-flex layout clipped the lower panels on
+ * real devices).
+ *
+ * 2026-11-09 (Jaizon): the screen has two faces over the same logic.
+ * It OPENS on a clean shuffle landing — a preview of the
+ * already-shuffled cut plus Reshuffle / Edit / Continue and nothing
+ * else (auto-shuffling on open when no edit exists yet) — and the
+ * editing layout above is Edit mode, one tap deeper. The watermark
+ * toggle sits at the bottom of Edit mode's scroll content.
  *
  * Preview is the native composition (NativePreview) built from the
  * SAME edlToCompositeRequest the exporter consumes — what plays here
  * is what exports. Progress/status events are display-only; JS never
- * drives playback.
+ * drives playback. No scores are ever shown: shuffle stays magic.
  */
 
 /** Screen-level EDL history depth (design system Appendix B). */
@@ -91,9 +97,43 @@ const CHIP_THUMB_SECONDS = 0.5;
 /** Minimum interval between preview seeks while scrubbing the ruler. */
 const SCRUB_SEEK_INTERVAL_MS = 120;
 
+/** A fresh random seed per shuffle tap (successive cuts must differ). */
+function randomSeed(): number {
+  return (Math.random() * 0xffffffff) >>> 0;
+}
+
 /** The layoutSegments input shape for one existing segment. */
 function partialOf(s: EdlSegment): { id: string; takeId: string; sourceStartFrame: number; durationFrames: number } {
   return { id: s.id, takeId: s.takeId, sourceStartFrame: s.sourceStartFrame, durationFrames: s.durationFrames };
+}
+
+/**
+ * The one decorative animation in the product (design system §4): a
+ * single lime sweep across the preview frame when a new cut lands,
+ * ~800ms, ease-out, never looped.
+ */
+function SweepOverlay({ width }: { width: number }) {
+  const [x] = useState(() => new Animated.Value(-width));
+  useEffect(() => {
+    const anim = Animated.timing(x, {
+      toValue: width,
+      duration: 800,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    });
+    anim.start();
+    return () => anim.stop();
+  }, [width, x]);
+  return (
+    <Animated.View style={[StyleSheet.absoluteFill, { transform: [{ translateX: x }], opacity: 0.4 }]} pointerEvents="none">
+      <LinearGradient
+        colors={[...colors.iridescent]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 0 }}
+        style={{ width: Math.max(1, width * 0.9), height: '100%' }}
+      />
+    </Animated.View>
+  );
 }
 
 export default function EditorScreen() {
@@ -107,19 +147,25 @@ export default function EditorScreen() {
 function EditorWorkspace() {
   const insets = useSafeAreaInsets();
   const studio = useStudio();
-  const { activeProject, track, takes } = studio;
+  const { activeProject, track, takes, trackSections } = studio;
   const storedEdl = studio.edl;
   const { width: winW, height: winH } = useWindowDimensions();
 
-  // The editor opens straight into Edit mode (Jaizon, 2026-11-12:
-  // the Shuffle/auto-edit is removed; the EDL is built
-  // chronologically from the takes when the project has no edit yet).
+  // Two faces, one workspace (Jaizon, 2026-11-09): the screen OPENS
+  // on the shuffle landing — preview of the already-shuffled cut,
+  // Reshuffle, Edit, Continue, nothing else — and the full editing
+  // surface lives one tap deeper in 'edit'. All state/logic below is
+  // shared; only the presentation branches.
+  const [mode, setMode] = useState<'shuffle' | 'edit'>('shuffle');
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [paused, setPaused] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
   const [positionSeconds, setPositionSeconds] = useState(0);
   const [previewStatus, setPreviewStatus] = useState<PreviewStatus | null>(null);
   const [previewNonce, setPreviewNonce] = useState(0);
+  const [justShuffled, setJustShuffled] = useState(false);
+  const [shuffleNote, setShuffleNote] = useState<string | null>(null);
+  const [sweepKey, setSweepKey] = useState(0);
   const [undoStack, setUndoStack] = useState<(Edl | null)[]>([]);
   const [redoStack, setRedoStack] = useState<(Edl | null)[]>([]);
   const [, setChipThumbTick] = useState(0);
@@ -214,10 +260,9 @@ function EditorWorkspace() {
   );
   /**
    * Where timeline frame 0 sits inside `take` — delegates to the ONE
-   * shared offset (src/lib/edl.ts), the same function
-   * buildEdlChronological uses, so the anchor and the builder can
-   * never diverge. It includes the take's manual frame calibration
-   * (syncAdjustFrames).
+   * shared offset (src/lib/edl.ts), the same function the shuffle
+   * bridge uses, so the anchor and the bridge can never diverge. It
+   * includes the take's manual frame calibration (syncAdjustFrames).
    */
   const offsetForTake = useCallback(
     (take: Take) => takeSyncOffsetSeconds(take, regionStartSeconds, DEFAULT_FPS),
@@ -256,10 +301,10 @@ function EditorWorkspace() {
    * RE-ANCHOR (the sync invariant above — applied here so EVERY
    * mutation honours it: drag trims and take-switch), validate,
    * store. The anchor is
-   * a no-op for fresh chronological output, which the builder already
-   * lays out anchored. Validation may clamp/drop a segment whose
-   * anchored source start falls outside its take's measured length —
-   * correct and honest: that take has no footage for that song moment.
+   * a no-op for fresh shuffle output, which the bridge already builds
+   * anchored. Validation may clamp/drop a segment whose anchored
+   * source start falls outside its take's measured length — correct
+   * and honest: that take has no footage for that song moment.
    */
   const commitEdl = (next: Edl) => {
     setUndoStack((stack) => [...stack.slice(-(HISTORY_CAP - 1)), edl]);
@@ -268,11 +313,11 @@ function EditorWorkspace() {
     const relaid = layoutSegments(next.segments.map(partialOf), next);
     const anchored: Edl = { ...relaid, segments: reanchorSegments(relaid.segments, relaid.fps) };
     const validated = validate(anchored);
-    studio.applyEdl(validated);
+    studio.applyEdl(validated, validated.segments.map((s) => s.takeId));
   };
 
   const applyHistoryEdl = (target: Edl | null) => {
-    if (target) studio.applyEdl(target);
+    if (target) studio.applyEdl(target, target.segments.map((s) => s.takeId));
     else studio.setEdl(null);
     setSelectedSegmentId(null);
     setPaused(true);
@@ -299,69 +344,72 @@ function EditorWorkspace() {
   const canUndo = undoStack.length > 0;
   const canRedo = redoStack.length > 0;
 
-  // ---- Chronological cut ------------------------------------------
-  // The Shuffle/auto-edit is removed (Jaizon, 2026-11-12): the edit
-  // is built chronologically — takes in recording order, each at
-  // full length, laid end-to-end and clipped to the song region
-  // (buildEdlChronological in src/lib/edl.ts, same clipping the old
-  // shuffle bridge applied). The EDL is still built by the shared
-  // builder, validated against measured durations, and committed
-  // through commitEdl (undo snapshot, re-anchor, validate) — so
-  // Edit-mode trimming, take-swap and export all work on it exactly
-  // as they did on a shuffled cut.
-  const buildChronologicalCut = () => {
-    const regionLengthSeconds =
-      effectiveRegion(studio.trackRegion, track?.durationSeconds)?.lengthSeconds ??
-      studio.trackRegion.durationSeconds ??
-      track?.durationSeconds ??
-      0;
-    const built = buildEdlChronological({
-      takes,
+  // ---- Shuffle ---------------------------------------------------------
+  const canShuffle = takes.length >= 2;
+  const handleShuffle = () => {
+    if (!canShuffle) return;
+    const energies = estimateTakeEnergies(takes);
+    const { edl: built } = buildEdlFromShuffle({
+      sections: trackSections,
+      takes: takes.map((t) => ({ ...t, energy: energies.get(t.id) ?? t.energy ?? 0.5 })),
+      frequency: studio.shuffleFrequency,
+      seed: randomSeed(),
+      previousSequence:
+        activeProject?.lastShuffleSequence ?? (edl ? edl.segments.map((s) => s.takeId) : undefined),
       regionStartSeconds,
-      regionLengthSeconds,
       audioUri: track?.uri ?? null,
       // The cut renders at the takes' own size (4K takes → 4K cut).
       ...(canvasForTakes(takes) ? { canvas: canvasForTakes(takes)! } : {}),
     });
-    if (built.segments.length === 0) return;
+    if (built.segments.length === 0) {
+      setShuffleNote("That didn't cut — check the song is loaded, then try again.");
+      return;
+    }
     commitEdl(built);
     setSelectedSegmentId(null);
+    setJustShuffled(true);
+    setShuffleNote(null);
     setPositionSeconds(0);
     setPaused(false); // the new cut auto-plays from the top
+    setSweepKey((k) => k + 1);
   };
 
-  // ---- Open on a finished cut --------------------------------------
-  // The editor must always open on a finished cut: when the project
-  // has no edit yet, the chronological cut is generated
-  // automatically — exactly once per mount, and EditorScreen
-  // remounts per project, so the guard is per project. A stored
-  // edit is shown as-is; undoing back to no edit must not trigger a
-  // surprise rebuild, so the guard is consumed either way.
-  const autoBuiltRef = useRef(false);
-  const buildCutRef = useRef(buildChronologicalCut);
+  // ---- Open on a shuffled cut --------------------------------------
+  // The shuffle landing must always open on a finished cut (Jaizon,
+  // 2026-11-09): when the project has no edit yet, the first shuffle
+  // is generated automatically — exactly once per mount, and
+  // EditorScreen remounts per project, so the guard is per project.
+  // A stored edit is shown as-is; undoing back to no edit must not
+  // trigger a surprise re-shuffle, so the guard is consumed either way.
+  const autoShuffledRef = useRef(false);
+  const handleShuffleRef = useRef(handleShuffle);
   useEffect(() => {
-    buildCutRef.current = buildChronologicalCut;
+    handleShuffleRef.current = handleShuffle;
   });
   useEffect(() => {
-    if (autoBuiltRef.current) return;
+    if (autoShuffledRef.current) return;
     if (storedEdl) {
-      autoBuiltRef.current = true;
+      autoShuffledRef.current = true;
       return;
     }
     if (takes.length === 0) return; // takes haven't landed yet — wait
+    if (!canShuffle) {
+      autoShuffledRef.current = true;
+      return;
+    }
     // Deferred by a frame: generating the cut commits state (local
     // UI state + the store), and doing that synchronously inside the
     // effect would cascade renders on mount. One frame is invisible
-    // — the editor still opens on the finished, auto-playing cut.
+    // — the landing still opens on the finished, auto-playing cut.
     // The guard is consumed inside the callback, so if this effect
     // re-runs first (a dep settled), the pending frame is cancelled
     // and a fresh one is scheduled instead of doubling up.
     const frame = requestAnimationFrame(() => {
-      autoBuiltRef.current = true;
-      buildCutRef.current();
+      autoShuffledRef.current = true;
+      handleShuffleRef.current();
     });
     return () => cancelAnimationFrame(frame);
-  }, [storedEdl, takes.length]);
+  }, [storedEdl, takes.length, canShuffle]);
 
   // ---- Selection & take swap ------------------------------------------
   const selected = edl?.segments.find((s) => s.id === selectedSegmentId) ?? null;
@@ -602,14 +650,24 @@ function EditorWorkspace() {
   const previewHeight = Math.round(Math.min(470, Math.max(340, winH * 0.46)));
   const previewWidth = Math.round(Math.min(winW - spacing.xl * 2, previewHeight * (9 / 16)));
 
+  const frequencyCaption =
+    studio.shuffleFrequency === 'chill'
+      ? 'Longer clips — changes about every 4 seconds.'
+      : studio.shuffleFrequency === 'normal'
+        ? 'Changes about every 2 seconds.'
+        : studio.shuffleFrequency === 'fast'
+          ? 'Changes about every second.'
+          : 'A new clip almost every beat.';
+
   const headerSubtitle = hasCut
     ? `${edl!.segments.length} cut${edl!.segments.length === 1 ? '' : 's'} · ${formatTime(totalSeconds)}`
     : track
       ? track.name
       : 'No song loaded';
 
-  // The preview frame + transport — one NativePreview wiring, so the
-  // preview plays the identical composition the exporter consumes.
+  // The preview frame + transport, shared verbatim by the shuffle
+  // landing and Edit mode — one NativePreview wiring, so both faces
+  // of this screen play the identical composition.
   const previewAndTransport = (
     <>
     {/* Preview — the native composition, exactly as it exports. */}
@@ -626,6 +684,7 @@ function EditorWorkspace() {
               onStatus={handleStatus}
               style={StyleSheet.absoluteFill}
             />
+            {sweepKey > 0 ? <SweepOverlay key={sweepKey} width={previewWidth} /> : null}
             <WatermarkOverlay enabled={watermarkOn} width={previewWidth} />
             <LyricsOverlay lyrics={lyricsPayload} positionSeconds={positionSeconds} width={previewWidth} />
             {previewStatus === 'loading' ? (
@@ -682,21 +741,123 @@ function EditorWorkspace() {
     </>
   );
 
+  // ---- Shuffle landing ----------------------------------------------
+  // The screen Record's Next lands on (Jaizon, 2026-11-09): the
+  // preview of the already-shuffled cut, Reshuffle, Edit, Continue —
+  // and nothing else. No timeline, no selection, no chips.
+  if (mode === 'shuffle') {
+    return (
+      <View style={styles.root}>
+        <View style={[styles.header, { paddingTop: insets.top + spacing.md }]}>
+          <View style={styles.headerRow}>
+            <Pressable
+              onPress={() => router.back()}
+              hitSlop={10}
+              accessibilityRole="button"
+              accessibilityLabel="Back to Record"
+              style={styles.backButton}>
+              <Ionicons name="chevron-back" size={26} color={colors.accent} />
+              <Text style={styles.backText}>Record</Text>
+            </Pressable>
+          </View>
+          <Text style={styles.largeTitle} numberOfLines={1}>
+            Your cut
+          </Text>
+          <Text style={styles.headerSubtitle} numberOfLines={1}>
+            {headerSubtitle}
+          </Text>
+        </View>
+
+        {takes.length === 0 ? (
+          <View style={[styles.section, styles.emptyCard]}>
+            <Ionicons name="videocam-outline" size={30} color={colors.labelSecondary} />
+            <Text style={styles.emptyTitle}>Record some takes first</Text>
+            <Text style={styles.emptyBody}>
+              Your shuffled cut appears here once you have recorded some takes to cut together.
+            </Text>
+            <Pressable
+              style={styles.emptyPrimaryButton}
+              onPress={() => router.back()}
+              accessibilityRole="button">
+              <Ionicons name="videocam-outline" size={18} color={colors.onAccent} />
+              <Text style={styles.emptyPrimaryButtonText}>Back to Record</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <ScrollView
+            style={styles.scroll}
+            contentContainerStyle={[
+              styles.scrollContent,
+              { paddingBottom: Math.max(insets.bottom, spacing.md) + spacing.xl },
+            ]}
+            showsVerticalScrollIndicator={false}>
+            {previewAndTransport}
+
+            <View style={styles.section}>
+              <View style={styles.panel}>
+                <View style={styles.actionRow}>
+                  <Pressable
+                    style={[styles.actionButton, !canShuffle && styles.actionButtonDisabled]}
+                    onPress={handleShuffle}
+                    disabled={!canShuffle}
+                    accessibilityRole="button"
+                    accessibilityLabel="Reshuffle for a different arrangement">
+                    <Ionicons name="shuffle" size={19} color={canShuffle ? colors.label : colors.labelTertiary} />
+                    <Text style={[styles.actionButtonText, !canShuffle && styles.actionButtonTextDisabled]}>
+                      Reshuffle
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.actionButton}
+                    onPress={() => setMode('edit')}
+                    accessibilityRole="button"
+                    accessibilityLabel="Edit the cut">
+                    <Ionicons name="create-outline" size={19} color={colors.label} />
+                    <Text style={styles.actionButtonText}>Edit</Text>
+                  </Pressable>
+                </View>
+                {!canShuffle ? (
+                  <Text style={styles.caption}>
+                    Shuffle needs at least 2 takes — record one more to mix between takes.
+                  </Text>
+                ) : shuffleNote ? (
+                  <Text style={styles.caption}>{shuffleNote}</Text>
+                ) : null}
+                <Pressable
+                  style={[styles.continueButton, !hasCut && styles.continueButtonDisabled]}
+                  onPress={() => hasCut && router.push('/project/export')}
+                  disabled={!hasCut}
+                  accessibilityRole="button"
+                  accessibilityLabel={hasCut ? 'Continue to Export' : 'Continue — make a cut first'}
+                  accessibilityState={{ disabled: !hasCut }}>
+                  <Text style={[styles.continueButtonText, !hasCut && styles.continueButtonTextDisabled]}>
+                    Continue
+                  </Text>
+                  <Ionicons name="arrow-forward" size={18} color={hasCut ? colors.onAccent : colors.labelTertiary} />
+                </Pressable>
+              </View>
+            </View>
+          </ScrollView>
+        )}
+      </View>
+    );
+  }
+
   return (
     <View style={styles.root}>
-      {/* Header band: back to Record, the
+      {/* Edit-mode header band: back to the shuffle landing, the
           "Edit" title — plus this stage's undo/redo and the Export
           action. FIXED: it lives outside the scroll area. */}
       <View style={[styles.header, { paddingTop: insets.top + spacing.md }]}>
         <View style={styles.headerRow}>
           <Pressable
-            onPress={() => router.back()}
+            onPress={() => setMode('shuffle')}
             hitSlop={10}
             accessibilityRole="button"
-            accessibilityLabel="Back to Record"
+            accessibilityLabel="Back to your cut"
             style={styles.backButton}>
             <Ionicons name="chevron-back" size={26} color={colors.accent} />
-            <Text style={styles.backText}>Record</Text>
+            <Text style={styles.backText}>Your cut</Text>
           </Pressable>
           <View style={styles.headerActions}>
             <Pressable
@@ -767,8 +928,8 @@ function EditorWorkspace() {
           <Ionicons name="lock-closed-outline" size={30} color={colors.labelSecondary} />
           <Text style={styles.emptyTitle}>Record a take first</Text>
           <Text style={styles.emptyBody}>
-            The Editor works on your takes, and there aren&apos;t any yet. Record at least one take and this step
-            unlocks.
+            The Editor works on your takes, and there aren&apos;t any yet. Record at least one take — two or more to
+            shuffle — and this step unlocks.
           </Text>
           <Pressable
             style={styles.emptyPrimaryButton}
@@ -808,7 +969,7 @@ function EditorWorkspace() {
                 <Ionicons name="film-outline" size={30} color={colors.labelSecondary} />
                 <Text style={styles.emptyTitle}>No cut yet</Text>
                 <Text style={styles.timelineEmptyBody}>
-                  Your takes appear here in recording order once you&apos;ve recorded some.
+                  Tap Shuffle my cut and MVMT arranges your takes into a cut, right here.
                 </Text>
               </View>
             )}
@@ -869,6 +1030,45 @@ function EditorWorkspace() {
               </View>
             </View>
           ) : null}
+
+          {/* Shuffle — always available below the editing surface. */}
+          <View style={styles.section}>
+            <View style={styles.panel}>
+              <Pressable
+                style={[styles.shuffleButton, !canShuffle && styles.shuffleButtonDisabled]}
+                onPress={handleShuffle}
+                disabled={!canShuffle}
+                accessibilityRole="button"
+                accessibilityLabel={hasCut ? 'Shuffle again for a different arrangement' : 'Shuffle takes into a cut'}>
+                <Ionicons name="shuffle" size={20} color={canShuffle ? colors.onAccent : colors.labelTertiary} />
+                <Text style={[styles.shuffleButtonText, !canShuffle && styles.shuffleButtonTextDisabled]}>
+                  {hasCut ? 'Try another shuffle' : 'Shuffle my cut'}
+                </Text>
+              </Pressable>
+              {!canShuffle ? (
+                <Text style={styles.caption}>
+                  Shuffle needs at least 2 takes — record one more to mix between takes.
+                </Text>
+              ) : shuffleNote ? (
+                <Text style={styles.caption}>{shuffleNote}</Text>
+              ) : justShuffled && hasCut ? (
+                <Text style={styles.caption}>Your cut, remixed.</Text>
+              ) : null}
+              <Text style={styles.panelLabel}>Cut pace</Text>
+              <SegmentedControl
+                options={[
+                  { value: 'chill' as ShuffleFrequency, label: 'Chill' },
+                  { value: 'normal' as ShuffleFrequency, label: 'Normal' },
+                  { value: 'fast' as ShuffleFrequency, label: 'Fast' },
+                  { value: 'rapid' as ShuffleFrequency, label: 'Rapid' },
+                ]}
+                value={studio.shuffleFrequency}
+                onChange={studio.setShuffleFrequency}
+                accessibilityLabel="Cut pace — how often the cut changes"
+              />
+              <Text style={styles.caption}>{frequencyCaption} Applies to the next shuffle.</Text>
+            </View>
+          </View>
 
           {/* Watermark — the MVMT studio logo stamped on the video
               (preview and export alike). A project-level output
@@ -1017,7 +1217,46 @@ const styles = StyleSheet.create({
   },
   progressFill: { height: '100%', backgroundColor: colors.label, borderRadius: radius.pill },
   panel: { gap: spacing.sm },
+  panelLabel: { ...typeScale.headline, color: colors.label, marginTop: spacing.sm },
+  shuffleButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: colors.accent,
+    borderRadius: radius.md,
+    paddingVertical: 14,
+  },
+  shuffleButtonDisabled: { backgroundColor: colors.elevated },
+  shuffleButtonText: { color: colors.onAccent, ...typeScale.headline },
+  shuffleButtonTextDisabled: { color: colors.labelTertiary },
   caption: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 18 },
+  actionRow: { flexDirection: 'row', gap: spacing.sm },
+  actionButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    paddingVertical: 13,
+  },
+  actionButtonDisabled: { opacity: 0.5 },
+  actionButtonText: { color: colors.label, ...typeScale.headline },
+  actionButtonTextDisabled: { color: colors.labelTertiary },
+  continueButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: colors.accent,
+    borderRadius: radius.md,
+    paddingVertical: 14,
+  },
+  continueButtonDisabled: { backgroundColor: colors.elevated },
+  continueButtonText: { color: colors.onAccent, ...typeScale.headline },
+  continueButtonTextDisabled: { color: colors.labelTertiary },
   watermarkRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md },
   watermarkText: { flex: 1, gap: 2 },
   cutTitle: { ...typeScale.headline, color: colors.label },

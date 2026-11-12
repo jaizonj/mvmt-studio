@@ -19,7 +19,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { IconButton } from '../../components/IconButton';
 import { RecordButton } from '../../components/RecordButton';
-import { effectiveRegion } from '../../lib/analysis';
+import { DEFAULT_BPM, effectiveRegion, rmsOfFrames, SectionEnergyAccumulator } from '../../lib/analysis';
 import { TrackSheet } from '../../components/TrackSheet';
 import { Image } from 'expo-image';
 
@@ -86,9 +86,9 @@ const SYNC_MEASUREMENT_SANITY_SECONDS = 2;
  *
  * Minimal by design (HIG): only flip / torch / track / the Settings gear
  * sit on the camera itself. ALL the little options live in Settings
- * (gear). Forward movement follows the flow — Record → Edit
+ * (gear). Forward movement follows the flow — Record → Takes → Shuffle
  * → Export — and the later stages are locked until you've recorded:
- * tapping the forward arrow with zero takes shows "Record a take first"
+ * tapping Takes or Shuffle with zero takes shows "Record a take first"
  * instead of navigating. There is deliberately no Export action here.
  *
  * Camera preferences (facing/torch/mirror/zoom/countdown) live in the
@@ -303,6 +303,7 @@ export default function CameraScreen() {
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const countInTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const energyAccRef = useRef<SectionEnergyAccumulator | null>(null);
   const zoomAtPinchStartRef = useRef(0);
 
   // NATIVE CAPTURE availability: when the compositor module's
@@ -624,6 +625,19 @@ export default function CameraScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playerStatus.duration]);
 
+  // Sample the track's real energy (RMS) while it plays during a take, so
+  // the section table the shuffle engine uses is cached, not recomputed.
+  useEffect(() => {
+    player.setAudioSamplingEnabled(true);
+    const sub = player.addListener('audioSampleUpdate', (sample) => {
+      const acc = energyAccRef.current;
+      if (!acc) return;
+      const channel = sample.channels[0];
+      if (channel) acc.addSample(sample.timestamp, rmsOfFrames(channel.frames));
+    });
+    return () => sub.remove();
+  }, [player]);
+
   useEffect(
     () => () => {
       if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
@@ -634,7 +648,7 @@ export default function CameraScreen() {
   );
 
   // Metronome beat flash while recording (Settings → Audio): a soft dot
-  // pulsing at the assumed 120 BPM grid.
+  // pulsing at the assumed 120 BPM grid the sections are built on.
   useEffect(() => {
     if (!recording || !metronome) return;
     const timer = setInterval(() => setBeatFlash((v) => !v), 500);
@@ -647,10 +661,10 @@ export default function CameraScreen() {
   }, []);
 
   // Forward navigation: the takes live on this screen's left rail now
-  // (no separate Takes screen). Next ALWAYS goes to the Editor —
-  // never straight to Export, even when a cut already
-  // exists: landing on the cut first is how you edit it.
-  // Gated on the first take.
+  // (no separate Takes screen). Next ALWAYS goes to the Editor — the
+  // shuffle screen — never straight to Export, even when a cut already
+  // exists: landing on the cut first is how you re-shuffle or edit it
+  // (Jaizon, 2026-11-09). Gated on the first take.
   const goForward = useCallback(() => {
     if (takes.length === 0) return flashNotice('Record a take first');
     router.push('/project/editor');
@@ -938,6 +952,12 @@ export default function CameraScreen() {
         ...(syncOffsetSeconds !== undefined ? { syncOffsetSeconds } : {}),
         ...(syncSource !== undefined ? { syncSource } : {}),
       });
+      // Cache the sampled section energies for the shuffle engine.
+      // (Native-path takes contribute none — the JS player never
+      // played — so previously cached sections simply stay.)
+      if (energyAccRef.current && energyAccRef.current.sampledSectionCount > 0) {
+        studio.setTrackSections(energyAccRef.current.finish());
+      }
       flashNotice('Take saved — find it in Takes');
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1000,9 +1020,15 @@ export default function CameraScreen() {
     const regionEff = effectiveRegion(studio.trackRegion, playerStatus.duration || track?.durationSeconds);
     // The region start this take is recorded against: stored on the
     // take as trackOffsetSeconds AND used as the reference for the
-    // measured sync offset below — one value, so the EDL mapping
-    // (trackOffset − regionStart + syncOffset) stays coherent.
+    // measured sync offset below — one value, so the EDL bridge's
+    // mapping (trackOffset − regionStart + syncOffset) stays coherent.
     const regionStartSeconds = regionEff?.startSeconds ?? studio.trackRegion.startSeconds ?? 0;
+
+    // Fresh energy accumulation for this pass over the region.
+    energyAccRef.current =
+      track && regionEff
+        ? new SectionEnergyAccumulator(regionEff.lengthSeconds, DEFAULT_BPM, regionEff.startSeconds)
+        : null;
 
     // Sync at capture: the region restarts from its start at the same
     // moment the camera starts, so every take is time-aligned. The
@@ -1131,8 +1157,8 @@ export default function CameraScreen() {
     // duration) is the measurable cross-check on this estimate — a bad
     // start sample or clock disagreement shows up there instead of
     // hiding. Both values are stored on the Take and consumed by the
-    // chronological EDL builder and the editor via src/lib/edl.ts's
-    // single mapping: sourceFrame = timelineFrame − round(offset · fps),
+    // EDL bridge (src/lib/shuffleEdl.ts) via src/lib/edl.ts's single
+    // mapping: sourceFrame = timelineFrame − round(offset · fps),
     // where offset's measured part is (this sample − the seek target).
     const songStartSeconds = track ? player.currentTime : null;
 

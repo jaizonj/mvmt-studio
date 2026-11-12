@@ -43,6 +43,7 @@ jobs:
       # the build here instead of shipping a broken IPA.
       - name: Gate — unit tests, typecheck, lint
         run: |
+          npm run test:shuffle
           npm run test:edl
           npm run test:lyrics
           npm run test:library

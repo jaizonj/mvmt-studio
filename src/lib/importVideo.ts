@@ -12,7 +12,7 @@ import { measureTakeDurationSeconds, persistTake } from './media';
  * app's own takes folder (same stewardship as a recorded take, so it
  * survives picker-cache cleanup), probed for its real duration and
  * frame size, and from then on is indistinguishable from a recorded
- * take to the editor and the exporter — except for its
+ * take to the shuffle, the editor and the exporter — except for its
  * `source: 'imported'` marker, which keeps it out of the EDL canvas
  * vote (canvasForTakes) and drives its sync wording. The actual
  * sound-matching lives in record.tsx (`syncImportedTake`), beside the
@@ -21,9 +21,9 @@ import { measureTakeDurationSeconds, persistTake } from './media';
 
 /**
  * Sanity cap on import length. The sync measurement decodes the
- * video's whole audio track, and takes are song-scale material —
- * an hour is already far beyond any song. Longer files get a plain
- * "trim it" message instead of a hang.
+ * video's whole audio track, and the shuffle treats takes as
+ * song-scale material — an hour is already far beyond any song.
+ * Longer files get a plain "trim it" message instead of a hang.
  */
 export const MAX_IMPORT_DURATION_SECONDS = 3600;
 

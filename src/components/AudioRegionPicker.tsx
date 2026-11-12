@@ -31,7 +31,7 @@ const MIN_REGION_SECONDS = 1;
  *
  * The selection lives in the studio store (AudioRegion =
  * start + duration; the end is start + duration) — recording length,
- * take anchoring, lyrics and the editor all read
+ * take anchoring, shuffle sectioning, lyrics and the editor all read
  * that same value. The neutral default is the full song: a freshly
  * picked track stores { start: 0, duration: null } and the handles
  * sit at the song's edges until they're moved.
