@@ -4081,6 +4081,61 @@ private enum MvmtCompositorEngine {
     return outputURL.absoluteString
   }
 
+  /// Mix & Master profile reader (bridge: `getMixMasterProfile`,
+  /// Stage 3 UI). Returns the stored profile JSON for this song +
+  /// stage settings, or nil when the engine has nothing for it.
+  /// The profile file is written beside the render by
+  /// `prepareMixMasterSong`; when it is missing — an interrupted
+  /// earlier run, or a song whose gains are all zero so no render
+  /// was written — the analysis runs again and the profile is built
+  /// from it directly (no render, no file write), so the UI can
+  /// still show the flat curve and "already balanced" instead of a
+  /// blank screen. Never throws: a missing file or an undecodable
+  /// song is nil, not an error.
+  static func mixMasterProfile(
+    _ uri: String,
+    correctiveEnabled: Bool,
+    correctiveIntensity: Double,
+    masterEnabled: Bool,
+    masterIntensity: Double
+  ) async -> String? {
+    let settings = resolveMmStageSettings(
+      correctiveEnabled: correctiveEnabled,
+      correctiveIntensity: correctiveIntensity,
+      masterEnabled: masterEnabled,
+      masterIntensity: masterIntensity
+    )
+    let sourceURL = resolveURL(uri)
+    guard sourceURL.isFileURL else { return nil }
+    let attrs = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
+    let fileSize = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+    let fileMtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+    guard fileSize > 0 else { return nil }
+    let cacheKey =
+      "\(sourceURL.path)|\(fileSize)|\(fileMtime)|mmv\(mixMasterProfileVersion)|\(mmStageSettingsKey(settings))"
+    guard let outputURL = mixMasterCacheFileURL(cacheKey: cacheKey) else { return nil }
+    let profileURL = mixMasterProfileURL(for: outputURL)
+    if let data = try? Data(contentsOf: profileURL),
+       let json = String(data: data, encoding: .utf8), !json.isEmpty {
+      return json
+    }
+    guard let analysis = await analyzeMixMaster(asset: AVURLAsset(url: sourceURL), settings: settings) else {
+      return nil
+    }
+    let profile = MixMasterProfileRecord(
+      version: mixMasterProfileVersion,
+      songKey: cacheKey,
+      sampleRate: analysis.sampleRate,
+      durationSeconds: analysis.durationSeconds,
+      windows: analysis.windows,
+      findings: analysis.findings,
+      masterGainsDb: analysis.masterGainsDb,
+      stages: settings
+    )
+    guard let data = try? JSONEncoder().encode(profile) else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
+
   /// Measures the song in 1.0 s windows (50% overlap) and turns
   /// each window's band balance into per-band gains in dB (cuts
   /// only, 0 … −6 dB), then smooths the whole curve. Nil when the
@@ -8528,6 +8583,22 @@ public class MvmtCompositorModule: Module {
       masterIntensity: Double
     ) -> String in
       await MvmtCompositorEngine.prepareMixMasterSong(
+        uri,
+        correctiveEnabled: correctiveEnabled,
+        correctiveIntensity: correctiveIntensity,
+        masterEnabled: masterEnabled,
+        masterIntensity: masterIntensity
+      )
+    }
+
+    AsyncFunction("getMixMasterProfile") { (
+      uri: String,
+      correctiveEnabled: Bool,
+      correctiveIntensity: Double,
+      masterEnabled: Bool,
+      masterIntensity: Double
+    ) -> String? in
+      await MvmtCompositorEngine.mixMasterProfile(
         uri,
         correctiveEnabled: correctiveEnabled,
         correctiveIntensity: correctiveIntensity,

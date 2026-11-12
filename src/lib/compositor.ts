@@ -18,6 +18,7 @@ export {
   inspectAsset,
   isCaptureAvailable,
   isCompositorAvailable,
+  getMixMasterProfile,
   measureTakeSync,
   prepareEqSong,
   prepareMixMasterSong,

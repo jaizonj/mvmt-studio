@@ -706,6 +706,23 @@ export default function ExportScreen() {
                       />
                     </View>
                   </View>
+                  <View style={styles.optionBlock}>
+                    <Pressable
+                      style={styles.switchRow}
+                      onPress={() => router.push('/project/mix-master')}
+                      accessibilityRole="button"
+                      accessibilityLabel="Mix & Master">
+                      <View style={styles.switchText}>
+                        <Text style={styles.optionLabel}>Mix &amp; Master</Text>
+                        <Text style={styles.blockHint}>
+                          {mixMasterEnabled
+                            ? 'On — tap to tune the stages and A/B the result.'
+                            : 'Dynamic EQ + Master EQ, tuned per moment of the song.'}
+                        </Text>
+                      </View>
+                      <Ionicons name="chevron-forward" size={20} color={colors.labelSecondary} />
+                    </Pressable>
+                  </View>
                 </View>
                 <Text style={styles.qualityCaption}>
                   {request.canvasWidth} × {request.canvasHeight} · {request.frameRate} fps · Portrait · Song only —

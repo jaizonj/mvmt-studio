@@ -162,6 +162,17 @@ no nested scroll views, no desktop panels.
   stage is off.
 - **Stage 3 — Mix & Master UI**: the screen in Section 3, driven
   entirely by the stored profile; A/B compare; findings list.
+  SHIPPED (commit pending, 2026-11-12): `src/app/project/mix-master.tsx`
+  (route `/project/mix-master`, reached from Export beside the Auto EQ
+  toggle), new native `getMixMasterProfile` bridge (reads the stored
+  profile JSON, or rebuilds it from a fresh analysis when no render
+  was written), `useMixMasterProfile` hook, waveform + activity
+  strip + Dynamic/Master EQ curves + findings list + A/B compare
+  through the one standing player at the same playhead (the SAME
+  processed file editor/export use). Master switch defaults OFF —
+  no analysis runs until the user turns it on. Progress is an
+  indeterminate spinner: `prepareMixMasterSong` reports no progress
+  (no onProgress on that bridge), so there is nothing real to show.
 - **Stage 4 — Export**: WAV/AAC export, share sheet, "use in
   project".
 - **Stage 5 — Later modules** (NOT promised in this programme):

@@ -505,6 +505,13 @@ interface NativeMvmtCompositorModule {
     masterEnabled: boolean,
     masterIntensity: number,
   ): Promise<string>;
+  getMixMasterProfile(
+    uri: string,
+    correctiveEnabled: boolean,
+    correctiveIntensity: number,
+    masterEnabled: boolean,
+    masterIntensity: number,
+  ): Promise<string | null>;
   isCaptureAvailable(): boolean;
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
@@ -705,6 +712,35 @@ export async function prepareMixMasterSong(
     return typeof result === 'string' && result.length > 0 ? result : uri;
   } catch {
     return uri;
+  }
+}
+
+/**
+ * Mix & Master Stage 3: reads the stored profile JSON for this song
+ * + stage settings (windows, findings, master gains) — the data the
+ * Mix & Master screen draws. Resolves to the JSON string, or null
+ * when the engine has nothing for it (Expo Go, an older build
+ * without the function, or an undecodable file). Never rejects.
+ */
+export async function getMixMasterProfile(
+  uri: string,
+  correctiveEnabled: boolean,
+  correctiveIntensity: number,
+  masterEnabled: boolean,
+  masterIntensity: number,
+): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.getMixMasterProfile !== 'function') return null;
+  try {
+    const result = await nativeModule.getMixMasterProfile(
+      uri,
+      correctiveEnabled,
+      correctiveIntensity,
+      masterEnabled,
+      masterIntensity,
+    );
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
   }
 }
 

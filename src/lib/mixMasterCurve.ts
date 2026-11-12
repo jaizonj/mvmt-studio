@@ -36,6 +36,35 @@ export const MM_MIN_WINDOW_SECONDS = 0.25;
 /** Smoothing slew limit: max gain change per 100 ms of song time. */
 export const MM_SLEW_DB_PER_100MS = 1.5;
 
+/**
+ * EQ band centres in Hz, same order as Auto EQ and the native
+ * `eqBandCentersHz` in MvmtCompositorModule.swift — the one band
+ * order every gain set in this module uses. Mirrored here so the
+ * Stage 3 UI can label the curve without a second source of truth.
+ */
+export const MM_BAND_CENTERS_HZ: readonly number[] = [
+  125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000, 12000,
+];
+
+/** A master gain below this is inaudible — it counts as "no correction". */
+export const MM_MEANINGFUL_GAIN_DB = 0.05;
+
+/** Short chart label for a band centre: 125, 250, 500, 1k, 2k, …, 12k. */
+export function shortBandLabelHz(hz: number): string {
+  return hz >= 1000 ? `${Math.round(hz / 100) / 10}k` : `${Math.round(hz)}`;
+}
+
+/** Long label for a band centre: "125 Hz", "1 kHz", "3 kHz", "12 kHz". */
+export function formatBandHz(hz: number): string {
+  return hz >= 1000 ? `${Math.round(hz / 100) / 10} kHz` : `${Math.round(hz)} Hz`;
+}
+
+/** m:ss for a song time (the theme's formatTime, kept import-free here). */
+export function formatMixMasterTime(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, '0')}`;
+}
+
 /** One smoothed analysis point: the gain set that applies at this song time. */
 export interface MixMasterWindow {
   timeSeconds: number;
@@ -318,4 +347,168 @@ export function computeMasterGains(
     const gain = reference + (targetDb[b] ?? 0) - level;
     return Math.max(-MM_MASTER_MAX_GAIN_DB, Math.min(MM_MASTER_MAX_GAIN_DB, gain));
   });
+}
+
+// --- Stage 3 UI: profile reading + display --------------------------------
+
+/** A gain set is valid only when it covers every band exactly once. */
+function isGainSet(value: unknown): value is number[] {
+  return (
+    Array.isArray(value) &&
+    value.length === MM_BAND_CENTERS_HZ.length &&
+    value.every((g) => typeof g === 'number' && Number.isFinite(g))
+  );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * Validate a decoded profile JSON object into a MixMasterProfile,
+ * or null when anything is missing or malformed. The profile is
+ * written by the native engine beside its render; a strict read
+ * keeps a corrupt or stale file (wrong version, short gain sets,
+ * a bogus reason) from ever reaching the screen — the UI treats
+ * null as "no analysis available", never as a crash. Stage
+ * settings inside the profile resolve through the same defaults
+ * as everywhere else.
+ */
+export function parseMixMasterProfile(value: unknown): MixMasterProfile | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (v.version !== MIX_MASTER_PROFILE_VERSION) return null;
+  if (typeof v.songKey !== 'string' || v.songKey.length === 0) return null;
+  if (!isFiniteNumber(v.sampleRate) || v.sampleRate <= 0) return null;
+  if (!isFiniteNumber(v.durationSeconds) || v.durationSeconds < 0) return null;
+  if (!isGainSet(v.masterGainsDb)) return null;
+  if (!Array.isArray(v.windows)) return null;
+  const windows: MixMasterWindow[] = [];
+  for (const raw of v.windows) {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const w = raw as Record<string, unknown>;
+    if (!isFiniteNumber(w.timeSeconds) || w.timeSeconds < 0) return null;
+    if (!isGainSet(w.gainsDb)) return null;
+    windows.push({ timeSeconds: w.timeSeconds, gainsDb: (w.gainsDb as number[]).slice() });
+  }
+  if (!Array.isArray(v.findings)) return null;
+  const findings: MixMasterFinding[] = [];
+  for (const raw of v.findings) {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const f = raw as Record<string, unknown>;
+    if (!isFiniteNumber(f.timeSeconds) || f.timeSeconds < 0) return null;
+    if (!isFiniteNumber(f.bandHz) || f.bandHz <= 0) return null;
+    if (!isFiniteNumber(f.cutDb) || f.cutDb < 0) return null;
+    if (f.reason !== 'harshness' && f.reason !== 'mud') return null;
+    findings.push({
+      timeSeconds: f.timeSeconds,
+      bandHz: f.bandHz,
+      cutDb: f.cutDb,
+      reason: f.reason,
+    });
+  }
+  const stagesRaw =
+    typeof v.stages === 'object' && v.stages !== null
+      ? (v.stages as Partial<MixMasterStageSettings>)
+      : null;
+  return {
+    version: MIX_MASTER_PROFILE_VERSION,
+    songKey: v.songKey,
+    sampleRate: v.sampleRate,
+    durationSeconds: v.durationSeconds,
+    windows,
+    findings,
+    masterGainsDb: (v.masterGainsDb as number[]).slice(),
+    stages: resolveMixMasterStageSettings(stagesRaw),
+  };
+}
+
+/** The one-line answer to "what did it do to my song?" */
+export interface MixMasterSummary {
+  /** Findings count (direct cuts ≥ 1 dB). */
+  totalCuts: number;
+  /** Deepest single cut in dB, 0 when there are no findings. */
+  deepestCutDb: number;
+  deepestBandHz: number | null;
+  deepestTimeSeconds: number | null;
+  /** Largest absolute master gain in dB (0 when the master stage is flat). */
+  masterMaxAbsDb: number;
+  /** Anything was actually changed (a cut, or a meaningful master gain). */
+  hasCorrections: boolean;
+}
+
+/** Summarise a profile for the screen's headline + A/B gating. */
+export function summarizeMixMasterProfile(profile: MixMasterProfile): MixMasterSummary {
+  let deepest: MixMasterFinding | null = null;
+  for (const f of profile.findings) {
+    if (!deepest || f.cutDb > deepest.cutDb) deepest = f;
+  }
+  const masterMaxAbsDb = profile.masterGainsDb.reduce((m, g) => Math.max(m, Math.abs(g)), 0);
+  return {
+    totalCuts: profile.findings.length,
+    deepestCutDb: deepest ? deepest.cutDb : 0,
+    deepestBandHz: deepest ? deepest.bandHz : null,
+    deepestTimeSeconds: deepest ? deepest.timeSeconds : null,
+    masterMaxAbsDb,
+    hasCorrections: profile.findings.length > 0 || masterMaxAbsDb > MM_MEANINGFUL_GAIN_DB,
+  };
+}
+
+/** One finding as a list row: "3 kHz −4.2 dB at 0:42 — harshness". */
+export function formatMixMasterFinding(finding: MixMasterFinding): string {
+  return (
+    `${formatBandHz(finding.bandHz)} −${finding.cutDb.toFixed(1)} dB ` +
+    `at ${formatMixMasterTime(finding.timeSeconds)} — ${finding.reason}`
+  );
+}
+
+/** The screen's summary line for a profile. */
+export function formatMixMasterSummary(profile: MixMasterProfile): string {
+  const summary = summarizeMixMasterProfile(profile);
+  if (!summary.hasCorrections) {
+    return 'No corrections needed — this song is already balanced.';
+  }
+  const cuts =
+    summary.totalCuts === 1 ? '1 cut' : `${summary.totalCuts} cuts`;
+  let line = cuts;
+  if (summary.deepestBandHz !== null && summary.deepestTimeSeconds !== null) {
+    line +=
+      ` · deepest −${summary.deepestCutDb.toFixed(1)} dB at ` +
+      `${formatBandHz(summary.deepestBandHz)} (${formatMixMasterTime(summary.deepestTimeSeconds)})`;
+  }
+  if (summary.masterMaxAbsDb > MM_MEANINGFUL_GAIN_DB) {
+    line += ` · master up to ${summary.masterMaxAbsDb.toFixed(1)} dB`;
+  }
+  return line;
+}
+
+/** Total cut depth in one window (sum of |cut| across bands), for the activity strip. */
+export function windowTotalCutDb(window: MixMasterWindow): number {
+  let total = 0;
+  for (const g of window.gainsDb) if (g < 0) total += -g;
+  return total;
+}
+
+/**
+ * The activity strip: per-window total cut resampled to exactly
+ * `count` bars, taking the MAXIMUM within each slice — a loud
+ * correction must survive downsampling, or the strip would lie
+ * about where the EQ is working. Mirrors `samplePeaks` in
+ * src/lib/waveform.ts (same contract, different signal).
+ */
+export function mixMasterActivityBars(profile: MixMasterProfile, count: number): number[] {
+  if (count <= 0) return [];
+  const totals = profile.windows.map(windowTotalCutDb);
+  if (totals.length === 0) return Array.from({ length: count }, () => 0);
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const start = Math.floor((i * totals.length) / count);
+    const end = Math.max(start + 1, Math.floor(((i + 1) * totals.length) / count));
+    let max = 0;
+    for (let j = start; j < end && j < totals.length; j++) {
+      if (totals[j] > max) max = totals[j];
+    }
+    out.push(max);
+  }
+  return out;
 }

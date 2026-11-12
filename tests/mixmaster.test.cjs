@@ -19,6 +19,7 @@ const {
   MM_MASTER_TARGET_DB,
   MM_MASTER_MAX_GAIN_DB,
   MM_MASTER_SILENCE_DBFS,
+  MM_BAND_CENTERS_HZ,
   DEFAULT_MIX_MASTER_STAGE_SETTINGS,
   mixMasterWindowStarts,
   smoothGainCurve,
@@ -28,6 +29,15 @@ const {
   scaleGainsTowardZero,
   resolveMixMasterStageSettings,
   mixMasterStageSettingsKey,
+  formatBandHz,
+  shortBandLabelHz,
+  formatMixMasterTime,
+  parseMixMasterProfile,
+  summarizeMixMasterProfile,
+  formatMixMasterFinding,
+  formatMixMasterSummary,
+  windowTotalCutDb,
+  mixMasterActivityBars,
 } = require('./.build-mixmaster/src/lib/mixMasterCurve.js');
 
 /** Gains are computed in floating point — compare within 1e-9. */
@@ -263,4 +273,174 @@ test('stage settings key: stable for identical settings, changes with any settin
     mixMasterStageSettingsKey({ ...DEFAULT_MIX_MASTER_STAGE_SETTINGS, correctiveEnabled: false }),
     base,
   );
+});
+
+// --- Stage 3 UI: profile reading + display -------------------------------
+
+/** A minimal valid profile, as the native engine writes it. */
+function validProfile(overrides = {}) {
+  return {
+    version: 2,
+    songKey: 'song|1|2|mmv2|c1:100|m1:100',
+    sampleRate: 48000,
+    durationSeconds: 10,
+    windows: [
+      { timeSeconds: 0, gainsDb: [0, 0, 0, 0, -2, -4, 0, 0, 0, 0] },
+      { timeSeconds: 0.5, gainsDb: [0, -1, 0, 0, 0, -3, -1, 0, 0, 0] },
+    ],
+    findings: [
+      { timeSeconds: 0, bandHz: 3000, cutDb: 4, reason: 'harshness' },
+      { timeSeconds: 0.5, bandHz: 250, cutDb: 1.5, reason: 'mud' },
+    ],
+    masterGainsDb: [1, 0.5, 0, 0, 0, 0, 0, 0, 0.5, 1],
+    stages: { correctiveEnabled: true, correctiveIntensity: 100, masterEnabled: true, masterIntensity: 100 },
+    ...overrides,
+  };
+}
+
+test('band centres: 10 bands, same order as Auto EQ, strictly increasing', () => {
+  assert.equal(MM_BAND_CENTERS_HZ.length, 10);
+  assert.equal(MM_BAND_CENTERS_HZ[0], 125);
+  assert.equal(MM_BAND_CENTERS_HZ[9], 12000);
+  for (let i = 1; i < MM_BAND_CENTERS_HZ.length; i++) {
+    assert.ok(MM_BAND_CENTERS_HZ[i] > MM_BAND_CENTERS_HZ[i - 1]);
+  }
+});
+
+test('band labels: Hz below 1 kHz, kHz at and above', () => {
+  assert.equal(formatBandHz(125), '125 Hz');
+  assert.equal(formatBandHz(500), '500 Hz');
+  assert.equal(formatBandHz(1000), '1 kHz');
+  assert.equal(formatBandHz(3000), '3 kHz');
+  assert.equal(formatBandHz(12000), '12 kHz');
+  assert.equal(shortBandLabelHz(125), '125');
+  assert.equal(shortBandLabelHz(1000), '1k');
+  assert.equal(shortBandLabelHz(12000), '12k');
+});
+
+test('profile time: m:ss, floored, never negative', () => {
+  assert.equal(formatMixMasterTime(0), '0:00');
+  assert.equal(formatMixMasterTime(42), '0:42');
+  assert.equal(formatMixMasterTime(125), '2:05');
+  assert.equal(formatMixMasterTime(-3), '0:00');
+});
+
+test('profile parse: a valid profile round-trips', () => {
+  const parsed = parseMixMasterProfile(validProfile());
+  assert.ok(parsed);
+  assert.equal(parsed.version, 2);
+  assert.equal(parsed.durationSeconds, 10);
+  assert.equal(parsed.windows.length, 2);
+  assert.equal(parsed.findings.length, 2);
+  assert.deepEqual(parsed.masterGainsDb, [1, 0.5, 0, 0, 0, 0, 0, 0, 0.5, 1]);
+  assert.deepEqual(parsed.stages, DEFAULT_MIX_MASTER_STAGE_SETTINGS);
+});
+
+test('profile parse: rejects wrong version, short gain sets, bad reasons, NaN', () => {
+  assert.equal(parseMixMasterProfile(null), null);
+  assert.equal(parseMixMasterProfile('nope'), null);
+  assert.equal(parseMixMasterProfile(validProfile({ version: 1 })), null);
+  assert.equal(parseMixMasterProfile(validProfile({ version: 3 })), null);
+  assert.equal(parseMixMasterProfile(validProfile({ songKey: '' })), null);
+  assert.equal(parseMixMasterProfile(validProfile({ sampleRate: 0 })), null);
+  assert.equal(
+    parseMixMasterProfile(validProfile({ masterGainsDb: [0, 0, 0] })),
+    null,
+  );
+  assert.equal(
+    parseMixMasterProfile(
+      validProfile({ windows: [{ timeSeconds: 0, gainsDb: [0, 0] }] }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseMixMasterProfile(
+      validProfile({ findings: [{ timeSeconds: 0, bandHz: 3000, cutDb: 2, reason: 'loud' }] }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseMixMasterProfile(
+      validProfile({ findings: [{ timeSeconds: 0, bandHz: 3000, cutDb: NaN, reason: 'harshness' }] }),
+    ),
+    null,
+  );
+  assert.equal(parseMixMasterProfile(validProfile({ windows: 'nope' })), null);
+});
+
+test('profile parse: missing stage settings resolve to the defaults', () => {
+  const parsed = parseMixMasterProfile(validProfile({ stages: undefined }));
+  assert.ok(parsed);
+  assert.deepEqual(parsed.stages, DEFAULT_MIX_MASTER_STAGE_SETTINGS);
+});
+
+test('profile summary: counts cuts, finds the deepest, reads the master', () => {
+  const summary = summarizeMixMasterProfile(parseMixMasterProfile(validProfile()));
+  assert.equal(summary.totalCuts, 2);
+  assert.equal(summary.deepestCutDb, 4);
+  assert.equal(summary.deepestBandHz, 3000);
+  assert.equal(summary.deepestTimeSeconds, 0);
+  assert.equal(summary.masterMaxAbsDb, 1);
+  assert.equal(summary.hasCorrections, true);
+});
+
+test('profile summary: an all-flat profile has no corrections', () => {
+  const flat = validProfile({
+    windows: [{ timeSeconds: 0, gainsDb: new Array(10).fill(0) }],
+    findings: [],
+    masterGainsDb: new Array(10).fill(0),
+  });
+  const summary = summarizeMixMasterProfile(parseMixMasterProfile(flat));
+  assert.equal(summary.totalCuts, 0);
+  assert.equal(summary.deepestCutDb, 0);
+  assert.equal(summary.deepestBandHz, null);
+  assert.equal(summary.masterMaxAbsDb, 0);
+  assert.equal(summary.hasCorrections, false);
+});
+
+test('profile summary line: cuts + deepest, or the already-balanced line', () => {
+  assert.equal(
+    formatMixMasterSummary(parseMixMasterProfile(validProfile())),
+    '2 cuts · deepest −4.0 dB at 3 kHz (0:00) · master up to 1.0 dB',
+  );
+  const flat = validProfile({
+    windows: [{ timeSeconds: 0, gainsDb: new Array(10).fill(0) }],
+    findings: [],
+    masterGainsDb: new Array(10).fill(0),
+  });
+  assert.equal(
+    formatMixMasterSummary(parseMixMasterProfile(flat)),
+    'No corrections needed — this song is already balanced.',
+  );
+});
+
+test('finding format: band, depth, time, reason', () => {
+  assert.equal(
+    formatMixMasterFinding({ timeSeconds: 42, bandHz: 3000, cutDb: 4.2, reason: 'harshness' }),
+    '3 kHz −4.2 dB at 0:42 — harshness',
+  );
+  assert.equal(
+    formatMixMasterFinding({ timeSeconds: 70, bandHz: 250, cutDb: 3, reason: 'mud' }),
+    '250 Hz −3.0 dB at 1:10 — mud',
+  );
+});
+
+test('window total cut: sums only the cuts, ignores boosts and flats', () => {
+  assert.equal(windowTotalCutDb({ timeSeconds: 0, gainsDb: [0, -2, 0, 0, -4, 0, 0, 0, 0, 0] }), 6);
+  assert.equal(windowTotalCutDb({ timeSeconds: 0, gainsDb: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }), 0);
+});
+
+test('activity bars: exact count, max-preserving, empty profile is flat', () => {
+  const profile = parseMixMasterProfile(validProfile());
+  const bars = mixMasterActivityBars(profile, 4);
+  assert.equal(bars.length, 4);
+  // Windows total 6 and 5 dB; downsampling to 4 bars keeps the max per slice.
+  assert.equal(Math.max(...bars), 6);
+  const flat = validProfile({
+    windows: [{ timeSeconds: 0, gainsDb: new Array(10).fill(0) }],
+    findings: [],
+    masterGainsDb: new Array(10).fill(0),
+  });
+  assert.deepEqual(mixMasterActivityBars(parseMixMasterProfile(flat), 3), [0, 0, 0]);
+  assert.deepEqual(mixMasterActivityBars(parseMixMasterProfile(validProfile({ windows: [] })), 3), [0, 0, 0]);
 });

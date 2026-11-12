@@ -35,10 +35,12 @@
  */
 import { useEffect, useState } from 'react';
 
-import { isCompositorAvailable, prepareMixMasterSong } from './compositor';
+import { getMixMasterProfile, isCompositorAvailable, prepareMixMasterSong } from './compositor';
 import {
   mixMasterStageSettingsKey,
+  parseMixMasterProfile,
   resolveMixMasterStageSettings,
+  type MixMasterProfile,
   type MixMasterStageSettings,
 } from './mixMasterCurve';
 
@@ -85,6 +87,84 @@ export function warmUpMixMasterSong(
 ): void {
   if (!uri) return;
   void prepareMixMasterSongUri(uri, stages);
+}
+
+/**
+ * Load the stored profile for a song + stage settings (Stage 3
+ * UI): prepares first — memoized, the SAME preparation
+ * composition builds use, so this never renders twice — then
+ * reads the profile JSON the engine stored beside the render (or
+ * built from a fresh analysis when no render was written, e.g. a
+ * song that needs no corrections). Resolves to null when the
+ * engine is unavailable, the song can't be analyzed, or the
+ * profile is missing/malformed. Never rejects.
+ */
+export async function loadMixMasterProfile(
+  uri: string,
+  stages?: Partial<MixMasterStageSettings> | null,
+): Promise<MixMasterProfile | null> {
+  const resolved = resolveMixMasterStageSettings(stages);
+  try {
+    await prepareMixMasterSongUri(uri, resolved);
+    const json = await getMixMasterProfile(
+      uri,
+      resolved.correctiveEnabled,
+      resolved.correctiveIntensity,
+      resolved.masterEnabled,
+      resolved.masterIntensity,
+    );
+    if (!json) return null;
+    return parseMixMasterProfile(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The profile for the screen: null + not loading while Mix &
+ * Master is off (no analysis runs until the user turns it on),
+ * loading while the analysis/render runs, then the profile. A
+ * settings change re-loads but keeps the previous profile on
+ * screen until the new one lands, so the curve never blanks
+ * while a slider settles.
+ *
+ * The returned value is derived during render from the last
+ * loaded result + the current inputs — the effect only ever
+ * setStates in the load's async callback, never synchronously.
+ */
+export function useMixMasterProfile(
+  originalUri: string | null | undefined,
+  enabled: boolean,
+  stages?: Partial<MixMasterStageSettings> | null,
+): { profile: MixMasterProfile | null; loading: boolean } {
+  const resolvedStages = resolveMixMasterStageSettings(stages);
+  const settingsKey = mixMasterStageSettingsKey(resolvedStages);
+  const key = `${originalUri ?? ''}|${settingsKey}`;
+  const [loaded, setLoaded] = useState<{
+    key: string;
+    profile: MixMasterProfile | null;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!originalUri || !enabled) return;
+    let alive = true;
+    void loadMixMasterProfile(originalUri, resolvedStages).then((profile) => {
+      if (!alive) return;
+      setLoaded({ key, profile });
+    });
+    return () => {
+      alive = false;
+    };
+    // key carries originalUri + the resolved stages; resolvedStages
+    // is re-derived from `stages` above (same values, same key).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [originalUri, enabled, key]);
+
+  if (!originalUri || !enabled) return { profile: null, loading: false };
+  if (loaded && loaded.key === key) return { profile: loaded.profile, loading: false };
+  // Loading for this key — keep the previous profile (if any) on
+  // screen until the new one lands.
+  return { profile: loaded?.profile ?? null, loading: true };
 }
 
 /**
