@@ -44,6 +44,7 @@ export {
   type CompositeResult,
   type LyricAnimationParams,
   type ResolvedLookParams,
+  type ResolvedLyricDecor,
   type ResolvedLyricStyle,
   type ExportProgressEvent,
   type PreviewProgressEvent,

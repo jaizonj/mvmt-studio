@@ -235,6 +235,28 @@ export interface LyricWord {
  * knock lyrics out of sync — the song↔timeline mapping happens once,
  * at the native boundary (src/lib/lyrics.ts).
  */
+/**
+ * Deterministic lyric intelligence for one line (Styles Redesign
+ * Stage 2): computed ONCE at Detect time (and re-computed on manual
+ * line edits) in src/lib/lyrics.ts, then stored here — renderers
+ * never analyse, they only read. Every field is optional: a line
+ * with no keyword match has no emoji, a line with no tone word has
+ * no tone, and a line with nothing to emphasize has no indices.
+ * Never guessed — absence means "no match".
+ */
+export interface LyricLineDecor {
+  /** Relevant emoji for this line, from the keyword dictionary. */
+  emoji?: string;
+  /** Emotional tone tag from the tone word lists. */
+  tone?: 'joy' | 'sad' | 'anger' | 'love' | 'hype';
+  /**
+   * Word indices (into line.words, or into the line's whitespace
+   * tokens when it has no timed words) to emphasize: ALL-CAPS
+   * words, or words that repeat within the line.
+   */
+  emphasisWordIndices?: number[];
+}
+
 export interface LyricLine {
   id: string;
   text: string;
@@ -246,6 +268,8 @@ export interface LyricLine {
    * word-level animations fall back to line-level for them.
    */
   words?: LyricWord[];
+  /** Stored lyric intelligence (emoji / tone / emphasis) — see above. */
+  decor?: LyricLineDecor;
 }
 
 /** How a project's lyrics are drawn — one style per project (v1). */
@@ -293,6 +317,18 @@ export interface ProjectLyrics {
    */
   favoriteFontIds?: string[];
   favoriteAnimationIds?: string[];
+  /**
+   * Active Extra Style template (Styles Redesign Stage 2): the id
+   * of a template in src/lib/lyricTemplates.ts. Undefined = the
+   * classic style — no template, no decor, byte-identical rendering
+   * to before templates existed.
+   */
+  templateId?: string;
+  /**
+   * Extra Styles favorites: template ids hearted in the Extra tab.
+   * Same persistence shape as the font/animation favorites above.
+   */
+  favoriteTemplateIds?: string[];
   /**
    * Global fine offset, in song-timeline frames, applied to EVERY
    * line (and word) when the lyrics are rendered — the Lyrics

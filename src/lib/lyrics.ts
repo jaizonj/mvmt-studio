@@ -3,10 +3,11 @@ import type {
   CompositeLyrics,
   ResolvedLyricStyle,
 } from '../../modules/mvmt-compositor/src/index';
-import type { LyricLine, LyricStyle, LyricWord, ProjectLyrics } from '../types';
+import type { LyricLine, LyricLineDecor, LyricStyle, LyricWord, ProjectLyrics } from '../types';
 import { framesToSeconds, secondsToFrames } from './edl';
 import { DEFAULT_ANIMATION_ID, resolveAnimationParams } from './lyricAnimations';
 import { DEFAULT_FONT_ID, lyricFontById } from './lyricFonts';
+import { lyricTemplateById, resolveLyricDecor } from './lyricTemplates';
 import type { WhisperSegment } from './whisper';
 
 /**
@@ -257,6 +258,184 @@ function cleanLyricText(text: string): string {
   return respellLyricProfanity(stripWhisperBracketTokens(text)).replace(/\s+/g, ' ').trim();
 }
 
+// ---- Lyric intelligence (Styles Redesign Stage 2) -----------------
+// Deterministic, computed ONCE at Detect time (and re-computed on
+// manual line edits), then STORED on the line (LyricLine.decor).
+// Renderers never analyse — they only read. No match = no field;
+// nothing is ever guessed.
+
+/** Keyword → emoji. The FIRST token in line order that matches
+ *  wins, so "dancing in the rain" is 💃, not 🌧️. */
+const LYRIC_EMOJI_KEYWORDS: Record<string, string> = {
+  love: '❤️',
+  heart: '❤️',
+  baby: '💕',
+  kiss: '💋',
+  forever: '💍',
+  heartbreak: '💔',
+  broken: '💔',
+  pain: '💔',
+  hurt: '💔',
+  cry: '😢',
+  tears: '😢',
+  sad: '😢',
+  lonely: '🥀',
+  alone: '🥀',
+  gone: '🥀',
+  sorry: '🙏',
+  miss: '💭',
+  fire: '🔥',
+  hot: '🔥',
+  burn: '🔥',
+  burning: '🔥',
+  money: '💰',
+  cash: '💰',
+  rich: '💰',
+  gold: '✨',
+  diamond: '💎',
+  diamonds: '💎',
+  crown: '👑',
+  king: '👑',
+  queen: '👑',
+  night: '🌙',
+  moon: '🌙',
+  stars: '✨',
+  star: '⭐',
+  dream: '💭',
+  dreams: '💭',
+  sky: '☁️',
+  clouds: '☁️',
+  dance: '💃',
+  dancing: '💃',
+  party: '🎉',
+  club: '🪩',
+  lit: '🔥',
+  rain: '🌧️',
+  storm: '⛈️',
+  thunder: '⚡',
+  lightning: '⚡',
+  snow: '❄️',
+  winter: '❄️',
+  ice: '🧊',
+  cold: '🥶',
+  sun: '☀️',
+  summer: '☀️',
+  beach: '🏖️',
+  ocean: '🌊',
+  sea: '🌊',
+  car: '🚗',
+  drive: '🚗',
+  driving: '🚗',
+  phone: '📱',
+  call: '📱',
+  text: '💬',
+  drink: '🍾',
+  drunk: '🥂',
+  wine: '🍷',
+  coffee: '☕',
+  music: '🎵',
+  song: '🎵',
+  sing: '🎤',
+  mic: '🎤',
+  guitar: '🎸',
+  angel: '😇',
+  heaven: '😇',
+  devil: '😈',
+  hell: '😈',
+  god: '🙏',
+  flower: '🌸',
+  rose: '🌹',
+  roses: '🌹',
+  run: '🏃',
+  running: '🏃',
+  fly: '🕊️',
+  wings: '🕊️',
+  happy: '😄',
+  smile: '😄',
+  laugh: '😂',
+  laughing: '😂',
+  city: '🌆',
+  lights: '✨',
+  neon: '💡',
+  morning: '🌅',
+  sunrise: '🌅',
+  sunset: '🌇',
+};
+
+/** Tone word lists, in priority order — the first tone with a
+ *  matching word wins. */
+const LYRIC_TONE_WORDS: { tone: NonNullable<LyricLineDecor['tone']>; words: string[] }[] = [
+  { tone: 'love', words: ['love', 'baby', 'heart', 'forever', 'kiss', 'darling', 'adore', 'sweetheart', 'mine', 'yours'] },
+  { tone: 'joy', words: ['happy', 'smile', 'laugh', 'joy', 'celebrate', 'sunshine', 'beautiful', 'wonderful', 'amazing', 'alive', 'good', 'great'] },
+  { tone: 'hype', words: ['party', 'lit', 'wild', 'crazy', 'energy', 'dance', 'club', 'fire', 'hot', 'go'] },
+  { tone: 'sad', words: ['sad', 'cry', 'tears', 'lonely', 'alone', 'broken', 'gone', 'pain', 'hurt', 'miss', 'sorry', 'goodbye'] },
+  { tone: 'anger', words: ['hate', 'mad', 'angry', 'fight', 'rage', 'furious', 'damn', 'hell', 'devil'] },
+];
+
+function normalizeLyricToken(token: string): string {
+  return token.toLowerCase().replace(/[^a-z0-9']/g, '');
+}
+
+/**
+ * Analyse one line's text (and its timed words when present):
+ * emoji from the first matching keyword, tone from the first
+ * matching tone list, emphasis for ALL-CAPS words (≥2 letters) and
+ * words that repeat within the line. Returns undefined when
+ * nothing matched — callers store nothing in that case.
+ */
+export function analyzeLyricLine(text: string, words?: LyricWord[]): LyricLineDecor | undefined {
+  const tokens = words && words.length > 0 ? words.map((w) => w.text) : text.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return undefined;
+  const decor: LyricLineDecor = {};
+  for (const token of tokens) {
+    const emoji = LYRIC_EMOJI_KEYWORDS[normalizeLyricToken(token)];
+    if (emoji) {
+      decor.emoji = emoji;
+      break;
+    }
+  }
+  const normalized = tokens.map(normalizeLyricToken);
+  for (const { tone, words: toneWords } of LYRIC_TONE_WORDS) {
+    if (toneWords.some((w) => normalized.includes(w))) {
+      decor.tone = tone;
+      break;
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const n of normalized) counts.set(n, (counts.get(n) ?? 0) + 1);
+  const emphasis: number[] = [];
+  tokens.forEach((token, i) => {
+    const letters = token.replace(/[^A-Za-z]/g, '');
+    const allCaps = letters.length >= 2 && letters === letters.toUpperCase();
+    const repeated = normalized[i].length > 0 && (counts.get(normalized[i]) ?? 0) > 1;
+    if (allCaps || repeated) emphasis.push(i);
+  });
+  if (emphasis.length > 0) decor.emphasisWordIndices = emphasis;
+  return Object.keys(decor).length > 0 ? decor : undefined;
+}
+
+/** Drop a line's stored decor and re-analyse its current text —
+ *  used wherever the text changes (detection, edits, split, merge).
+ *  Returns the line unchanged when the new analysis finds nothing.
+ *  Identity matters: cleanDetectedLyrics promises lines that need
+ *  no change keep their object, so a no-op refresh must return the
+ *  SAME object — not a spread copy with the same fields. */
+function refreshLineDecor(line: LyricLine): LyricLine {
+  const decor = analyzeLyricLine(line.text, line.words);
+  if (!decor) {
+    if (!line.decor) return line;
+    const { decor: _old, ...bare } = line;
+    return bare;
+  }
+  return { ...line, decor };
+}
+
+/** Fill a missing decor (old saved lines, hydration) without
+ *  touching a line that already carries one. */
+function ensureLineDecor(line: LyricLine): LyricLine {
+  return line.decor ? line : refreshLineDecor(line);
+}
+
 /** Dedup key: case, punctuation and spacing don't make a line a
  *  different line. */
 function normalizeLineTextForDedup(text: string): string {
@@ -310,7 +489,9 @@ export function cleanDetectedLyrics(lines: LyricLine[]): LyricLine[] {
     if (prev && normalizeLineTextForDedup(prev.text) === normalizeLineTextForDedup(next.text)) {
       continue; // consecutive echo repeat — the first occurrence wins
     }
-    cleaned.push(next);
+    // Hydration: an old saved line carries no decor — analyse it
+    // now so every stored line has its intelligence attached.
+    cleaned.push(ensureLineDecor(next));
   }
   return cleaned;
 }
@@ -324,7 +505,7 @@ function lineFromWords(words: TimedWord[], fps: number): LyricLine {
     const wEnd = i === words.length - 1 ? endFrame : Math.max(secondsToFrames(w.endSeconds, fps), wStart + 1);
     return { text: w.text, startFrame: wStart, endFrame: wEnd };
   });
-  return { id: newLyricLineId(), text: lineText(words), startFrame, endFrame, words: timed };
+  return refreshLineDecor({ id: newLyricLineId(), text: lineText(words), startFrame, endFrame, words: timed });
 }
 
 /**
@@ -349,12 +530,14 @@ export function groupWhisperSegments(segments: WhisperSegment[], fps: number): L
       const text = cleanLyricText(segment.text);
       if (text.length > 0) {
         const startFrame = secondsToFrames(segment.startSeconds, fps);
-        lines.push({
-          id: newLyricLineId(),
-          text,
-          startFrame,
-          endFrame: Math.max(secondsToFrames(segment.endSeconds, fps), startFrame + 1),
-        });
+        lines.push(
+          refreshLineDecor({
+            id: newLyricLineId(),
+            text,
+            startFrame,
+            endFrame: Math.max(secondsToFrames(segment.endSeconds, fps), startFrame + 1),
+          }),
+        );
       }
       continue;
     }
@@ -402,13 +585,13 @@ export function lineAtSongFrame(lines: LyricLine[], songFrame: number): LyricLin
 export function retimeLineWordsForText(line: LyricLine, newText: string): LyricLine {
   const tokens = newText.trim().split(/\s+/).filter(Boolean);
   if (!line.words || tokens.length === 0 || tokens.length !== line.words.length) {
-    return { ...line, text: newText, words: undefined };
+    return refreshLineDecor({ ...line, text: newText, words: undefined });
   }
-  return {
+  return refreshLineDecor({
     ...line,
     text: newText,
     words: line.words.map((word, i) => ({ ...word, text: tokens[i] })),
-  };
+  });
 }
 
 /**
@@ -426,14 +609,19 @@ export function splitLineAtWord(line: LyricLine, wordIndex: number): [LyricLine,
     const splitFrame = secondWords[0].startFrame;
     if (splitFrame <= line.startFrame || splitFrame >= line.endFrame) return null;
     return [
-      { ...line, text: firstWords.map((w) => w.text).join(' '), endFrame: splitFrame, words: firstWords },
-      {
+      refreshLineDecor({
+        ...line,
+        text: firstWords.map((w) => w.text).join(' '),
+        endFrame: splitFrame,
+        words: firstWords,
+      }),
+      refreshLineDecor({
         id: newLyricLineId(),
         text: secondWords.map((w) => w.text).join(' '),
         startFrame: splitFrame,
         endFrame: line.endFrame,
         words: secondWords,
-      },
+      }),
     ];
   }
   const tokens = line.text.trim().split(/\s+/).filter(Boolean);
@@ -444,21 +632,27 @@ export function splitLineAtWord(line: LyricLine, wordIndex: number): [LyricLine,
   const splitFrame = Math.round(line.startFrame + (line.endFrame - line.startFrame) * fraction);
   if (splitFrame <= line.startFrame || splitFrame >= line.endFrame) return null;
   return [
-    { ...line, text: firstText, endFrame: splitFrame, words: undefined },
-    { id: newLyricLineId(), text: secondText, startFrame: splitFrame, endFrame: line.endFrame, words: undefined },
+    refreshLineDecor({ ...line, text: firstText, endFrame: splitFrame, words: undefined }),
+    refreshLineDecor({
+      id: newLyricLineId(),
+      text: secondText,
+      startFrame: splitFrame,
+      endFrame: line.endFrame,
+      words: undefined,
+    }),
   ];
 }
 
 /** Merge two lines (a first) into one, keeping a's id. Words survive
  *  only when BOTH lines carry them. */
 export function mergeLyricLines(a: LyricLine, b: LyricLine): LyricLine {
-  return {
+  return refreshLineDecor({
     id: a.id,
     text: [a.text.trim(), b.text.trim()].filter(Boolean).join(' '),
     startFrame: Math.min(a.startFrame, b.startFrame),
     endFrame: Math.max(a.endFrame, b.endFrame),
     words: a.words && b.words ? [...a.words, ...b.words] : undefined,
-  };
+  });
 }
 
 /** Shift every line (and its words) by `deltaFrames`, clamped so no
@@ -521,6 +715,12 @@ export function buildCompositeLyrics(
   // at the one boundary every renderer (preview overlay + export
   // burn-in) reads, so the authored line timings never change.
   const offset = Math.round(lyrics.offsetFrames ?? 0);
+  // Extra Styles (Stage 2): the template's resolved decor rides
+  // the same payload as the style, and each line carries its
+  // stored intelligence (emoji / tone / emphasis) — but ONLY when
+  // a template is active. The classic path (no templateId) emits
+  // exactly the keys it always has.
+  const template = lyricTemplateById(lyrics.templateId);
   const out: CompositeLyricLine[] = [];
   for (const line of sortLyricLines(lyrics.lines)) {
     const startTl = songFrameToTimelineFrame(line.startFrame, regionStartFrame) + offset;
@@ -544,8 +744,15 @@ export function buildCompositeLyrics(
       startSeconds: framesToSeconds(clampedStart, fps),
       endSeconds: framesToSeconds(endTl, fps),
       ...(words && words.length > 0 ? { words } : {}),
+      ...(template && line.decor?.emoji ? { emoji: line.decor.emoji } : {}),
+      ...(template && line.decor?.tone ? { tone: line.decor.tone } : {}),
+      ...(template && line.decor?.emphasisWordIndices ? { emphasisWordIndices: line.decor.emphasisWordIndices } : {}),
     });
   }
   if (out.length === 0) return null;
-  return { lines: out, style: resolveLyricStyle(lyrics.style) };
+  return {
+    lines: out,
+    style: resolveLyricStyle(lyrics.style),
+    ...(template ? { decor: resolveLyricDecor(template.decor) } : {}),
+  };
 }

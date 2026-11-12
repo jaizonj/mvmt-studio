@@ -1,7 +1,12 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { StyleSheet, Text, View, type TextStyle, type ViewStyle } from 'react-native';
 
-import type { CompositeLyrics, LyricAnimationParams, ResolvedLyricStyle } from '../lib/compositor';
+import type {
+  CompositeLyrics,
+  LyricAnimationParams,
+  ResolvedLyricDecor,
+  ResolvedLyricStyle,
+} from '../lib/compositor';
 import { lyricFontByPostScriptName } from '../lib/lyricFonts';
 
 /**
@@ -129,6 +134,8 @@ export function LyricsOverlay({
 
   const style: ResolvedLyricStyle = lyrics.style;
   const anim = style.animation;
+  const decor: ResolvedLyricDecor | undefined = lyrics.decor;
+  const lineIndex = lyrics.lines.indexOf(active);
   const fontSize = Math.max(8, style.sizeRatio * width);
   const font = lyricFontByPostScriptName(style.fontPostScriptName);
   const duration = Math.max(0.01, active.endSeconds - active.startSeconds);
@@ -142,8 +149,16 @@ export function LyricsOverlay({
     color: style.color,
     textAlign: 'center',
     lineHeight: fontSize * 1.22,
+    // Glow decor (Neon Sign, Karaoke Pop): a soft halo around the
+    // glyphs — the preview stand-in for the native shadow.
+    ...(decor?.kind === 'glow'
+      ? { textShadowColor: decor.color, textShadowOffset: { width: 0, height: 0 }, textShadowRadius: fontSize * 0.5 }
+      : {}),
   };
   const strokeWidth = style.strokeColor ? Math.max(0, (style.strokeWidthRatio ?? 0) * fontSize) : 0;
+  // Comic-burst emphasis: a flagged word renders 25% larger.
+  const isEmphasisWord = (i: number) =>
+    decor?.kind === 'comic-burst' && (active.emphasisWordIndices ?? []).includes(i);
 
   const lineW = lineSize.w > 0 ? lineSize.w : width * 0.8;
   const lineH = lineSize.h > 0 ? lineSize.h : fontSize * 1.3;
@@ -169,7 +184,12 @@ export function LyricsOverlay({
   // Karaoke without word timings degrades to line-level ('none').
   const wordMode = anim.wordMode === 'karaoke' && !hasWordTimes ? 'none' : anim.wordMode;
 
-  let content: ReactNode;
+  // The line's own content (no decor): either one whole-line unit
+  // or one unit per word. `lineUnit` is the enter/exit transform
+  // for the whole line — the emoji row shares it, so the emoji
+  // enters with the line exactly like the native burn-in.
+  let lineUnit: UnitStyle;
+  let inner: ReactNode;
   if (wordMode === 'none' || words.length === 0) {
     const e = Math.min(enterE(anim, tIn), exitE(anim, tOut));
     const state = stateFromE(anim, e);
@@ -179,30 +199,49 @@ export function LyricsOverlay({
       const period = Math.min(1.2, Math.max(0.2, duration));
       pulse = 1 + (anim.emphasisScale - 1) * (0.5 - 0.5 * Math.cos((2 * Math.PI * tIn) / period));
     }
-    content = (
+    lineUnit = toUnit(state, pulse);
+    inner = (
       <OutlinedText
         text={active.text}
         textStyle={textStyle}
         strokeColor={style.strokeColor}
         strokeWidth={strokeWidth}
-        unitStyle={toUnit(state, pulse)}
       />
     );
   } else {
     // Word modes: the exit envelope applies to the whole line; enter
     // behaviour is per word (stagger / karaoke / typewriter).
-    const wrapUnit = toUnit(stateFromE(anim, exitE(anim, tOut)));
+    lineUnit = toUnit(stateFromE(anim, exitE(anim, tOut)));
     const wordUnits = words.map((word, i) => {
       let unit: UnitStyle | undefined;
       let hidden = false;
       if (wordMode === 'stagger') {
-        unit = toUnit(stateFromE(anim, enterE(anim, tIn - i * anim.wordStaggerSecs)));
+        const e = enterE(anim, tIn - i * anim.wordStaggerSecs);
+        let unitState = stateFromE(anim, e);
+        if (decor?.kind === 'burst') {
+          // Word Explosion: words fly in from above, fanned
+          // across the line (30°…150°).
+          const count = Math.max(1, words.length);
+          const angle = ((30 + (count > 1 ? (i / (count - 1)) * 120 : 60)) * Math.PI) / 180;
+          const distance = fontSize * 2.2 * (decor.scale ?? 1);
+          const burst = 1 - e;
+          unitState = {
+            ...unitState,
+            dxFrac: unitState.dxFrac + (Math.cos(angle) * distance * burst) / lineW,
+            dyFrac: unitState.dyFrac - (Math.sin(angle) * distance * burst) / lineH,
+            scale: unitState.scale * (0.3 + 0.7 * e),
+          };
+        }
+        unit = toUnit(unitState, isEmphasisWord(i) ? 1.25 : 1);
       } else if (wordMode === 'karaoke') {
         const start = word.start ?? active.startSeconds;
         const end = word.end ?? active.endSeconds;
+        // Comic-burst emphasis: a flagged word stays 25% larger.
+        const emphasis = isEmphasisWord(i) ? 1.25 : 1;
         if (positionSeconds < start) unit = { opacity: 0.45, transform: [] };
-        else if (positionSeconds < end) unit = { opacity: 1, transform: [{ scale: anim.emphasisScale }] };
-        else unit = { opacity: 1, transform: [] };
+        else if (positionSeconds < end)
+          unit = { opacity: 1, transform: [{ scale: anim.emphasisScale * emphasis }] };
+        else unit = { opacity: 1, transform: emphasis === 1 ? [] : [{ scale: emphasis }] };
       } else {
         // typewriter
         const start = word.start ?? active.startSeconds + (duration * i) / Math.max(1, words.length);
@@ -220,8 +259,175 @@ export function LyricsOverlay({
         />
       );
     });
+    // Typewriter cursor: a block after the last word, blinking
+    // every 0.5 s off the playhead (no timer needed).
+    const cursorNode =
+      decor?.kind === 'cursor' && wordMode === 'typewriter' ? (
+        <View
+          style={{
+            width: fontSize * 0.45,
+            height: fontSize * 1.1,
+            backgroundColor: decor.color,
+            borderRadius: 2,
+            opacity: Math.floor(positionSeconds * 2) % 2 === 0 ? 1 : 0,
+          }}
+        />
+      ) : null;
+    inner = (
+      <View style={[styles.wordRow, { gap: fontSize * 0.24 }]}>
+        {wordUnits}
+        {cursorNode}
+      </View>
+    );
+  }
+
+  // Emoji row (Extra Styles): the line's stored emoji above the
+  // text, inside the line's own animated unit.
+  const emojiNode =
+    decor?.kind === 'emoji-row' && active.emoji ? (
+      <Text style={{ fontSize: fontSize * 1.15 * (decor.scale ?? 1), textAlign: 'center' }}>{active.emoji}</Text>
+    ) : null;
+
+  let content: ReactNode = (
+    <View style={lineUnit}>
+      {emojiNode}
+      {inner}
+    </View>
+  );
+
+  // Decor frames around the line (Extra Styles). Background shapes
+  // are absolute layers behind the text; the bubble tail and the
+  // comic "POW" label hang off the frame.
+  if (decor?.kind === 'chat-bubble') {
+    const isSender = lineIndex % 2 === 0;
+    const bubbleColor = isSender ? decor.color : decor.secondaryColor;
     content = (
-      <View style={[styles.wordRow, { gap: fontSize * 0.24 }, wrapUnit]}>{wordUnits}</View>
+      <View
+        style={{
+          backgroundColor: bubbleColor,
+          borderRadius: fontSize * 0.5,
+          paddingHorizontal: fontSize * 0.55,
+          paddingVertical: fontSize * 0.22,
+          transform: [{ translateX: (isSender ? 1 : -1) * width * 0.06 }],
+        }}>
+        {content}
+        <View
+          style={{
+            position: 'absolute',
+            bottom: -fontSize * 0.22,
+            ...(isSender ? { right: fontSize * 0.5 } : { left: fontSize * 0.5 }),
+            width: 0,
+            height: 0,
+            borderLeftWidth: fontSize * 0.22,
+            borderRightWidth: fontSize * 0.22,
+            borderTopWidth: fontSize * 0.28,
+            borderLeftColor: 'transparent',
+            borderRightColor: 'transparent',
+            borderTopColor: bubbleColor,
+          }}
+        />
+      </View>
+    );
+  } else if (decor?.kind === 'comic-burst') {
+    content = (
+      <View
+        style={{
+          backgroundColor: decor.color,
+          borderRadius: fontSize * 0.35,
+          borderWidth: Math.max(2, fontSize * 0.06),
+          borderColor: decor.secondaryColor,
+          paddingHorizontal: fontSize * 0.7,
+          paddingVertical: fontSize * 0.35,
+          transform: [{ rotate: '-2deg' }],
+        }}>
+        {content}
+        {decor.text ? (
+          <Text
+            style={{
+              position: 'absolute',
+              top: -fontSize * 0.35,
+              right: -fontSize * 0.2,
+              fontSize: fontSize * 0.55,
+              fontWeight: '900',
+              color: decor.secondaryColor,
+              transform: [{ rotate: '8deg' }],
+            }}>
+            {decor.text}
+          </Text>
+        ) : null}
+      </View>
+    );
+  } else if (decor?.kind === 'sticker-frame') {
+    const dot = fontSize * 0.22;
+    const dotStyle = (
+      vertical: { top: number } | { bottom: number },
+      horizontal: { left: number } | { right: number },
+      color: string,
+    ): ViewStyle => ({
+      position: 'absolute',
+      width: dot,
+      height: dot,
+      borderRadius: dot / 2,
+      backgroundColor: color,
+      ...vertical,
+      ...horizontal,
+    });
+    content = (
+      <View
+        style={{
+          borderWidth: Math.max(2, fontSize * 0.07),
+          borderColor: '#FFFFFF',
+          borderRadius: fontSize * 0.2,
+          paddingHorizontal: fontSize * 0.4,
+          paddingVertical: fontSize * 0.28,
+          transform: [{ rotate: '-2deg' }],
+        }}>
+        {content}
+        <View style={dotStyle({ top: -dot / 2 }, { left: -dot / 2 }, decor.color)} />
+        <View style={dotStyle({ top: -dot / 2 }, { right: -dot / 2 }, decor.secondaryColor)} />
+        <View style={dotStyle({ bottom: -dot / 2 }, { left: -dot / 2 }, decor.secondaryColor)} />
+        <View style={dotStyle({ bottom: -dot / 2 }, { right: -dot / 2 }, decor.color)} />
+      </View>
+    );
+  } else if (decor?.kind === 'pill') {
+    content = (
+      <View>
+        <View
+          style={{
+            position: 'absolute',
+            top: -fontSize * 0.2,
+            bottom: -fontSize * 0.2,
+            left: -fontSize * 0.9,
+            right: -fontSize * 0.9,
+            backgroundColor: decor.color,
+            opacity: decor.opacity,
+            borderRadius: fontSize * 0.4,
+          }}
+        />
+        {content}
+      </View>
+    );
+  } else if (decor?.kind === 'scanlines') {
+    const scanCount = 8;
+    content = (
+      <View>
+        {content}
+        {Array.from({ length: scanCount }, (_, i) => (
+          <View
+            key={i}
+            pointerEvents="none"
+            style={{
+              position: 'absolute',
+              left: -fontSize * 0.5,
+              right: -fontSize * 0.5,
+              top: `${(((i + 0.5) / scanCount) * 100).toFixed(1)}%`,
+              height: 2,
+              backgroundColor: decor.color,
+              opacity: (decor.opacity ?? 0.5) * 0.4,
+            }}
+          />
+        ))}
+      </View>
     );
   }
 

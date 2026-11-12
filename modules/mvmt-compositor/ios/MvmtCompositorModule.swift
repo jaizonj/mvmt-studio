@@ -420,6 +420,18 @@ struct LyricLineRecord: Record {
   /// renders and animates as a whole.
   @Field
   var words: [LyricWordRecord]? = nil
+
+  /// Stored lyric intelligence (Extra Styles, Stage 2): the line's
+  /// emoji, tone tag, and emphasis word indices. Nil/absent = none.
+  /// Renderers read these; they never compute them.
+  @Field
+  var emoji: String? = nil
+
+  @Field
+  var tone: String? = nil
+
+  @Field
+  var emphasisWordIndices: [Int]? = nil
 }
 
 struct LyricAnimationRecord: Record {
@@ -510,12 +522,42 @@ struct LyricStyleRecord: Record {
   var animation: LyricAnimationRecord
 }
 
+/// An Extra Style template's decor, resolved (Stage 2): every
+/// field carries a value (the JS side folds defaults in). The
+/// native side applies it generically — one CALayer-subtree builder
+/// per `kind` — it has no template catalog.
+struct LyricDecorRecord: Record {
+  /// 'emoji-row' | 'chat-bubble' | 'comic-burst' | 'sticker-frame'
+  /// | 'scanlines' | 'glow' | 'cursor' | 'burst' | 'pill'
+  @Field
+  var kind: String = "none"
+
+  @Field
+  var color: String = "#FFFFFF"
+
+  @Field
+  var secondaryColor: String = "#101114"
+
+  @Field
+  var opacity: Double = 1
+
+  @Field
+  var scale: Double = 1
+
+  @Field
+  var text: String = ""
+}
+
 struct LyricsRecord: Record {
   @Field
   var lines: [LyricLineRecord]
 
   @Field
   var style: LyricStyleRecord
+
+  /// Extra Style decor for the whole project. Nil = classic style.
+  @Field
+  var decor: LyricDecorRecord? = nil
 }
 
 struct CompositeResultRecord: Record {
@@ -1852,6 +1894,188 @@ private enum MvmtCompositorEngine {
     layer.add(pop, forKey: "lyricWordPop")
   }
 
+  /// A jagged starburst polygon (comic-burst): `spikes` outer
+  /// points alternating with inner points at `innerRatio` of the
+  /// rect's radii.
+  private static func lyricStarburstPath(in rect: CGRect, spikes: Int, innerRatio: CGFloat) -> CGPath {
+    let path = UIBezierPath()
+    let cx = rect.midX
+    let cy = rect.midY
+    let outerRx = rect.width / 2
+    let outerRy = rect.height / 2
+    let total = max(4, spikes) * 2
+    for i in 0..<total {
+      let angle = CGFloat(i) * .pi / CGFloat(max(4, spikes)) - .pi / 2
+      let r: CGFloat = i % 2 == 0 ? 1 : innerRatio
+      let point = CGPoint(x: cx + cos(angle) * outerRx * r, y: cy + sin(angle) * outerRy * r)
+      if i == 0 {
+        path.move(to: point)
+      } else {
+        path.addLine(to: point)
+      }
+    }
+    path.close()
+    return path.cgPath
+  }
+
+  /// Extra Style background shapes, drawn behind the text inside
+  /// the inner layer (so they follow the line's enter/exit). Only
+  /// the background kinds draw here; scanlines / glow / cursor /
+  /// burst are applied at their own points in makeLyricLineLayer.
+  private static func addLyricDecorBackground(
+    to layer: CALayer,
+    decor: LyricDecorRecord,
+    lineIndex: Int,
+    containerSize: CGSize,
+    fontSize: CGFloat
+  ) {
+    let rect = CGRect(origin: .zero, size: containerSize)
+    switch decor.kind {
+    case "chat-bubble":
+      // Sender (even line) in decor.color, receiver (odd line) in
+      // decor.secondaryColor — the alternating conversation. The
+      // tail hangs off the bottom edge.
+      let isSender = lineIndex % 2 == 0
+      let fill = lyricColor(isSender ? decor.color : decor.secondaryColor) ?? .white
+      let path = UIBezierPath(roundedRect: rect, cornerRadius: containerSize.height * 0.35)
+      let tailW = fontSize * 0.45
+      let tailH = fontSize * 0.3
+      let tailX = isSender ? rect.maxX - rect.width * 0.22 : rect.minX + rect.width * 0.22
+      path.move(to: CGPoint(x: tailX - tailW / 2, y: 1))
+      path.addLine(to: CGPoint(x: tailX, y: -tailH))
+      path.addLine(to: CGPoint(x: tailX + tailW / 2, y: 1))
+      path.close()
+      let shape = CAShapeLayer()
+      shape.path = path.cgPath
+      shape.fillColor = fill.cgColor
+      shape.frame = rect
+      layer.addSublayer(shape)
+    case "comic-burst":
+      // Jagged starburst behind the line, with the decor's burst
+      // word ("POW") as a small rotated label at the top-right.
+      let fill = lyricColor(decor.color) ?? .yellow
+      let stroke = lyricColor(decor.secondaryColor) ?? .black
+      let pad = fontSize * 0.35
+      let shape = CAShapeLayer()
+      shape.path = lyricStarburstPath(in: rect.insetBy(dx: -pad, dy: -pad), spikes: 12, innerRatio: 0.78)
+      shape.fillColor = fill.cgColor
+      shape.strokeColor = stroke.cgColor
+      shape.lineWidth = max(2, fontSize * 0.06)
+      shape.frame = rect
+      layer.addSublayer(shape)
+      if !decor.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let labelFont = UIFont.systemFont(ofSize: fontSize * 0.55, weight: .black)
+        if let rendered = lyricTextImage(
+          decor.text, font: labelFont, fillColor: stroke, strokeColor: nil,
+          strokeFractionOfFont: 0, boldStrokeFallback: false, pad: 2, scale: 2
+        ) {
+          let label = CALayer()
+          label.contents = rendered.image
+          label.contentsScale = 2
+          label.contentsGravity = .resize
+          label.bounds = CGRect(origin: .zero, size: rendered.displaySize)
+          label.position = CGPoint(
+            x: containerSize.width - rendered.displaySize.width / 2,
+            y: containerSize.height - rendered.displaySize.height / 2 + fontSize * 0.15
+          )
+          label.transform = CATransform3DMakeRotation(-8 * .pi / 180, 0, 0, 1)
+          layer.addSublayer(label)
+        }
+      }
+    case "sticker-frame":
+      // White frame, slightly rotated, with coloured corner dots.
+      let frame = CAShapeLayer()
+      frame.path = UIBezierPath(roundedRect: rect, cornerRadius: fontSize * 0.2).cgPath
+      frame.fillColor = nil
+      frame.strokeColor = UIColor.white.cgColor
+      frame.lineWidth = max(2, fontSize * 0.07)
+      frame.frame = rect
+      frame.transform = CATransform3DMakeRotation(-2 * .pi / 180, 0, 0, 1)
+      layer.addSublayer(frame)
+      let dotSize = fontSize * 0.22
+      let dotColors = [
+        lyricColor(decor.color), lyricColor(decor.secondaryColor),
+        lyricColor(decor.secondaryColor), lyricColor(decor.color),
+      ]
+      let corners = [
+        CGPoint(x: 0, y: containerSize.height),
+        CGPoint(x: containerSize.width, y: containerSize.height),
+        CGPoint(x: 0, y: 0),
+        CGPoint(x: containerSize.width, y: 0),
+      ]
+      for (i, corner) in corners.enumerated() {
+        let dot = CALayer()
+        dot.backgroundColor = (dotColors[i] ?? .white)?.cgColor
+        dot.bounds = CGRect(origin: .zero, size: CGSize(width: dotSize, height: dotSize))
+        dot.cornerRadius = dotSize / 2
+        dot.position = corner
+        layer.addSublayer(dot)
+      }
+    case "pill":
+      // A wide subtitle bar, broader than the text.
+      let base = lyricColor(decor.color) ?? .black
+      let alpha = CGFloat(lyricClamp(lyricFinite(decor.opacity, 0.7), 0, 1))
+      let bar = CALayer()
+      bar.frame = rect
+      bar.backgroundColor = base.withAlphaComponent(alpha).cgColor
+      bar.cornerRadius = containerSize.height / 2
+      layer.addSublayer(bar)
+    default:
+      break
+    }
+  }
+
+  /// Per-word entrance for the 'burst' decor (Word Explosion):
+  /// the word flies in from above at `angleDeg`, fanned across
+  /// the line, from 0.3× scale — instead of the shared
+  /// from-transform. Same opacity + transform basics as the
+  /// stagger enter.
+  private static func addLyricWordBurstAnimation(
+    to layer: CALayer,
+    animation: LyricAnimationRecord,
+    wordBegin: Double,
+    lineEnd: Double,
+    angleDeg: Double,
+    distance: CGFloat
+  ) {
+    let enter = max(0, lyricFinite(animation.enterSecs, 0))
+    let available = lineEnd - wordBegin
+    guard enter > 0, available > 0.02 else {
+      layer.opacity = 1
+      return
+    }
+    layer.opacity = 0
+    let duration = min(enter, available)
+    let fromOpacity = lyricClamp(lyricFinite(animation.fromOpacity, 0), 0, 1)
+    let radians = CGFloat(angleDeg) * .pi / 180
+    let fromTransform = CATransform3DConcat(
+      CATransform3DMakeTranslation(cos(radians) * distance, sin(radians) * distance, 0),
+      CATransform3DConcat(
+        CATransform3DMakeRotation(CGFloat(lyricFinite(animation.fromRotateDeg, 0)) * .pi / 180, 0, 0, 1),
+        CATransform3DMakeScale(0.3, 0.3, 1)
+      )
+    )
+    let opacityAnimation = CABasicAnimation(keyPath: "opacity")
+    opacityAnimation.fromValue = NSNumber(value: fromOpacity)
+    opacityAnimation.toValue = NSNumber(value: 1.0)
+    opacityAnimation.duration = duration
+    opacityAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + wordBegin
+    opacityAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    opacityAnimation.fillMode = .both
+    opacityAnimation.isRemovedOnCompletion = false
+    layer.add(opacityAnimation, forKey: "lyricWordOpacity")
+
+    let transformAnimation = CABasicAnimation(keyPath: "transform")
+    transformAnimation.fromValue = NSValue(caTransform3D: fromTransform)
+    transformAnimation.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+    transformAnimation.duration = duration
+    transformAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + wordBegin
+    transformAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    transformAnimation.fillMode = .both
+    transformAnimation.isRemovedOnCompletion = false
+    layer.add(transformAnimation, forKey: "lyricWordTransform")
+  }
+
   /// Builds every lyric line's layer subtree. Returns true when at
   /// least one line was added.
   private static func addLyricLayers(
@@ -1870,10 +2094,12 @@ private enum MvmtCompositorEngine {
     guard baseFontSize >= 4 else { return false }
 
     var added = false
-    for line in lyrics.lines {
+    for (index, line) in lyrics.lines.enumerated() {
       if let lineLayer = makeLyricLineLayer(
         line: line,
+        lineIndex: index,
         style: style,
+        decor: lyrics.decor,
         fillColor: fillColor,
         strokeColor: strokeColor,
         strokeFraction: strokeFraction,
@@ -1890,9 +2116,14 @@ private enum MvmtCompositorEngine {
 
   /// Builds one line's gate-layer subtree (see the section header
   /// for the hierarchy), or nil when the line cannot be rendered.
+  /// `lineIndex` is the line's position in the song (chat bubbles
+  /// alternate sides by it); `decor` is the project's Extra Style
+  /// decor, or nil for the classic style.
   private static func makeLyricLineLayer(
     line: LyricLineRecord,
+    lineIndex: Int,
     style: LyricStyleRecord,
+    decor: LyricDecorRecord?,
     fillColor: UIColor,
     strokeColor: UIColor?,
     strokeFraction: Double,
@@ -1900,6 +2131,7 @@ private enum MvmtCompositorEngine {
     renderSize: CGSize,
     durationSeconds: Double
   ) -> CALayer? {
+    let decorKind = decor?.kind ?? "none"
     let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return nil }
 
@@ -1978,6 +2210,46 @@ private enum MvmtCompositorEngine {
     }
     let useWords = !words.isEmpty
 
+    // Emoji row (Extra Styles): the line's stored emoji rendered
+    // above the text, inside the same content block — the text
+    // block is pushed down by `textTopOffset` below. Emoji render
+    // in the system font (colour emoji glyphs), never the lyric
+    // font, which may not carry them.
+    var emojiLayer: CALayer?
+    var emojiDisplaySize = CGSize.zero
+    let emojiGap = baseFontSize * 0.25
+    if decorKind == "emoji-row",
+      let emojiText = line.emoji?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !emojiText.isEmpty
+    {
+      let emojiSize = baseFontSize * 1.15 * CGFloat(lyricClamp(lyricFinite(decor?.scale ?? 1, 1), 0.5, 3))
+      let emojiFont = UIFont.systemFont(ofSize: emojiSize)
+      if let rendered = lyricTextImage(
+        emojiText,
+        font: emojiFont,
+        fillColor: .white,
+        strokeColor: nil,
+        strokeFractionOfFont: 0,
+        boldStrokeFallback: false,
+        pad: 2,
+        scale: 2
+      ) {
+        let layer = CALayer()
+        layer.contents = rendered.image
+        layer.contentsScale = 2
+        layer.contentsGravity = .resize
+        layer.bounds = CGRect(origin: .zero, size: rendered.displaySize)
+        emojiLayer = layer
+        emojiDisplaySize = rendered.displaySize
+      }
+    }
+    let textTopOffset: CGFloat = emojiLayer == nil ? 0 : emojiDisplaySize.height + emojiGap
+
+    // Emphasis words (Extra Styles): word indices the stored
+    // intelligence flagged (ALL-CAPS / repeated). Only the
+    // comic-burst decor enlarges them, at render time.
+    let emphasisIndices = Set(line.emphasisWordIndices ?? [])
+
     // Image padding around the measured text (room for the
     // stroke's overhang): generous for a whole line, tighter per
     // word — per-word pads ADD UP across a line, so word renders
@@ -2014,14 +2286,20 @@ private enum MvmtCompositorEngine {
         // colour at 45% opacity; the highlight twin renders at
         // full strength and pops in at the word's start.
         let baseFill = isKaraoke ? fillColor.withAlphaComponent(0.45) : fillColor
+        // Comic-burst emphasis: a flagged word renders 25% larger.
+        let isEmphasis = decorKind == "comic-burst" && emphasisIndices.contains(index)
+        let wordFont = isEmphasis
+          ? lyricFont(postScriptName: style.fontPostScriptName, size: baseFontSize * 1.25, bold: style.bold)
+          : font
+        let wordBoldFallback = style.bold && !wordFont.fontDescriptor.symbolicTraits.contains(.traitBold)
         guard
           let rendered = lyricTextImage(
             word.text,
-            font: font,
+            font: wordFont,
             fillColor: baseFill,
             strokeColor: strokeColor,
             strokeFractionOfFont: strokeFraction,
-            boldStrokeFallback: boldFallback,
+            boldStrokeFallback: wordBoldFallback,
             pad: wordPad,
             scale: renderScale
           )
@@ -2069,7 +2347,7 @@ private enum MvmtCompositorEngine {
           layer: wordLayer,
           highlight: highlightLayer,
           centerX: cursorX + wordWidth / 2,
-          centerY: rowY + rendered.displaySize.height / 2,
+          centerY: textTopOffset + rowY + rendered.displaySize.height / 2,
           row: rowIndex,
           wordStart: word.start,
           index: index
@@ -2080,8 +2358,8 @@ private enum MvmtCompositorEngine {
       guard !wordEntries.isEmpty else { return nil }
       rowWidths.append(cursorX - spaceWidth)
       contentSize = CGSize(
-        width: rowWidths.max() ?? 0,
-        height: rowY + rowHeight
+        width: max(rowWidths.max() ?? 0, emojiDisplaySize.width),
+        height: textTopOffset + rowY + rowHeight
       )
     } else {
       guard
@@ -2102,17 +2380,32 @@ private enum MvmtCompositorEngine {
       imageLayer.contentsGravity = .resize
       imageLayer.bounds = CGRect(origin: .zero, size: rendered.displaySize)
       singleLayer = imageLayer
-      contentSize = rendered.displaySize
+      contentSize = CGSize(
+        width: max(rendered.displaySize.width, emojiDisplaySize.width),
+        height: textTopOffset + rendered.displaySize.height
+      )
     }
     guard contentSize.width > 0, contentSize.height > 0 else { return nil }
 
     // ---- Container: the pill adds padding around the content ----
-    let wantsPill = style.background == "pill"
+    // A decor background shape (bubble / burst / frame / bar)
+    // replaces the style pill — the decor draws the backing.
+    let decorBackgroundKinds: Set<String> = ["chat-bubble", "comic-burst", "sticker-frame", "pill"]
+    let wantsPill = style.background == "pill" && !decorBackgroundKinds.contains(decorKind)
     let pillPadX = wantsPill ? font.pointSize * 0.55 : 0
     let pillPadY = wantsPill ? font.pointSize * 0.24 : 0
+    var decorPadX: CGFloat = 0
+    var decorPadY: CGFloat = 0
+    switch decorKind {
+    case "chat-bubble": decorPadX = font.pointSize * 0.8; decorPadY = font.pointSize * 0.4
+    case "comic-burst": decorPadX = font.pointSize * 1.0; decorPadY = font.pointSize * 0.55
+    case "sticker-frame": decorPadX = font.pointSize * 0.55; decorPadY = font.pointSize * 0.4
+    case "pill": decorPadX = font.pointSize * 1.1; decorPadY = font.pointSize * 0.3
+    default: break
+    }
     let containerSize = CGSize(
-      width: contentSize.width + pillPadX * 2,
-      height: contentSize.height + pillPadY * 2
+      width: contentSize.width + (pillPadX + decorPadX) * 2,
+      height: contentSize.height + (pillPadY + decorPadY) * 2
     )
 
     // Anchor: centred horizontally; vertically per style.position
@@ -2159,11 +2452,44 @@ private enum MvmtCompositorEngine {
       innerLayer.addSublayer(pillLayer)
     }
 
+    // Extra Style background shapes, behind the text.
+    if let decor = decor {
+      addLyricDecorBackground(
+        to: innerLayer,
+        decor: decor,
+        lineIndex: lineIndex,
+        containerSize: containerSize,
+        fontSize: font.pointSize
+      )
+    }
+
     // Content is centred in the container (pill padding is
     // symmetric, so the content centre is the container centre).
     let contentCentre = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    // The text block's centre (the emoji row, when present, takes
+    // the top of the content area).
+    let textHeight = contentSize.height - textTopOffset
+    let textCentreY = contentCentre.y + (contentSize.height / 2 - (textTopOffset + textHeight / 2))
+    if let emojiLayer {
+      emojiLayer.position = CGPoint(
+        x: contentCentre.x,
+        y: contentCentre.y + (contentSize.height / 2 - emojiDisplaySize.height / 2)
+      )
+      innerLayer.addSublayer(emojiLayer)
+    }
+    // Glow (Extra Styles): a soft shadow behind the text image
+    // layers — the neon/hologram halo.
+    let glowColor = decorKind == "glow" ? lyricColor(decor?.color) : nil
+    let glowOpacity: Float = glowColor == nil ? 0 : Float(lyricClamp(lyricFinite(decor?.opacity ?? 0.6, 0.6), 0, 1))
+    let glowRadius = font.pointSize * 0.4
     if let singleLayer {
-      singleLayer.position = contentCentre
+      singleLayer.position = CGPoint(x: contentCentre.x, y: textCentreY)
+      if let glowColor {
+        singleLayer.shadowColor = glowColor.cgColor
+        singleLayer.shadowOpacity = glowOpacity
+        singleLayer.shadowRadius = glowRadius
+        singleLayer.shadowOffset = .zero
+      }
       innerLayer.addSublayer(singleLayer)
     }
     for entry in wordEntries {
@@ -2176,9 +2502,21 @@ private enum MvmtCompositorEngine {
         y: contentCentre.y + (contentSize.height / 2 - entry.centerY)
       )
       entry.layer.position = position
+      if let glowColor {
+        entry.layer.shadowColor = glowColor.cgColor
+        entry.layer.shadowOpacity = glowOpacity
+        entry.layer.shadowRadius = glowRadius
+        entry.layer.shadowOffset = .zero
+      }
       innerLayer.addSublayer(entry.layer)
       if let highlight = entry.highlight {
         highlight.position = position
+        if let glowColor {
+          highlight.shadowColor = glowColor.cgColor
+          highlight.shadowOpacity = glowOpacity
+          highlight.shadowRadius = glowRadius
+          highlight.shadowOffset = .zero
+        }
         innerLayer.addSublayer(highlight)
         addLyricWordPopAnimation(
           to: highlight,
@@ -2191,14 +2529,32 @@ private enum MvmtCompositorEngine {
       case "stagger":
         let stagger = max(0, lyricFinite(animation.wordStaggerSecs, 0.05))
         let wordBegin = min(max(start + Double(entry.index) * stagger, start), end - 0.05)
-        addLyricWordEnterAnimation(
-          to: entry.layer,
-          animation: animation,
-          wordBegin: wordBegin,
-          lineEnd: end,
-          lineHeight: contentSize.height,
-          lineWidth: contentSize.width
-        )
+        if decorKind == "burst" {
+          // Word Explosion: each word flies in from above, fanned
+          // across the line (30°…150°), instead of the shared
+          // from-transform.
+          let count = max(1, wordEntries.count)
+          let angle = 30 + (count > 1 ? Double(entry.index) / Double(count - 1) * 120 : 60)
+          let distance = max(contentSize.width, contentSize.height) * 0.55
+            * CGFloat(lyricClamp(lyricFinite(decor?.scale ?? 1, 1), 0.25, 3))
+          addLyricWordBurstAnimation(
+            to: entry.layer,
+            animation: animation,
+            wordBegin: wordBegin,
+            lineEnd: end,
+            angleDeg: angle,
+            distance: distance
+          )
+        } else {
+          addLyricWordEnterAnimation(
+            to: entry.layer,
+            animation: animation,
+            wordBegin: wordBegin,
+            lineEnd: end,
+            lineHeight: contentSize.height,
+            lineWidth: contentSize.width
+          )
+        }
       case "typewriter":
         addLyricWordPopAnimation(
           to: entry.layer,
@@ -2209,6 +2565,53 @@ private enum MvmtCompositorEngine {
       default:
         break // karaoke base words are present for the whole line
       }
+    }
+
+    // Scanlines (Extra Styles — Hologram): thin translucent lines
+    // across the container, drawn over the text.
+    if decorKind == "scanlines", let decor = decor, let scanColor = lyricColor(decor.color) {
+      let lineCount = 8
+      let scanHeight = containerSize.height / CGFloat(lineCount * 4)
+      let alpha = CGFloat(lyricClamp(lyricFinite(decor.opacity, 0.5), 0, 1)) * 0.4
+      for i in 0..<lineCount {
+        let scan = CALayer()
+        scan.backgroundColor = scanColor.withAlphaComponent(alpha).cgColor
+        scan.bounds = CGRect(origin: .zero, size: CGSize(width: containerSize.width, height: scanHeight))
+        scan.position = CGPoint(
+          x: containerSize.width / 2,
+          y: containerSize.height * (CGFloat(i) + 0.5) / CGFloat(lineCount)
+        )
+        innerLayer.addSublayer(scan)
+      }
+    }
+
+    // Cursor (Extra Styles — Typewriter Classic): a blinking block
+    // after the text, on the text's centre line.
+    if decorKind == "cursor", let decor = decor, let cursorColor = lyricColor(decor.color) {
+      let cursorWidth = font.pointSize * 0.45
+      let cursorHeight = max(textHeight * 0.8, font.pointSize * 0.8)
+      let cursor = CALayer()
+      cursor.backgroundColor = cursorColor.cgColor
+      cursor.bounds = CGRect(origin: .zero, size: CGSize(width: cursorWidth, height: cursorHeight))
+      cursor.position = CGPoint(
+        x: contentCentre.x + contentSize.width / 2 + cursorWidth,
+        y: textCentreY
+      )
+      cursor.opacity = 0
+      // Blink: discrete 1/0 every 0.5 s across the line window.
+      // Key times are strictly increasing by construction (0,
+      // 1/steps, …, 1), so no sanitising is needed.
+      let steps = max(1, Int(lineDuration / 0.5))
+      let blink = CAKeyframeAnimation(keyPath: "opacity")
+      blink.values = (0...steps).map { NSNumber(value: $0 % 2 == 0 ? 1 : 0) }
+      blink.keyTimes = (0...steps).map { NSNumber(value: Double($0) / Double(steps)) }
+      blink.duration = lineDuration
+      blink.beginTime = AVCoreAnimationBeginTimeAtZero + start
+      blink.calculationMode = .discrete
+      blink.fillMode = .both
+      blink.isRemovedOnCompletion = false
+      cursor.add(blink, forKey: "lyricCursorBlink")
+      innerLayer.addSublayer(cursor)
     }
 
     // Line enter/exit/emphasis on the inner layer. The per-word

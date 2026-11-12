@@ -53,6 +53,16 @@ export interface CompositeLyricLine {
   startSeconds: number;
   endSeconds: number;
   words?: CompositeLyricWord[];
+  /**
+   * Stored lyric intelligence (Styles Redesign Stage 2) — only
+   * emitted when an Extra Style template is active. Renderers read
+   * these, they never compute them.
+   */
+  emoji?: string;
+  tone?: 'joy' | 'sad' | 'anger' | 'love' | 'hype';
+  /** Word indices (into `words`, or into the line's whitespace
+   *  tokens when it has none) to emphasize. */
+  emphasisWordIndices?: number[];
 }
 
 /**
@@ -102,10 +112,42 @@ export interface ResolvedLyricStyle {
   animation: LyricAnimationParams;
 }
 
+/**
+ * An Extra Style template's decor, RESOLVED (Styles Redesign
+ * Stage 2): every field present, defaults folded in by
+ * `resolveLyricDecor`. The native side applies it generically —
+ * one CALayer-subtree builder per `kind` — it has no template
+ * catalog. Absent = classic style, no decor.
+ */
+export interface ResolvedLyricDecor {
+  kind:
+    | 'emoji-row'
+    | 'chat-bubble'
+    | 'comic-burst'
+    | 'sticker-frame'
+    | 'scanlines'
+    | 'glow'
+    | 'cursor'
+    | 'burst'
+    | 'pill';
+  /** Accent colour (#RRGGBB or rgba()). */
+  color: string;
+  /** Second colour. */
+  secondaryColor: string;
+  /** 0..1. */
+  opacity: number;
+  /** Size multiplier. */
+  scale: number;
+  /** Free text (e.g. the comic burst word). */
+  text: string;
+}
+
 /** The lyrics payload of a composite request (composition seconds). */
 export interface CompositeLyrics {
   lines: CompositeLyricLine[];
   style: ResolvedLyricStyle;
+  /** Extra Style decor — present only when a template is active. */
+  decor?: ResolvedLyricDecor;
 }
 
 export interface CompositeRequest {

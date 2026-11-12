@@ -5,6 +5,7 @@ import { warmUpEqSong } from '../lib/autoEq';
 import type { Edl } from '../lib/edl';
 import { effectiveLook } from '../lib/looks';
 import { cleanDetectedLyrics, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
+import { lyricTemplateById } from '../lib/lyricTemplates';
 import { loadProjects, saveProjects } from '../lib/persistence';
 import { findSongLibraryEntry, removeSongLibraryEntry, upsertSongLibraryEntry } from '../lib/songLibrary';
 import type {
@@ -190,6 +191,15 @@ interface StudioState {
   toggleFavoriteLyricFont: (fontId: string) => void;
   /** Heart/unheart an animation in the Style tab picker (per-project favorite). */
   toggleFavoriteLyricAnimation: (animationId: string) => void;
+  /**
+   * Apply an Extra Style template (Styles Redesign Stage 2): sets
+   * `templateId` and merges the template's style into the project's
+   * lyric style in one tap. Null clears the template (the style
+   * stays as it is — classic rendering).
+   */
+  setLyricTemplate: (templateId: string | null) => void;
+  /** Heart/unheart a template in the Extra tab picker (per-project favorite). */
+  toggleFavoriteLyricTemplate: (templateId: string) => void;
   /** Shift every line (and its words) by a frame delta. */
   shiftAllLyrics: (frames: number) => void;
   /** The active lyrics' fine offset in frames (0 when unset) — the
@@ -662,6 +672,37 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchLyrics],
   );
 
+  const setLyricTemplate = useCallback(
+    (templateId: string | null) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      if (templateId === null) {
+        const { templateId: _old, ...rest } = current;
+        patchLyrics(rest);
+        return;
+      }
+      const template = lyricTemplateById(templateId);
+      if (!template) return;
+      patchLyrics({ ...current, templateId, style: { ...current.style, ...template.style } });
+    },
+    [patchLyrics],
+  );
+
+  const toggleFavoriteLyricTemplate = useCallback(
+    (templateId: string) => {
+      const current = activeProjectRef.current?.lyrics;
+      if (!current) return;
+      const favs = current.favoriteTemplateIds ?? [];
+      patchLyrics({
+        ...current,
+        favoriteTemplateIds: favs.includes(templateId)
+          ? favs.filter((f) => f !== templateId)
+          : [...favs, templateId],
+      });
+    },
+    [patchLyrics],
+  );
+
   // ---- Lyric fine offset + song library ----
   const lyricsOffsetFrames = activeProject?.lyrics?.offsetFrames ?? 0;
 
@@ -805,6 +846,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setLyricStyle,
       toggleFavoriteLyricFont,
       toggleFavoriteLyricAnimation,
+      setLyricTemplate,
+      toggleFavoriteLyricTemplate,
       shiftAllLyrics,
       lyricsOffsetFrames,
       setLyricsOffset,
@@ -893,6 +936,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setLyricStyle,
       toggleFavoriteLyricFont,
       toggleFavoriteLyricAnimation,
+      setLyricTemplate,
+      toggleFavoriteLyricTemplate,
       shiftAllLyrics,
       lyricsOffsetFrames,
       setLyricsOffset,

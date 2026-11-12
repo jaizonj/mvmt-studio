@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import Slider from '@react-native-community/slider';
-import { useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -14,7 +14,9 @@ import {
   type TextStyle,
 } from 'react-native';
 
+import { LyricsOverlay } from './LyricsOverlay';
 import { SegmentedControl } from './SegmentedControl';
+import type { CompositeLyrics } from '../lib/compositor';
 import { DEFAULT_FPS, framesToSeconds } from '../lib/edl';
 import {
   LYRIC_ANIMATION_CATEGORIES,
@@ -35,8 +37,16 @@ import {
   groupWhisperSegments,
   mergeLyricLines,
   newLyricLineId,
+  resolveLyricStyle,
   splitLineAtWord,
 } from '../lib/lyrics';
+import {
+  EXTRA_STYLE_CATEGORIES,
+  LYRIC_TEMPLATES,
+  resolveLyricDecor,
+  type ExtraStyleCategory,
+  type LyricTemplate,
+} from '../lib/lyricTemplates';
 import { ensureModel, modelState, transcribe } from '../lib/whisper';
 import { useStudio } from '../store/StudioContext';
 import type { LyricLine } from '../types';
@@ -300,13 +310,93 @@ function AnimationChips({
   );
 }
 
+/**
+ * Extra tab sample line (Styles Redesign Stage 2): the card preview
+ * animates a real sample line through the same `LyricsOverlay` the
+ * editor preview uses — no thumbnails, no static mock.
+ */
+const SAMPLE_TEMPLATE_LINE = {
+  text: 'Feel the rhythm tonight',
+  startSeconds: 0,
+  endSeconds: 2,
+  words: [
+    { text: 'Feel', startSeconds: 0, endSeconds: 0.4 },
+    { text: 'the', startSeconds: 0.4, endSeconds: 0.7 },
+    { text: 'rhythm', startSeconds: 0.7, endSeconds: 1.3 },
+    { text: 'tonight', startSeconds: 1.3, endSeconds: 2 },
+  ],
+};
+
+function sampleTemplatePayload(template: LyricTemplate): CompositeLyrics {
+  return {
+    lines: [SAMPLE_TEMPLATE_LINE],
+    style: resolveLyricStyle({ ...defaultLyricStyle(), ...template.style }),
+    decor: resolveLyricDecor(template.decor),
+  };
+}
+
+/**
+ * One Extra Style card: a live animated preview of the template
+ * (its own 2s loop, driven by an interval — no video needed) over
+ * a dark stage, with the name/tagline and a favorite heart. The
+ * heart is a sibling Pressable so it never also applies the card.
+ */
+function TemplateCard({
+  template,
+  selected,
+  favorite,
+  onApply,
+  onToggleFavorite,
+}: {
+  template: LyricTemplate;
+  selected: boolean;
+  favorite: boolean;
+  onApply: () => void;
+  onToggleFavorite: () => void;
+}) {
+  const [stageWidth, setStageWidth] = useState(0);
+  const [time, setTime] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTime((t) => (t + 0.12 >= 2 ? 0 : t + 0.12)), 120);
+    return () => clearInterval(id);
+  }, []);
+  const payload = useMemo(() => sampleTemplatePayload(template), [template]);
+  return (
+    <View style={[styles.templateCard, selected && styles.templateCardSelected]}>
+      <Pressable
+        onPress={onApply}
+        accessibilityRole="button"
+        accessibilityState={{ selected }}
+        accessibilityLabel={`Apply extra style ${template.name}`}>
+        <View style={styles.templateStage} onLayout={(e) => setStageWidth(e.nativeEvent.layout.width)}>
+          {stageWidth > 0 ? <LyricsOverlay lyrics={payload} positionSeconds={time} width={stageWidth} /> : null}
+        </View>
+      </Pressable>
+      <View style={styles.templateMeta}>
+        <Pressable onPress={onApply} style={{ flex: 1 }} accessibilityRole="button" accessibilityLabel={template.name}>
+          <Text style={styles.templateName}>{template.name}</Text>
+          <Text style={styles.templateTagline}>{template.tagline}</Text>
+        </Pressable>
+        <Pressable
+          onPress={onToggleFavorite}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityState={{ selected: favorite }}
+          accessibilityLabel={`${favorite ? 'Unfavorite' : 'Favorite'} ${template.name}`}>
+          <Ionicons name={favorite ? 'heart' : 'heart-outline'} size={20} color={favorite ? colors.accent : colors.labelTertiary} />
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSeek, onPlay, onPause }: LyricsPanelProps) {
   const studio = useStudio();
   const { track, lyrics } = studio;
   const lines = lyrics?.lines ?? [];
   const style = lyrics?.style;
 
-  const [tab, setTab] = useState<'lines' | 'style'>('lines');
+  const [tab, setTab] = useState<'lines' | 'style' | 'extra'>('lines');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [syncMode, setSyncMode] = useState(false);
   const [phase, setPhase] = useState<'idle' | 'model' | 'transcribe'>('idle');
@@ -322,6 +412,9 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const [styleSearch, setStyleSearch] = useState('');
   const [fontCategory, setFontCategory] = useState<'All' | LyricFontCategory>('All');
   const [animationCategory, setAnimationCategory] = useState<'All' | LyricAnimationCategory>('All');
+  // Extra tab: search + category filters (Styles Redesign Stage 2).
+  const [templateSearch, setTemplateSearch] = useState('');
+  const [templateCategory, setTemplateCategory] = useState<'All' | ExtraStyleCategory>('All');
 
   const selectedIndex = lines.findIndex((l) => l.id === selectedId);
   const selected = selectedIndex >= 0 ? lines[selectedIndex] : null;
@@ -352,6 +445,24 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const showAnimationGroups = animationCategory === 'All' && styleQuery === '';
   const favoriteFonts = LYRIC_FONTS.filter((f) => favoriteFontIds.includes(f.id));
   const favoriteAnimations = PICKER_ANIMATIONS.filter((a) => favoriteAnimationIds.includes(a.id));
+
+  // ---- Extra tab derived lists (Styles Redesign Stage 2) ------------
+  const favoriteTemplateIds = lyrics?.favoriteTemplateIds ?? [];
+  const activeTemplateId = lyrics?.templateId;
+  const templateQuery = templateSearch.trim().toLowerCase();
+  const templateMatches = LYRIC_TEMPLATES.filter(
+    (t) =>
+      (templateCategory === 'All' || t.category === templateCategory) &&
+      (templateQuery === '' ||
+        t.name.toLowerCase().includes(templateQuery) ||
+        t.tagline.toLowerCase().includes(templateQuery)),
+  );
+  const showTemplateGroups = templateCategory === 'All' && templateQuery === '';
+  const favoriteTemplates = LYRIC_TEMPLATES.filter((t) => favoriteTemplateIds.includes(t.id));
+  const favoritesFirstTemplates = (templates: LyricTemplate[]) => [
+    ...templates.filter((t) => favoriteTemplateIds.includes(t.id)),
+    ...templates.filter((t) => !favoriteTemplateIds.includes(t.id)),
+  ];
 
   // ---- Detection -----------------------------------------------------
   const runDetect = () => {
@@ -579,6 +690,7 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
               options={[
                 { value: 'lines' as const, label: 'Lines' },
                 { value: 'style' as const, label: 'Style' },
+                { value: 'extra' as const, label: 'Extra' },
               ]}
               value={tab}
               onChange={setTab}
@@ -707,7 +819,7 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                   </Text>
                 )}
               </>
-            ) : (
+            ) : tab === 'style' ? (
               /* ---- Style tab: ONE style for ALL lines. ---- */
               <>
                 {!style ? (
@@ -1036,6 +1148,100 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                   </View>
                 )}
               </>
+            ) : (
+              /* ---- Extra tab: complete creative templates. ---- */
+              <View style={styles.styleBox}>
+                <Text style={styles.groupHeader}>Extra Styles</Text>
+                <Text style={styles.caption}>
+                  A whole look in one tap — typography, colour, animation and decor. Each card shows the style
+                  animating a sample line.
+                </Text>
+                <TextInput
+                  style={styles.searchInput}
+                  value={templateSearch}
+                  onChangeText={setTemplateSearch}
+                  placeholder="Search extra styles…"
+                  placeholderTextColor={colors.labelTertiary}
+                  accessibilityLabel="Search extra styles"
+                  returnKeyType="search"
+                />
+                <CategoryChips
+                  categories={EXTRA_STYLE_CATEGORIES}
+                  value={templateCategory}
+                  onChange={setTemplateCategory}
+                  label="Template"
+                />
+                {showTemplateGroups ? (
+                  <>
+                    {favoriteTemplates.length > 0 ? (
+                      <View style={styles.templateGroup}>
+                        <Text style={styles.sectionHeader}>Favorites</Text>
+                        {favoriteTemplates.map((template) => (
+                          <TemplateCard
+                            key={template.id}
+                            template={template}
+                            selected={activeTemplateId === template.id}
+                            favorite
+                            onApply={() => studio.setLyricTemplate(template.id)}
+                            onToggleFavorite={() => studio.toggleFavoriteLyricTemplate(template.id)}
+                          />
+                        ))}
+                      </View>
+                    ) : null}
+                    {EXTRA_STYLE_CATEGORIES.map((category) => (
+                      <View key={category} style={styles.templateGroup}>
+                        <Text style={styles.sectionHeader}>{category}</Text>
+                        {favoritesFirstTemplates(LYRIC_TEMPLATES.filter((t) => t.category === category)).map(
+                          (template) => (
+                            <TemplateCard
+                              key={template.id}
+                              template={template}
+                              selected={activeTemplateId === template.id}
+                              favorite={favoriteTemplateIds.includes(template.id)}
+                              onApply={() => studio.setLyricTemplate(template.id)}
+                              onToggleFavorite={() => studio.toggleFavoriteLyricTemplate(template.id)}
+                            />
+                          ),
+                        )}
+                      </View>
+                    ))}
+                  </>
+                ) : templateMatches.length === 0 ? (
+                  <Text style={styles.caption}>No extra styles match “{templateSearch.trim()}”.</Text>
+                ) : (
+                  favoritesFirstTemplates(templateMatches).map((template) => (
+                    <TemplateCard
+                      key={template.id}
+                      template={template}
+                      selected={activeTemplateId === template.id}
+                      favorite={favoriteTemplateIds.includes(template.id)}
+                      onApply={() => studio.setLyricTemplate(template.id)}
+                      onToggleFavorite={() => studio.toggleFavoriteLyricTemplate(template.id)}
+                    />
+                  ))
+                )}
+                <View style={styles.templateGroup}>
+                  <Text style={styles.sectionHeader}>Classic</Text>
+                  <Pressable
+                    onPress={() => studio.setLyricTemplate(null)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: activeTemplateId === undefined }}
+                    accessibilityLabel="Classic style — no extra effects"
+                    style={[styles.classicRow, activeTemplateId === undefined && styles.templateCardSelected]}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.templateName}>Classic</Text>
+                      <Text style={styles.templateTagline}>Your current style, no extra effects.</Text>
+                    </View>
+                    {activeTemplateId === undefined ? (
+                      <Ionicons name="checkmark" size={18} color={colors.accent} />
+                    ) : null}
+                  </Pressable>
+                </View>
+                <Text style={styles.caption}>
+                  Applying a template sets its font, colours and animation too — your lines and timings stay
+                  exactly as they are.
+                </Text>
+              </View>
             )}
           </>
         )}
@@ -1379,6 +1585,44 @@ const styles = StyleSheet.create({
     paddingLeft: 12,
     paddingRight: 6,
     paddingVertical: 5,
+  },
+  // Extra Styles cards (Styles Redesign Stage 2): one vertical card
+  // per template — a live animated preview stage on top, name/tagline
+  // and a heart below. The stage is a dark video-like surface; the
+  // overlay inside it is the real renderer, not a thumbnail.
+  templateGroup: { gap: spacing.xs },
+  templateCard: {
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    borderWidth: 2,
+    borderColor: 'transparent',
+    overflow: 'hidden',
+  },
+  templateCardSelected: { borderColor: colors.accent },
+  templateStage: {
+    height: 120,
+    backgroundColor: '#17171C',
+    overflow: 'hidden',
+  },
+  templateMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  templateName: { ...typeScale.subhead, color: colors.label, fontWeight: '600' },
+  templateTagline: { ...typeScale.caption, color: colors.labelSecondary },
+  classicRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    borderWidth: 2,
+    borderColor: 'transparent',
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
   },
   pickChipLabel: { paddingVertical: 3, paddingRight: 4 },
   pickChipHeart: { padding: 4 },

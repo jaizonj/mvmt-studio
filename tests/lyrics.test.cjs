@@ -743,7 +743,14 @@ test('composite lyric line keys match the Swift LyricLineRecord fields', () => {
   for (const key of Object.keys(payload.lines[0])) {
     assert.ok(swiftLineFields.includes(key), `payload line key ${key} has no Swift field`);
   }
-  assert.deepEqual(Object.keys(payload).sort(), swiftRecordFields('LyricsRecord'));
+  // Stage 2: `decor` is optional on LyricsRecord (nil = classic
+  // style), so the classic payload's top-level keys are a SUBSET —
+  // the exact match lives in the template payload test below.
+  const swiftLyricsFields = swiftRecordFields('LyricsRecord');
+  for (const key of Object.keys(payload)) {
+    assert.ok(swiftLyricsFields.includes(key), `payload key ${key} has no Swift field`);
+  }
+  assert.equal(payload.decor, undefined);
 });
 
 // ── Style catalog contract (Styles Redesign Stage 1) ─────────────
@@ -872,4 +879,178 @@ test('catalog: aliased ids still render through the composite payload', () => {
 
 test('catalog: unknown font ids fall back to the default font', () => {
   assert.equal(lyricFontById('not-a-font').id, 'avenir-next');
+});
+
+// ── Extra Styles contract (Styles Redesign Stage 2) ──────────────
+// Ten complete templates (own font/palette/animation/decor) over one
+// parametric decor model; the decor registry must exist on BOTH
+// sides (JS preview + Swift burn-in) or a kind renders nowhere.
+const {
+  LYRIC_TEMPLATES,
+  LYRIC_DECOR_KINDS,
+  EXTRA_STYLE_CATEGORIES,
+  lyricTemplateById,
+  resolveLyricDecor,
+} = require('./.build-lyrics/src/lib/lyricTemplates.js');
+const { analyzeLyricLine } = require('./.build-lyrics/src/lib/lyrics.js');
+
+test('templates: exactly 10, unique ids, one of the 7 categories each', () => {
+  assert.equal(LYRIC_TEMPLATES.length, 10);
+  const ids = LYRIC_TEMPLATES.map((t) => t.id);
+  assert.equal(new Set(ids).size, 10);
+  for (const t of LYRIC_TEMPLATES) {
+    assert.ok(EXTRA_STYLE_CATEGORIES.includes(t.category), `${t.id} category ${t.category}`);
+    assert.ok(t.name && t.tagline, `${t.id} needs a name and tagline`);
+  }
+  assert.equal(lyricTemplateById('not-a-template'), undefined);
+  assert.equal(lyricTemplateById('emoji-story').name, 'Emoji Story');
+});
+
+// LyricStyle fields, read from the type itself — defaultLyricStyle()
+// omits the optional fields (strokeColor, maxWidthRatio, …), so its
+// keys are not the full field set.
+function lyricStyleFields() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'types.ts'), 'utf8');
+  const match = source.match(/export interface LyricStyle \{([\s\S]*?)\n\}/);
+  assert.ok(match, 'LyricStyle interface not found');
+  return new Set([...match[1].matchAll(/^  (\w+)\??:/gm)].map((m) => m[1]));
+}
+
+test('templates: every style override is a real LyricStyle field and resolves', () => {
+  const styleKeys = lyricStyleFields();
+  for (const t of LYRIC_TEMPLATES) {
+    for (const key of Object.keys(t.style)) {
+      assert.ok(styleKeys.has(key), `${t.id} style key ${key} is not a LyricStyle field`);
+    }
+    // The merged style must resolve exactly like a classic style.
+    const payload = buildCompositeLyrics(
+      payloadProject(
+        [{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }],
+        { ...t.style },
+      ),
+      0,
+      FPS,
+    );
+    assert.equal(payload.style.fontPostScriptName.length > 0, true);
+    assert.equal(payload.style.animation.wordMode, lyricAnimationById(t.style.animationId ?? 'karaoke').wordMode);
+  }
+});
+
+test('decor: the 9 kinds exist on the Swift side too (registry parity)', () => {
+  // The Swift side has no decor enum — `LyricDecorRecord.kind` is a
+  // plain string and the builders switch on the literal
+  // (`decorKind == "emoji-row"`, …). Parity is pinned two ways: the
+  // JS mirror list SWIFT_DECOR_KINDS must equal the preview list,
+  // and every kind's literal must appear in the Swift source, so a
+  // kind can never exist on one side only.
+  const {
+    SWIFT_DECOR_KINDS,
+  } = require('./.build-lyrics/src/lib/lyricTemplates.js');
+  assert.deepEqual([...LYRIC_DECOR_KINDS].sort(), [...SWIFT_DECOR_KINDS].sort());
+  const swiftPath = path.join(__dirname, '..', 'modules', 'mvmt-compositor', 'ios', 'MvmtCompositorModule.swift');
+  const source = fs.readFileSync(swiftPath, 'utf8');
+  for (const kind of LYRIC_DECOR_KINDS) {
+    assert.ok(source.includes(`"${kind}"`), `Swift has no branch for decor kind ${kind}`);
+  }
+});
+
+test('decor: every template decor kind is in the registry', () => {
+  for (const t of LYRIC_TEMPLATES) {
+    assert.ok(LYRIC_DECOR_KINDS.includes(t.decor.kind), `${t.id} decor kind ${t.decor.kind}`);
+  }
+});
+
+test('payload: template decor keys match the Swift LyricDecorRecord fields exactly', () => {
+  const decor = resolveLyricDecor(LYRIC_TEMPLATES[0].decor);
+  assert.deepEqual(Object.keys(decor).sort(), swiftRecordFields('LyricDecorRecord'));
+  // Every template's decor resolves to the same key set.
+  for (const t of LYRIC_TEMPLATES) {
+    assert.deepEqual(Object.keys(resolveLyricDecor(t.decor)).sort(), swiftRecordFields('LyricDecorRecord'));
+  }
+});
+
+test('payload: a template project emits decor + line intelligence; a classic project emits neither', () => {
+  const line = {
+    id: 'a',
+    text: 'I love you NEVER',
+    startFrame: 0,
+    endFrame: 60,
+    words: [
+      { text: 'I', startFrame: 0, endFrame: 10 },
+      { text: 'love', startFrame: 10, endFrame: 25 },
+      { text: 'you', startFrame: 25, endFrame: 40 },
+      { text: 'NEVER', startFrame: 40, endFrame: 60 },
+    ],
+    decor: analyzeLyricLine('I love you NEVER'),
+  };
+  const templatePayload = buildCompositeLyrics(
+    { ...payloadProject([line]), templateId: 'emoji-story' },
+    0,
+    FPS,
+  );
+  assert.ok(templatePayload.decor, 'template payload carries decor');
+  assert.deepEqual(Object.keys(templatePayload.decor).sort(), swiftRecordFields('LyricDecorRecord'));
+  // With a template active the top-level keys match LyricsRecord
+  // exactly (the classic payload is a subset — see the line-keys
+  // test above).
+  assert.deepEqual(Object.keys(templatePayload).sort(), swiftRecordFields('LyricsRecord'));
+  assert.equal(templatePayload.lines[0].emoji, '❤️');
+  assert.equal(templatePayload.lines[0].tone, 'love');
+  assert.deepEqual(templatePayload.lines[0].emphasisWordIndices, [3]);
+  for (const key of Object.keys(templatePayload.lines[0])) {
+    assert.ok(
+      swiftRecordFields('LyricLineRecord').includes(key),
+      `payload line key ${key} has no Swift field`,
+    );
+  }
+  const classicPayload = buildCompositeLyrics(payloadProject([line]), 0, FPS);
+  assert.equal(classicPayload.decor, undefined);
+  assert.equal(classicPayload.lines[0].emoji, undefined);
+  assert.equal(classicPayload.lines[0].tone, undefined);
+  assert.equal(classicPayload.lines[0].emphasisWordIndices, undefined);
+});
+
+// ── Lyric intelligence (Styles Redesign Stage 2) ─────────────────
+// Deterministic, computed once at Detect / on line edits, stored on
+// the line — renderers only read it. No match means no emoji, never
+// a guess; tones come only from the word lists.
+test('intelligence: emoji is the first dictionary hit in line order', () => {
+  assert.equal(analyzeLyricLine('fire in my heart tonight').emoji, '🔥');
+  assert.equal(analyzeLyricLine('I love you tonight').emoji, '❤️');
+  assert.equal(analyzeLyricLine('driving my car fast').emoji, '🚗');
+  // No match means no decor at all — never a guessed emoji.
+  assert.equal(analyzeLyricLine('just some ordinary words'), undefined);
+});
+
+test('intelligence: tone comes only from the lists, love beats joy', () => {
+  assert.equal(analyzeLyricLine('I love this happy day').tone, 'love');
+  assert.equal(analyzeLyricLine('so happy dancing all night').tone, 'joy');
+  assert.equal(analyzeLyricLine('crying in the rain alone').tone, 'sad');
+  assert.equal(analyzeLyricLine('I am so angry right now').tone, 'anger');
+  assert.equal(analyzeLyricLine('turn it up lets go wild').tone, 'hype');
+  assert.equal(analyzeLyricLine('just some ordinary words'), undefined);
+});
+
+test('intelligence: emphasis flags ALL-CAPS words and repeats', () => {
+  assert.deepEqual(analyzeLyricLine('I said NEVER again').emphasisWordIndices, [2]);
+  assert.deepEqual(analyzeLyricLine('go go home').emphasisWordIndices, [0, 1]);
+  // A line with decor but no emphasis carries no emphasis key.
+  assert.equal(analyzeLyricLine('I love you').emphasisWordIndices, undefined);
+});
+
+test('intelligence: detection stores decor on the line', () => {
+  const lines = groupWhisperSegments([
+    seg(
+      [
+        ['I', 0, 0.3],
+        ['love', 0.3, 0.6],
+        ['you', 0.6, 1],
+      ],
+      0,
+      1,
+    ),
+  ]);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].decor.emoji, '❤️');
+  assert.equal(lines[0].decor.tone, 'love');
 });
