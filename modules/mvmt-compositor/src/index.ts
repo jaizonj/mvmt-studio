@@ -142,17 +142,34 @@ export interface ResolvedLyricDecor {
     | 'glow'
     | 'cursor'
     | 'burst'
-    | 'pill';
+    | 'pill'
+    | 'rule'
+    | 'spray'
+    | 'shadow'
+    | 'duet'
+    | 'ghost-trail'
+    | 'rain'
+    | 'bounce'
+    | 'wave-path'
+    | 'typing-dots'
+    | 'split-screen'
+    | 'none';
   /** Accent colour (#RRGGBB or rgba()). */
   color: string;
   /** Second colour. */
   secondaryColor: string;
-  /** 0..1. */
+  /** 0..1. For kind 'none' it is the line's text opacity. */
   opacity: number;
   /** Size multiplier. */
   scale: number;
   /** Free text (e.g. the comic burst word). */
   text: string;
+  /** Static rotation of the whole line, degrees. */
+  rotationDeg: number;
+  /** Letter-spacing as a fraction of the font size. */
+  tracking: number;
+  /** Horizontal alignment of the line. */
+  align: 'left' | 'center' | 'right';
 }
 
 /** The lyrics payload of a composite request (composition seconds). */

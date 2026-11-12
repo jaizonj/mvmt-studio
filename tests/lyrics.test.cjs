@@ -882,7 +882,7 @@ test('catalog: unknown font ids fall back to the default font', () => {
 });
 
 // ── Extra Styles contract (Styles Redesign Stage 2) ──────────────
-// Ten complete templates (own font/palette/animation/decor) over one
+// Thirty complete templates (own font/palette/animation/decor) over one
 // parametric decor model; the decor registry must exist on BOTH
 // sides (JS preview + Swift burn-in) or a kind renders nowhere.
 const {
@@ -894,16 +894,39 @@ const {
 } = require('./.build-lyrics/src/lib/lyricTemplates.js');
 const { analyzeLyricLine } = require('./.build-lyrics/src/lib/lyrics.js');
 
-test('templates: exactly 10, unique ids, one of the 7 categories each', () => {
-  assert.equal(LYRIC_TEMPLATES.length, 10);
+test('templates: exactly 30, unique ids, one of the 6 categories each', () => {
+  assert.equal(LYRIC_TEMPLATES.length, 30);
   const ids = LYRIC_TEMPLATES.map((t) => t.id);
-  assert.equal(new Set(ids).size, 10);
+  assert.equal(new Set(ids).size, 30);
   for (const t of LYRIC_TEMPLATES) {
     assert.ok(EXTRA_STYLE_CATEGORIES.includes(t.category), `${t.id} category ${t.category}`);
     assert.ok(t.name && t.tagline, `${t.id} needs a name and tagline`);
   }
   assert.equal(lyricTemplateById('not-a-template'), undefined);
   assert.equal(lyricTemplateById('emoji-story').name, 'Emoji Story');
+  assert.equal(lyricTemplateById('split-screen-words').name, 'Split Screen Words');
+});
+
+test('templates: every template references a real picker animation and a real font', () => {
+  const pickerIds = new Set(PICKER_ANIMATIONS.map((a) => a.id));
+  const fontIds = new Set(LYRIC_FONTS.map((f) => f.id));
+  for (const t of LYRIC_TEMPLATES) {
+    assert.ok(pickerIds.has(t.style.animationId), `${t.id} animationId ${t.style.animationId} is not in the picker`);
+    assert.ok(fontIds.has(t.style.fontId), `${t.id} fontId ${t.style.fontId} is not in the font catalog`);
+  }
+});
+
+test('decor: resolveLyricDecor folds the Stage 3 field defaults', () => {
+  const bare = resolveLyricDecor({ kind: 'glow' });
+  assert.equal(bare.rotationDeg, 0);
+  assert.equal(bare.tracking, 0);
+  assert.equal(bare.align, 'center');
+  assert.equal(bare.kind, 'glow');
+  // Explicit values survive the fold.
+  const tilted = resolveLyricDecor({ kind: 'spray', rotationDeg: -3, tracking: 0.35, align: 'left' });
+  assert.equal(tilted.rotationDeg, -3);
+  assert.equal(tilted.tracking, 0.35);
+  assert.equal(tilted.align, 'left');
 });
 
 // LyricStyle fields, read from the type itself — defaultLyricStyle()
@@ -936,7 +959,7 @@ test('templates: every style override is a real LyricStyle field and resolves', 
   }
 });
 
-test('decor: the 9 kinds exist on the Swift side too (registry parity)', () => {
+test('decor: the 20 kinds exist on the Swift side too (registry parity)', () => {
   // The Swift side has no decor enum — `LyricDecorRecord.kind` is a
   // plain string and the builders switch on the literal
   // (`decorKind == "emoji-row"`, …). Parity is pinned two ways: the
