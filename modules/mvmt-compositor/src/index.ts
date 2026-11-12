@@ -426,6 +426,7 @@ interface NativeMvmtCompositorModule {
   ): Promise<TakeSyncMeasurement>;
   waveformPeaks(uri: string, buckets: number): Promise<WaveformPeaks | null>;
   prepareEqSong(uri: string): Promise<string>;
+  prepareMixMasterSong(uri: string): Promise<string>;
   isCaptureAvailable(): boolean;
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
@@ -578,6 +579,34 @@ export async function prepareEqSong(uri: string): Promise<string> {
   if (!nativeModule || typeof nativeModule.prepareEqSong !== 'function') return uri;
   try {
     const result = await nativeModule.prepareEqSong(uri);
+    return typeof result === 'string' && result.length > 0 ? result : uri;
+  } catch {
+    return uri;
+  }
+}
+
+/**
+ * Mix & Master Stage 1: asks the engine to analyze the song in
+ * 1.0 s windows (50% overlap) and render a copy with the harsh /
+ * muddy bands pulled down per window, the gains smoothed across
+ * windows (cuts only, never boosts). Resolves to the URI
+ * composition builds should use: the processed copy (full song,
+ * exact same duration, cached on disk across launches) or — for a
+ * balanced song, an unreadable file, Expo Go, or any failure — the
+ * ORIGINAL uri. Never rejects: Mix & Master must never block a
+ * preview or an export. The smoothed profile (windows + findings)
+ * is stored as JSON beside the render for the Stage 3 UI.
+ *
+ * Only composition builds consume the result. The recording path
+ * (capture, record-time playback, sync measurement) always keeps
+ * the original file.
+ *
+ * @param uri The original song file (`file://` URI or absolute path).
+ */
+export async function prepareMixMasterSong(uri: string): Promise<string> {
+  if (!nativeModule || typeof nativeModule.prepareMixMasterSong !== 'function') return uri;
+  try {
+    const result = await nativeModule.prepareMixMasterSong(uri);
     return typeof result === 'string' && result.length > 0 ? result : uri;
   } catch {
     return uri;

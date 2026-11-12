@@ -32,6 +32,7 @@ import {
 } from '../../components/TimelineStrip';
 import { effectiveRegion, estimateTakeEnergies } from '../../lib/analysis';
 import { useEqSongUri } from '../../lib/autoEq';
+import { useMixMasterSongUri } from '../../lib/mixMaster';
 import { inspectAsset, isCompositorAvailable, type PreviewStatus } from '../../lib/compositor';
 import {
   DEFAULT_FPS,
@@ -656,6 +657,13 @@ function EditorWorkspace() {
   // on the EQ'd song when it arrives. Until then — and whenever the
   // project has Auto EQ off — the original plays.
   const eqSongUri = useEqSongUri(edl?.audio.uri, studio.autoEqEnabled);
+  // Mix & Master (Stage 1): when the project has it on, the
+  // dynamically-EQ'd copy REPLACES the Auto EQ copy — the dynamic
+  // curve already contains the per-window version of Auto EQ's
+  // static cut, so running both would cut twice. Off by default;
+  // the toggle comes with the Stage 3 screen.
+  const mmSongUri = useMixMasterSongUri(edl?.audio.uri, studio.mixMasterEnabled);
+  const songUri = studio.mixMasterEnabled ? mmSongUri : eqSongUri;
 
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
@@ -663,12 +671,12 @@ function EditorWorkspace() {
       return edlToCompositeRequest(edlWithTakeCanvas(edl, takes), takeUriById, {
         look: resolvedLook,
         normalizeVolume: studio.autoVolume,
-        audioUri: eqSongUri,
+        audioUri: songUri,
       });
     } catch {
       return null;
     }
-  }, [edl, takeUriById, takes, resolvedLook, studio.autoVolume, eqSongUri]);
+  }, [edl, takeUriById, takes, resolvedLook, studio.autoVolume, songUri]);
   const previewKey = previewRequest ? `${JSON.stringify(previewRequest)}#${previewNonce}` : '';
 
   const handleProgress = useCallback((pos: number, playing: boolean) => {

@@ -34,6 +34,7 @@ import {
   TIER_DEFAULT_VIDEO_BITRATE_BPS,
 } from '../../lib/exportSize';
 import { useEqSongUri } from '../../lib/autoEq';
+import { useMixMasterSongUri } from '../../lib/mixMaster';
 import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { saveToPhotoLibrary, shareFile } from '../../lib/media';
@@ -106,6 +107,7 @@ export default function ExportScreen() {
     setAutoVolume,
     autoEqEnabled,
     setAutoEqEnabled,
+    mixMasterEnabled,
     watermarkEnabled,
   } = studio;
 
@@ -128,6 +130,13 @@ export default function ExportScreen() {
   // it off. Same swap the Editor preview makes, off the same store
   // flag, so preview and export never drift.
   const eqSongUri = useEqSongUri(edl?.audio.uri, autoEqEnabled);
+  // Mix & Master (Stage 1): when the project has it on, the
+  // dynamically-EQ'd copy REPLACES the Auto EQ copy (same reason
+  // as the Editor — the dynamic curve already contains Auto EQ's
+  // static cut per window). Off by default; the toggle comes with
+  // the Stage 3 screen.
+  const mmSongUri = useMixMasterSongUri(edl?.audio.uri, mixMasterEnabled);
+  const songUri = mixMasterEnabled ? mmSongUri : eqSongUri;
 
   const engineAvailable = isCompositorAvailable();
   const noTakes = takes.length === 0;
@@ -231,10 +240,10 @@ export default function ExportScreen() {
         // inside the composition, so the preview plays at the level
         // the file will ship at.
         normalizeVolume: autoVolume,
-        // Auto EQ likewise: the processed song FILE rides the same
-        // shared request (it is the full song at the same duration,
-        // so nothing else about the request changes).
-        audioUri: eqSongUri,
+        // Auto EQ / Mix & Master likewise: the processed song FILE
+        // rides the same shared request (it is the full song at the
+        // same duration, so nothing else about the request changes).
+        audioUri: songUri,
       });
       // 'high' (null) renders at the cut's canvas — which follows the
       // takes, so 4K takes export at 4K; the other tiers are explicit
@@ -281,7 +290,7 @@ export default function ExportScreen() {
     lyricsPayload,
     resolvedLook,
     autoVolume,
-    eqSongUri,
+    songUri,
     controlledBitrate,
     exportTargetSizeMB,
   ]);

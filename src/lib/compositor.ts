@@ -20,6 +20,7 @@ export {
   isCompositorAvailable,
   measureTakeSync,
   prepareEqSong,
+  prepareMixMasterSong,
   prepareSong,
   setCaptureExposureLock,
   setCaptureQuality,

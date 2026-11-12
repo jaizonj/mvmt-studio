@@ -47,6 +47,7 @@ jobs:
           npm run test:edl
           npm run test:lyrics
           npm run test:library
+          npm run test:mixmaster
           npx tsc --noEmit
           npx expo lint
           # Bundle smoke test: catches unresolved require() asset paths

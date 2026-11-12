@@ -381,6 +381,20 @@ export interface Project {
    * original song regardless of this flag.
    */
   autoEqEnabled?: boolean;
+  /**
+   * Mix & Master Stage 1: the engine analyzes this project's song
+   * in 1.0 s windows and renders a copy with the harsh/muddy bands
+   * pulled down along a smoothed curve (cuts only), which
+   * composition builds then use in place of the original file
+   * (src/lib/mixMaster.ts). Undefined = OFF: Stage 1 is
+   * engine-only and no UI exposes the flag yet (the toggle comes
+   * with the Stage 3 screen). When on, Mix & Master REPLACES Auto
+   * EQ for the song (the dynamic curve already contains the
+   * per-window version of Auto EQ's static cut — running both
+   * would cut twice). Recording, record-time playback and sync
+   * measurement always use the original song regardless.
+   */
+  mixMasterEnabled?: boolean;
   /** When the project's video was last successfully rendered (Export stamps it). */
   exportedAt?: number;
 }

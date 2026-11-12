@@ -160,6 +160,15 @@ interface StudioState {
   autoEqEnabled: boolean;
   setAutoEqEnabled: (enabled: boolean) => void;
 
+  /** Effective Mix & Master flag for the active project — stored
+   *  values win; projects saved before the flag existed read as
+   *  OFF (Stage 1 is engine-only; the toggle comes with the Stage 3
+   *  screen). When on, composition builds use the dynamically-EQ'd
+   *  copy of the song INSTEAD of the Auto EQ copy; recording
+   *  always uses the original. */
+  mixMasterEnabled: boolean;
+  setMixMasterEnabled: (enabled: boolean) => void;
+
   /** The active project's lyrics (song-frame timed lines + style). */
   lyrics: ProjectLyrics | null;
   /** Effective lyrics visibility — stored value wins; unset reads as
@@ -487,6 +496,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchActiveProject],
   );
 
+  // Mix & Master, same shape as the Auto EQ flag — except the
+  // effective value defaults to OFF (Stage 1 is engine-only).
+  const mixMasterEnabled = activeProject?.mixMasterEnabled ?? false;
+
+  const setMixMasterEnabled = useCallback(
+    (enabled: boolean) => patchActiveProject({ mixMasterEnabled: enabled }),
+    [patchActiveProject],
+  );
+
   // ---- Lyrics (song-frame timed; see src/lib/lyrics.ts) ----
   const lyrics = activeProject?.lyrics ?? null;
   const lyricsEnabled = activeProject?.lyricsEnabled ?? ((activeProject?.lyrics?.lines.length ?? 0) > 0);
@@ -775,6 +793,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setWatermarkEnabled,
       autoEqEnabled,
       setAutoEqEnabled,
+      mixMasterEnabled,
+      setMixMasterEnabled,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,
@@ -861,6 +881,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setWatermarkEnabled,
       autoEqEnabled,
       setAutoEqEnabled,
+      mixMasterEnabled,
+      setMixMasterEnabled,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,

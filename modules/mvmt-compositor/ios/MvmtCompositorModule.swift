@@ -2760,6 +2760,620 @@ private enum MvmtCompositorEngine {
     }
   }
 
+  // MARK: Mix & Master — Stage 1 (dynamic corrective EQ)
+  //
+  // Same corrective idea as Auto EQ (cuts only, harsh + mud bands
+  // measured against the song's own band balance), but measured in
+  // 1.0 s windows with 50% overlap and applied as a SMOOTHED,
+  // time-varying gain curve — never a per-second EQ switch. The
+  // profile (smoothed windows + findings) is stored as JSON beside
+  // the rendered WAV so the Stage 3 UI can draw it without
+  // re-analyzing. The render is a new file in MVMTStudio/mixmaster;
+  // the original is never touched and any failure returns it.
+  // `renderEqSong` is deliberately left untouched — this stage
+  // mirrors its render loop instead of refactoring it, so Auto EQ's
+  // proven path stays byte-identical.
+
+  /// Recipe version for the Stage 1 analysis + render. Part of the
+  /// cache key; bump when the window layout, gain logic or render
+  /// chain changes.
+  private static let mixMasterProfileVersion = 1
+
+  /// Analysis windows: 1.0 s long, 50% overlap — a new analysis
+  /// point every 0.5 s.
+  private static let mmWindowSeconds = 1.0
+  private static let mmHopSeconds = 0.5
+
+  /// A window holding less than this much audio is dropped (except
+  /// the first, so a sub-second song still gets one analysis point).
+  private static let mmMinWindowSeconds = 0.25
+
+  /// Smoothing: 3-point moving average across windows, then a slew
+  /// limit of ±1.5 dB per 100 ms of song time.
+  private static let mmSlewDbPer100ms = 1.5
+
+  /// Only cuts at or above this depth are reported as findings.
+  private static let mmFindingMinCutDb = 1.0
+  /// The findings list is capped at the deepest cuts (keeps the
+  /// stored profile small on long songs).
+  private static let mmMaxFindings = 100
+
+  /// Low-mid bands that count as "mud" under the same excess rule
+  /// as the harsh bands (250 Hz, 500 Hz).
+  private static let mmMudBandIndices: Set<Int> = [1, 2]
+
+  private struct MixMasterWindowRecord: Codable {
+    var timeSeconds: Double
+    var gainsDb: [Double]
+  }
+
+  private struct MixMasterFindingRecord: Codable {
+    var timeSeconds: Double
+    var bandHz: Double
+    var cutDb: Double
+    var reason: String
+  }
+
+  private struct MixMasterProfileRecord: Codable {
+    var version: Int
+    var songKey: String
+    var sampleRate: Double
+    var durationSeconds: Double
+    var windows: [MixMasterWindowRecord]
+    var findings: [MixMasterFindingRecord]
+  }
+
+  /// Smooths raw per-window gains: (a) a 3-point moving average
+  /// across windows, per band, then (b) a slew limit applied
+  /// sequentially per band. Mirrors `smoothGainCurve` in
+  /// src/lib/mixMasterCurve.ts; the Node tests pin it.
+  private static func smoothMmGains(_ raw: [[Double]]) -> [[Double]] {
+    guard !raw.isEmpty else { return [] }
+    let bandCount = eqBandCentersHz.count
+    var averaged = raw
+    for i in raw.indices {
+      for b in 0..<bandCount {
+        var sum = raw[i][b]
+        var n = 1
+        if i > 0 { sum += raw[i - 1][b]; n += 1 }
+        if i < raw.count - 1 { sum += raw[i + 1][b]; n += 1 }
+        averaged[i][b] = sum / Double(n)
+      }
+    }
+    let maxStep = mmSlewDbPer100ms * (mmHopSeconds / 0.1)
+    var out: [[Double]] = [averaged[0]]
+    for i in 1..<averaged.count {
+      var gains = averaged[i]
+      for b in 0..<bandCount {
+        let prev = out[i - 1][b]
+        gains[b] = max(prev - maxStep, min(prev + maxStep, gains[b]))
+      }
+      out.append(gains)
+    }
+    return out
+  }
+
+  /// The smoothed gain set at a song time: linear interpolation
+  /// between the bracketing analysis points, clamped to the first /
+  /// last window outside the range. Mirrors `mixMasterGainAtTime`
+  /// in src/lib/mixMasterCurve.ts.
+  private static func mmGainAtTime(
+    windows: [MixMasterWindowRecord],
+    timeSeconds: Double
+  ) -> [Double] {
+    let zero = [Double](repeating: 0, count: eqBandCentersHz.count)
+    guard let first = windows.first else { return zero }
+    if timeSeconds <= first.timeSeconds { return first.gainsDb }
+    guard let last = windows.last else { return first.gainsDb }
+    if timeSeconds >= last.timeSeconds { return last.gainsDb }
+    for i in 1..<windows.count {
+      if timeSeconds <= windows[i].timeSeconds {
+        let a = windows[i - 1]
+        let b = windows[i]
+        let span = b.timeSeconds - a.timeSeconds
+        let f = span > 0 ? (timeSeconds - a.timeSeconds) / span : 0
+        return zip(a.gainsDb, b.gainsDb).map { $0.0 + ($0.1 - $0.0) * f }
+      }
+    }
+    return last.gainsDb
+  }
+
+  /// The on-disk home of one Mix & Master render + profile:
+  /// Application Support, keyed by an FNV-1a hash of the cache key
+  /// (same scheme as the Auto EQ cache, separate directory).
+  private static func mixMasterCacheFileURL(cacheKey: String) -> URL? {
+    guard
+      let support = try? FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true
+      )
+    else { return nil }
+    let directory = support.appendingPathComponent("MVMTStudio/mixmaster", isDirectory: true)
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in cacheKey.utf8 {
+      hash ^= UInt64(byte)
+      hash = hash &* 0x0000_0100_0000_01b3
+    }
+    return directory.appendingPathComponent(String(format: "mm-%016llx.wav", hash))
+  }
+
+  /// The profile lives beside its render, same base name, .json.
+  private static func mixMasterProfileURL(for outputURL: URL) -> URL {
+    outputURL.deletingPathExtension().appendingPathExtension("json")
+  }
+
+  /// Writes the profile JSON beside the render (temp file moved
+  /// into place only when complete). Best effort — a missing
+  /// profile never blocks serving the render.
+  private static func writeMixMasterProfile(_ profile: MixMasterProfileRecord, to url: URL) {
+    let tempURL = url.deletingPathExtension()
+      .appendingPathExtension("tmp-\(UUID().uuidString).json")
+    do {
+      let data = try JSONEncoder().encode(profile)
+      try data.write(to: tempURL)
+      if FileManager.default.fileExists(atPath: url.path) {
+        try? FileManager.default.removeItem(at: url)
+      }
+      try FileManager.default.moveItem(at: tempURL, to: url)
+    } catch {
+      try? FileManager.default.removeItem(at: tempURL)
+    }
+  }
+
+  /// Mix & Master Stage 1 entry point (bridge:
+  /// `prepareMixMasterSong`). Returns the URI composition builds
+  /// should use for this song: a cached, dynamically-EQ'd copy when
+  /// the song measures harsh or muddy anywhere, or the ORIGINAL uri
+  /// when it doesn't — and the original on ANY failure. Never
+  /// throws, so a preview or export can never be blocked on it.
+  /// Only composition builds consume the result; capture,
+  /// record-time playback and the sync measurement always use the
+  /// original file.
+  static func prepareMixMasterSong(_ uri: String) async -> String {
+    let sourceURL = resolveURL(uri)
+    guard sourceURL.isFileURL else { return uri }
+    let attrs = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
+    let fileSize = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+    let fileMtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+    guard fileSize > 0 else { return uri }
+    let cacheKey =
+      "\(sourceURL.path)|\(fileSize)|\(fileMtime)|mmv\(mixMasterProfileVersion)"
+    if let cached = EqRenderCache.shared.get(cacheKey) {
+      return cached
+    }
+    guard let outputURL = mixMasterCacheFileURL(cacheKey: cacheKey) else { return uri }
+    let profileURL = mixMasterProfileURL(for: outputURL)
+    if FileManager.default.fileExists(atPath: outputURL.path) {
+      // Render cached; make sure its profile is beside it (an
+      // interrupted earlier run could have left the WAV without one).
+      if !FileManager.default.fileExists(atPath: profileURL.path),
+         let analysis = await analyzeMixMaster(asset: AVURLAsset(url: sourceURL)) {
+        writeMixMasterProfile(
+          MixMasterProfileRecord(
+            version: mixMasterProfileVersion,
+            songKey: cacheKey,
+            sampleRate: analysis.sampleRate,
+            durationSeconds: analysis.durationSeconds,
+            windows: analysis.windows,
+            findings: analysis.findings
+          ),
+          to: profileURL
+        )
+      }
+      EqRenderCache.shared.set(cacheKey, outputURL.absoluteString)
+      return outputURL.absoluteString
+    }
+    guard let analysis = await analyzeMixMaster(asset: AVURLAsset(url: sourceURL)) else {
+      return uri
+    }
+    // Nothing worth cutting anywhere: the original IS the answer
+    // (and what the session remembers, so the song isn't
+    // re-analyzed on every preview rebuild).
+    if analysis.windows.allSatisfy({ $0.gainsDb.allSatisfy({ $0 == 0 }) }) {
+      EqRenderCache.shared.set(cacheKey, uri)
+      return uri
+    }
+    guard renderMixMasterSong(sourceURL: sourceURL, windows: analysis.windows, outputURL: outputURL) else {
+      return uri
+    }
+    writeMixMasterProfile(
+      MixMasterProfileRecord(
+        version: mixMasterProfileVersion,
+        songKey: cacheKey,
+        sampleRate: analysis.sampleRate,
+        durationSeconds: analysis.durationSeconds,
+        windows: analysis.windows,
+        findings: analysis.findings
+      ),
+      to: profileURL
+    )
+    EqRenderCache.shared.set(cacheKey, outputURL.absoluteString)
+    return outputURL.absoluteString
+  }
+
+  /// Measures the song in 1.0 s windows (50% overlap) and turns
+  /// each window's band balance into per-band gains in dB (cuts
+  /// only, 0 … −6 dB), then smooths the whole curve. Nil when the
+  /// file can't be decoded — the caller keeps the original song.
+  ///
+  /// Per window the rule is Auto EQ's rule applied to THAT window's
+  /// balance: harsh (2–8 kHz) and mud (250/500 Hz) bands whose level
+  /// exceeds the window's mean band level by more than 2 dB take a
+  /// cut equal to the excess (clamped to 6 dB), shouldered
+  /// half-strength onto neighbours. A window quieter than −60 dBFS
+  /// broadband takes no cuts (never process noise into "tone").
+  /// The filters run CONTINUOUSLY across the song — only the energy
+  /// accumulators reset at window boundaries — so there is no
+  /// filter transient at a window edge; the gains are interpolated
+  /// at render time, so the audio path never sees a window edge.
+  /// Overlapping windows are handled with two live accumulators:
+  /// each sample's filtered energy lands in every window that
+  /// covers it.
+  private static func analyzeMixMaster(
+    asset: AVURLAsset
+  ) async -> (
+    windows: [MixMasterWindowRecord],
+    findings: [MixMasterFindingRecord],
+    sampleRate: Double,
+    durationSeconds: Double
+  )? {
+    let bandCount = eqBandCentersHz.count
+    guard let track = (try? await asset.loadTracks(withMediaType: .audio))?.first else {
+      return nil
+    }
+    var sampleRate = 48_000.0
+    var streamChannels = 2
+    if let descriptions = try? await track.load(.formatDescriptions),
+      let first = descriptions.first,
+      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(first)
+    {
+      if asbd.pointee.mSampleRate > 0 { sampleRate = asbd.pointee.mSampleRate }
+      if asbd.pointee.mChannelsPerFrame > 0 { streamChannels = Int(asbd.pointee.mChannelsPerFrame) }
+    }
+    let measuredChannels = max(1, min(2, streamChannels))
+    // Bands too close to Nyquist can't be designed or measured at
+    // this sample rate; they report no energy and take no cut.
+    let measurable = eqBandCentersHz.map { $0 < sampleRate * 0.45 }
+
+    var reader: AVAssetReader?
+    var output: AVAssetReaderTrackOutput?
+    let setupException = avTry {
+      do {
+        let createdReader = try AVAssetReader(asset: asset)
+        let outputSettings: [String: Any] = [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVLinearPCMBitDepthKey: 32,
+          AVLinearPCMIsFloatKey: true,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsNonInterleaved: false,
+        ]
+        let createdOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+        createdOutput.alwaysCopiesSampleData = false
+        if createdReader.canAdd(createdOutput) {
+          createdReader.add(createdOutput)
+          reader = createdReader
+          output = createdOutput
+        }
+      } catch {
+        // Unreadable — the guards below read nil as "unmeasurable".
+      }
+    }
+    guard setupException == nil, let reader, let output, reader.startReading() else {
+      return nil
+    }
+
+    let filters: [[BandpassFilter]] = (0..<measuredChannels).map { _ in
+      eqBandCentersHz.map { BandpassFilter(centerHz: $0, sampleRate: sampleRate) }
+    }
+    let windowFrames = Int(mmWindowSeconds * sampleRate)
+    let hopFrames = Int(mmHopSeconds * sampleRate)
+
+    struct WindowAccumulator {
+      var startFrame: Int
+      var bandSums: [[Double]]
+      var rawSums: [Double]
+      var frames: Int
+    }
+    func zeroBandSums() -> [[Double]] {
+      [[Double]](repeating: [Double](repeating: 0, count: bandCount), count: measuredChannels)
+    }
+
+    // Raw (unsmoothed) per-window gains, in window order.
+    var rawWindows: [(timeSeconds: Double, gainsDb: [Double])] = []
+    var findings: [MixMasterFindingRecord] = []
+
+    func flushWindow(_ acc: WindowAccumulator) {
+      let timeSeconds = Double(acc.startFrame) / sampleRate
+      guard acc.frames > 0 else { return }
+      // Broadband level: a near-silent window takes no cuts.
+      let broadbandEnergy =
+        acc.rawSums.reduce(0, +) / Double(measuredChannels) / Double(acc.frames)
+      guard broadbandEnergy > 0 else {
+        rawWindows.append((timeSeconds, [Double](repeating: 0, count: bandCount)))
+        return
+      }
+      let broadbandDb = 10.0 * log10(broadbandEnergy)
+      guard broadbandDb >= eqSilenceDbfs else {
+        rawWindows.append((timeSeconds, [Double](repeating: 0, count: bandCount)))
+        return
+      }
+      var bandLevels = [Double](repeating: -120, count: bandCount)
+      for band in 0..<bandCount where measurable[band] {
+        var energy = 0.0
+        for channel in 0..<measuredChannels {
+          energy += acc.bandSums[channel][band]
+        }
+        energy /= Double(measuredChannels) * Double(acc.frames)
+        if energy > 0 {
+          bandLevels[band] = 10.0 * log10(energy)
+        }
+      }
+      let flooredLevels = bandLevels.map { max($0, -80) }
+      let referenceDb = flooredLevels.reduce(0, +) / Double(bandCount)
+      // Raw cuts: harsh + mud bands only, excess over the threshold.
+      var rawCuts = [Double](repeating: 0, count: bandCount)
+      for band in 0..<bandCount where measurable[band] {
+        guard eqHarshBandIndices.contains(band) || mmMudBandIndices.contains(band) else {
+          continue
+        }
+        let excess = bandLevels[band] - referenceDb - eqExcessThresholdDb
+        rawCuts[band] = min(eqMaxCutDb, max(0, excess))
+      }
+      // Smooth: every band also takes half of its strongest
+      // neighbour's raw cut (same shoulder as Auto EQ).
+      var gainsDb = [Double](repeating: 0, count: bandCount)
+      for band in 0..<bandCount {
+        var cut = rawCuts[band]
+        if band > 0 { cut = max(cut, rawCuts[band - 1] / 2) }
+        if band < bandCount - 1 { cut = max(cut, rawCuts[band + 1] / 2) }
+        gainsDb[band] = -min(eqMaxCutDb, cut)
+      }
+      // Findings report DIRECT cuts only (shouldered bands are the
+      // neighbour's doing, not this band's own excess).
+      for band in 0..<bandCount where rawCuts[band] >= mmFindingMinCutDb {
+        findings.append(MixMasterFindingRecord(
+          timeSeconds: timeSeconds,
+          bandHz: eqBandCentersHz[band],
+          cutDb: rawCuts[band],
+          reason: mmMudBandIndices.contains(band) ? "mud" : "harshness"
+        ))
+      }
+      rawWindows.append((timeSeconds, gainsDb))
+    }
+
+    var active: [WindowAccumulator] = [
+      WindowAccumulator(startFrame: 0, bandSums: zeroBandSums(), rawSums: [Double](repeating: 0, count: measuredChannels), frames: 0)
+    ]
+    var nextWindowStart = hopFrames
+    var frameIndex = 0
+
+    while let sampleBuffer = output.copyNextSampleBuffer() {
+      guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+      let byteLength = CMBlockBufferGetDataLength(blockBuffer)
+      let floatCount = byteLength / 4
+      guard floatCount >= streamChannels else { continue }
+      var floats = [Float](repeating: 0, count: floatCount)
+      let copyStatus = floats.withUnsafeMutableBytes { pointer -> OSStatus in
+        guard let baseAddress = pointer.baseAddress else { return OSStatus(-1) }
+        return CMBlockBufferCopyDataBytes(
+          blockBuffer,
+          atOffset: 0,
+          dataLength: floatCount * 4,
+          destination: baseAddress
+        )
+      }
+      guard copyStatus == noErr else { return nil }
+      let frames = floatCount / streamChannels
+      for frame in 0..<frames {
+        // A new window starts every hop (50% overlap with the one
+        // before it); the previous windows stay live until full.
+        if frameIndex == nextWindowStart {
+          active.append(WindowAccumulator(
+            startFrame: frameIndex,
+            bandSums: zeroBandSums(),
+            rawSums: [Double](repeating: 0, count: measuredChannels),
+            frames: 0
+          ))
+          nextWindowStart += hopFrames
+        }
+        let base = frame * streamChannels
+        for channel in 0..<measuredChannels {
+          let sample = Double(floats[base + channel])
+          var filtered = [Double](repeating: 0, count: bandCount)
+          for band in 0..<bandCount where measurable[band] {
+            filtered[band] = filters[channel][band].process(sample)
+          }
+          for w in active.indices {
+            active[w].rawSums[channel] += sample * sample
+            for band in 0..<bandCount where measurable[band] {
+              let f = filtered[band]
+              active[w].bandSums[channel][band] += f * f
+            }
+          }
+        }
+        for w in active.indices {
+          active[w].frames += 1
+        }
+        frameIndex += 1
+        while let first = active.first, frameIndex >= first.startFrame + windowFrames {
+          flushWindow(first)
+          active.removeFirst()
+        }
+      }
+    }
+    if reader.status == .failed {
+      return nil
+    }
+    // Flush whatever windows are still open (the tail of the song).
+    for acc in active {
+      flushWindow(acc)
+    }
+    guard !rawWindows.isEmpty else { return nil }
+
+    let durationSeconds = Double(frameIndex) / sampleRate
+    // Trailing rule (mirrors mixMasterWindowStarts): drop a final
+    // window holding < 0.25 s of audio, unless it is the only one.
+    if rawWindows.count > 1,
+       let last = rawWindows.last,
+       durationSeconds - last.timeSeconds < mmMinWindowSeconds {
+      rawWindows.removeLast()
+    }
+    // Findings belong to the windows that survived; keep the
+    // deepest cuts, time-ordered.
+    if let lastTime = rawWindows.last?.timeSeconds {
+      findings.removeAll { $0.timeSeconds > lastTime }
+    }
+    findings.sort { $0.cutDb > $1.cutDb }
+    if findings.count > mmMaxFindings {
+      findings = Array(findings.prefix(mmMaxFindings))
+    }
+    findings.sort { $0.timeSeconds < $1.timeSeconds }
+
+    let smoothed = smoothMmGains(rawWindows.map { $0.gainsDb })
+    let windows = zip(rawWindows, smoothed).map {
+      MixMasterWindowRecord(timeSeconds: $0.0.timeSeconds, gainsDb: $0.1)
+    }
+    return (
+      windows: windows,
+      findings: findings,
+      sampleRate: sampleRate,
+      durationSeconds: durationSeconds
+    )
+  }
+
+  /// Renders the full song through an AVAudioUnitEQ in offline
+  /// manual-rendering mode, with the band gains driven by the
+  /// smoothed curve: before each 4096-frame block the engine sets
+  /// every band's gain from the curve at that block's timestamp
+  /// (linear interpolation between analysis points). The EQ unit
+  /// stays attached for the whole render, so its filter state is
+  /// continuous and the gains move at most the slew limit between
+  /// blocks — no clicks, no per-second switching. Bands are never
+  /// bypassed (a band at 0 dB at the song's start may cut later in
+  /// the song; a 0 dB band is sonically inert anyway). Otherwise
+  /// the same contract as renderEqSong: Float32 WAV, EXACT source
+  /// frame count, temp file moved into place only when complete.
+  /// False on any failure; the caller falls back to the original song.
+  private static func renderMixMasterSong(
+    sourceURL: URL,
+    windows: [MixMasterWindowRecord],
+    outputURL: URL
+  ) -> Bool {
+    let tempURL = outputURL.deletingPathExtension()
+      .appendingPathExtension("tmp-\(UUID().uuidString).wav")
+    defer { try? FileManager.default.removeItem(at: tempURL) }
+    do {
+      let sourceFile = try AVAudioFile(forReading: sourceURL)
+      let format = sourceFile.processingFormat
+      let totalFrames = sourceFile.length
+      guard totalFrames > 0, format.sampleRate > 0, format.channelCount > 0 else {
+        return false
+      }
+
+      let engine = AVAudioEngine()
+      let player = AVAudioPlayerNode()
+      let eq = AVAudioUnitEQ(numberOfBands: eqBandCentersHz.count)
+      engine.attach(player)
+      engine.attach(eq)
+      engine.connect(player, to: eq, format: format)
+      engine.connect(eq, to: engine.mainMixerNode, format: format)
+      let initialGains = mmGainAtTime(windows: windows, timeSeconds: 0)
+      for (index, band) in eq.bands.enumerated() {
+        band.filterType = .parametric
+        // Clamp under Nyquist for very low sample rates; the
+        // analysis already measured nothing up there in that case.
+        band.frequency = Float(min(eqBandCentersHz[index], format.sampleRate * 0.45))
+        band.bandwidth = 1.0  // octaves — matches the analysis width
+        band.gain = Float(initialGains[index])
+        band.bypass = false
+      }
+      eq.globalGain = 0  // cuts only — no makeup boost, ever
+
+      let outputSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: format.sampleRate,
+        AVNumberOfChannelsKey: format.channelCount,
+        AVLinearPCMBitDepthKey: 32,
+        AVLinearPCMIsFloatKey: true,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: !format.isInterleaved,
+      ]
+      let outputFile = try AVAudioFile(
+        forWriting: tempURL,
+        settings: outputSettings,
+        commonFormat: format.commonFormat,
+        interleaved: format.isInterleaved
+      )
+
+      try engine.enableManualRenderingMode(
+        .offline,
+        format: format,
+        maximumFrameCount: 4096
+      )
+      player.scheduleFile(sourceFile, at: nil)
+      try engine.start()
+      player.play()
+
+      guard
+        let buffer = AVAudioPCMBuffer(
+          pcmFormat: engine.manualRenderingFormat,
+          frameCapacity: 4096
+        )
+      else {
+        engine.stop()
+        return false
+      }
+      var written: AVAudioFramePosition = 0
+      var stalledRenders = 0
+      while written < totalFrames {
+        // Drive the EQ from the smoothed curve at this block's song
+        // position — before the render, so the block is processed
+        // with the gains for its own timestamp.
+        let gains = mmGainAtTime(
+          windows: windows,
+          timeSeconds: Double(written) / format.sampleRate
+        )
+        for (index, band) in eq.bands.enumerated() {
+          band.gain = Float(gains[index])
+        }
+        let framesToRender = AVAudioFrameCount(
+          min(4096, AVAudioFramePosition(totalFrames - written))
+        )
+        let status = try engine.renderOffline(framesToRender, to: buffer)
+        switch status {
+        case .success, .insufficientDataFromInputNode:
+          if buffer.frameLength > 0 {
+            try outputFile.write(from: buffer)
+            written += AVAudioFramePosition(buffer.frameLength)
+            stalledRenders = 0
+          } else {
+            stalledRenders += 1
+            if stalledRenders > 8 { engine.stop(); return false }
+          }
+        case .cannotDoInCurrentContext:
+          // Transient by contract, but never spin forever on it.
+          stalledRenders += 1
+          if stalledRenders > 64 { engine.stop(); return false }
+        case .error:
+          engine.stop()
+          return false
+        @unknown default:
+          engine.stop()
+          return false
+        }
+      }
+      engine.stop()
+      guard written == totalFrames else { return false }
+      try FileManager.default.moveItem(at: tempURL, to: outputURL)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   // MARK: Look (CI grade on the composed frames)
 
   private static func lookIsIdentity(_ look: LookParamsRecord) -> Bool {
@@ -6725,6 +7339,10 @@ public class MvmtCompositorModule: Module {
 
     AsyncFunction("prepareEqSong") { (uri: String) -> String in
       await MvmtCompositorEngine.prepareEqSong(uri)
+    }
+
+    AsyncFunction("prepareMixMasterSong") { (uri: String) -> String in
+      await MvmtCompositorEngine.prepareMixMasterSong(uri)
     }
 
     Function("isCaptureAvailable") { () -> Bool in
