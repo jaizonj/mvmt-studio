@@ -56,7 +56,7 @@
     "test:lyrics": "tsc --ignoreConfig src/lib/lyrics.ts --outDir tests/.build-lyrics --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/lyrics.test.cjs",
     "test:library": "tsc --ignoreConfig src/lib/songLibrary.ts --outDir tests/.build-library --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/library.test.cjs",
     "test:looks": "tsc --ignoreConfig src/lib/looks.ts src/lib/exportSize.ts src/lib/loudness.ts --outDir tests/.build-looks --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/looks.test.cjs",
-    "test:mixmaster": "tsc --ignoreConfig src/lib/mixMasterCurve.ts --outDir tests/.build-mixmaster --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/mixmaster.test.cjs"
+    "test:mixmaster": "tsc --ignoreConfig src/lib/mixMasterCurve.ts src/lib/mixMasterExport.ts --outDir tests/.build-mixmaster --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/mixmaster.test.cjs"
   },
   "private": true
 }

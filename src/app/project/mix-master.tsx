@@ -4,6 +4,7 @@ import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -16,7 +17,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { SegmentedControl } from '../../components/SegmentedControl';
 import { isCompositorAvailable } from '../../lib/compositor';
-import { useMixMasterProfile, useMixMasterSongUri } from '../../lib/mixMaster';
+import { shareFile } from '../../lib/media';
+import { exportMixMasterSongFile, useMixMasterProfile, useMixMasterSongUri } from '../../lib/mixMaster';
 import {
   MM_BAND_CENTERS_HZ,
   formatMixMasterFinding,
@@ -26,6 +28,10 @@ import {
   shortBandLabelHz,
   summarizeMixMasterProfile,
 } from '../../lib/mixMasterCurve';
+import {
+  mixMasterExportMimeType,
+  type MixMasterExportFormat,
+} from '../../lib/mixMasterExport';
 import { loadTrackPeaks, samplePeaks, standinPeaks } from '../../lib/waveform';
 import { useStudio } from '../../store/StudioContext';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
@@ -179,7 +185,16 @@ function StageSection({
 export default function MixMasterScreen() {
   const insets = useSafeAreaInsets();
   const studio = useStudio();
-  const { track, mixMasterEnabled, setMixMasterEnabled, mixMasterStages, setMixMasterStages } = studio;
+  const {
+    track,
+    mixMasterEnabled,
+    setMixMasterEnabled,
+    mixMasterStages,
+    setMixMasterStages,
+    mixMasterSource,
+    applyMixMasterTrack,
+    restoreMixMasterSource,
+  } = studio;
 
   const trackUri = track?.uri ?? null;
   const trackName = track?.name ?? null;
@@ -322,6 +337,84 @@ export default function MixMasterScreen() {
   const identicalAb =
     !profile || !summary?.hasCorrections || !processedUri || processedUri === trackUri;
 
+  // ---- Export (Stage 4) -------------------------------------------------
+  const [exporting, setExporting] = useState<MixMasterExportFormat | null>(null);
+  const [exportNote, setExportNote] = useState<string | null>(null);
+  // Exportable only when a processed file exists for the CURRENT
+  // settings: a settings change keeps `loading` true until the new
+  // render lands, so a tap can never export a stale file — and
+  // `identicalAb` covers the song that needs no corrections (the
+  // "processed" file IS the original, so there is nothing to save).
+  const canExport =
+    mixMasterEnabled && !!profile && !loading && !identicalAb && !!processedUri && !!trackUri;
+
+  const runExport = async (format: MixMasterExportFormat) => {
+    if (!trackUri || !trackName || !canExport || exporting) return;
+    setExporting(format);
+    setExportNote(null);
+    try {
+      const result = await exportMixMasterSongFile(trackUri, trackName, mixMasterStages, format);
+      if (!result) {
+        setExportNote('Export failed — the processed song could not be written.');
+        return;
+      }
+      const shared = await shareFile(result.uri, mixMasterExportMimeType(format));
+      setExportNote(
+        shared
+          ? `Saved “${result.fileName}” — share sheet opened.`
+          : `Saved “${result.fileName}” in Files (MVMT Studio → exports).`,
+      );
+    } finally {
+      setExporting(null);
+    }
+  };
+
+  /**
+   * "Use in project": the track becomes the processed song. A
+   * confirm first — it changes the project's song. The track
+   * points at the EXPORT copy (a durable file outside the render
+   * cache), and the store records the original for Restore.
+   */
+  const useInProject = () => {
+    if (!trackUri || !trackName || !canExport) return;
+    Alert.alert(
+      'Use processed song in this project?',
+      `Your track becomes the Mix & Master version of “${trackName}”. The region, takes, edit and lyrics carry over — it is the same song at the same length. Your original is kept, and you can switch back from this screen.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Use processed song',
+          onPress: () => {
+            void (async () => {
+              const result = await exportMixMasterSongFile(
+                trackUri,
+                trackName,
+                mixMasterStages,
+                'wav',
+              );
+              if (!result) {
+                setExportNote('Could not save the processed song — the track was not changed.');
+                return;
+              }
+              applyMixMasterTrack(result.uri, result.fileName);
+              setExportNote(
+                `Now performing to “${result.fileName}”. The original is kept — tap “Restore original song” to switch back.`,
+              );
+            })();
+          },
+        },
+      ],
+    );
+  };
+
+  const restoreOriginal = () => {
+    if (!mixMasterSource) return;
+    restoreMixMasterSource();
+    setExportNote(
+      `Back to the original “${mixMasterSource.name}” — Mix & Master is on again.`,
+    );
+  };
+
   const playheadPct =
     playheadDuration > 0 ? Math.min(100, Math.max(0, (playhead / playheadDuration) * 100)) : 0;
 
@@ -376,6 +469,24 @@ export default function MixMasterScreen() {
                 />
               </View>
             </View>
+
+            {/* The original song, kept after "Use in project" — the way back. */}
+            {mixMasterSource ? (
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Original song kept</Text>
+                <Text style={styles.cardHint}>
+                  This project is performing to a Mix &amp; Master render. The original
+                  “{mixMasterSource.name}” is untouched.
+                </Text>
+                <Pressable
+                  style={styles.restoreButton}
+                  onPress={restoreOriginal}
+                  accessibilityRole="button"
+                  accessibilityLabel="Restore original song">
+                  <Text style={styles.restoreButtonText}>Restore original song</Text>
+                </Pressable>
+              </View>
+            ) : null}
 
             {!mixMasterEnabled ? (
               <View style={styles.card}>
@@ -564,6 +675,56 @@ export default function MixMasterScreen() {
                   accessibilityLabel="Master EQ"
                 />
 
+                {/* Export (Stage 4) */}
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>Export the processed song</Text>
+                  <Text style={styles.cardHint}>
+                    Save the mastered song as its own file — WAV is the full-quality master,
+                    AAC is the smaller shareable copy. The original file is never changed.
+                  </Text>
+                  <View style={styles.exportRow}>
+                    <Pressable
+                      style={[styles.exportButton, (!canExport || exporting) && styles.buttonDisabled]}
+                      disabled={!canExport || exporting !== null}
+                      onPress={() => void runExport('wav')}
+                      accessibilityRole="button"
+                      accessibilityLabel="Export WAV">
+                      {exporting === 'wav' ? (
+                        <ActivityIndicator size="small" color={colors.label} />
+                      ) : (
+                        <Text style={styles.exportButtonText}>Export WAV</Text>
+                      )}
+                    </Pressable>
+                    <Pressable
+                      style={[styles.exportButton, (!canExport || exporting) && styles.buttonDisabled]}
+                      disabled={!canExport || exporting !== null}
+                      onPress={() => void runExport('aac')}
+                      accessibilityRole="button"
+                      accessibilityLabel="Export AAC">
+                      {exporting === 'aac' ? (
+                        <ActivityIndicator size="small" color={colors.label} />
+                      ) : (
+                        <Text style={styles.exportButtonText}>Export AAC</Text>
+                      )}
+                    </Pressable>
+                  </View>
+                  <Pressable
+                    style={[styles.useButton, (!canExport || exporting) && styles.buttonDisabled]}
+                    disabled={!canExport || exporting !== null}
+                    onPress={useInProject}
+                    accessibilityRole="button"
+                    accessibilityLabel="Use processed song in this project">
+                    <Text style={styles.useButtonText}>Use in this project</Text>
+                  </Pressable>
+                  {!canExport && !loading ? (
+                    <Text style={styles.cardHint}>
+                      Nothing to export yet — either the song needs no corrections, or the
+                      settings are still updating.
+                    </Text>
+                  ) : null}
+                  {exportNote ? <Text style={styles.exportNote}>{exportNote}</Text> : null}
+                </View>
+
                 <Text style={styles.footnote}>
                   The processed song is what the editor preview and export use while Mix &amp;
                   Master is on. Your original file is never changed.
@@ -653,6 +814,35 @@ const styles = StyleSheet.create({
   chartLabel: { ...typeScale.caption, color: colors.labelTertiary },
 
   findingRow: { ...typeScale.subhead, color: colors.label, lineHeight: 22 },
+
+  exportRow: { flexDirection: 'row', gap: spacing.sm },
+  exportButton: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 44,
+    borderRadius: radius.md,
+    backgroundColor: colors.elevated,
+  },
+  exportButtonText: { ...typeScale.headline, color: colors.label },
+  useButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 44,
+    borderRadius: radius.md,
+    backgroundColor: colors.accent,
+  },
+  useButtonText: { ...typeScale.headline, color: colors.onAccent },
+  buttonDisabled: { opacity: 0.45 },
+  restoreButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 44,
+    borderRadius: radius.md,
+    backgroundColor: colors.elevated,
+  },
+  restoreButtonText: { ...typeScale.headline, color: colors.label },
+  exportNote: { ...typeScale.subhead, color: colors.labelSecondary, lineHeight: 21 },
 
   sliderLabelRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
   sliderLabel: { ...typeScale.subhead, color: colors.label },

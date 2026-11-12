@@ -1,12 +1,14 @@
 /**
- * Node tests for the Mix & Master Stages 1–2 curve math
- * (src/lib/mixMasterCurve.ts): window layout, smoothing (moving
- * average + slew limit), gain interpolation, stage settings, and
- * the Master EQ gain computation. The Swift engine
- * (prepareMixMasterSong) mirrors these functions exactly, so these
- * tests pin the behaviour both sides implement.
+ * Node tests for the Mix & Master curve math (src/lib/mixMasterCurve.ts):
+ * window layout, smoothing (moving average + slew limit), gain
+ * interpolation, stage settings, and the Master EQ gain computation.
+ * The Swift engine (prepareMixMasterSong) mirrors these functions
+ * exactly, so these tests pin the behaviour both sides implement.
+ * Plus the Stage 4 export pure half (src/lib/mixMasterExport.ts):
+ * export file names, uniqueness, and the use-in-project / restore
+ * state transitions.
  * Run with: npm run test:mixmaster
- * (tsc compiles the pure module into tests/.build-mixmaster, then
+ * (tsc compiles the pure modules into tests/.build-mixmaster, then
  * node --test runs this file against the compiled JS.)
  */
 const test = require('node:test');
@@ -39,6 +41,15 @@ const {
   windowTotalCutDb,
   mixMasterActivityBars,
 } = require('./.build-mixmaster/src/lib/mixMasterCurve.js');
+const {
+  MM_EXPORT_FOLDER,
+  mixMasterExportBaseName,
+  mixMasterExportFileName,
+  mixMasterExportMimeType,
+  resolveMixMasterExportFileName,
+  mixMasterUseInProjectPatch,
+  mixMasterRestoreOriginalPatch,
+} = require('./.build-mixmaster/src/lib/mixMasterExport.js');
 
 /** Gains are computed in floating point — compare within 1e-9. */
 function assertGainsClose(actual, expected, eps = 1e-9) {
@@ -443,4 +454,110 @@ test('activity bars: exact count, max-preserving, empty profile is flat', () => 
   });
   assert.deepEqual(mixMasterActivityBars(parseMixMasterProfile(flat), 3), [0, 0, 0]);
   assert.deepEqual(mixMasterActivityBars(parseMixMasterProfile(validProfile({ windows: [] })), 3), [0, 0, 0]);
+});
+
+// --- Stage 4 export: file names -------------------------------------------
+
+test('export base name: strips the extension, sanitises, falls back to Song', () => {
+  assert.equal(mixMasterExportBaseName('My Song.mp3'), 'My Song');
+  assert.equal(mixMasterExportBaseName('track'), 'track');
+  assert.equal(mixMasterExportBaseName('a/b:c*d?e"f<g>h|i.wav'), 'abcdefghi');
+  assert.equal(mixMasterExportBaseName('  spaced   out  .m4a'), 'spaced out');
+  assert.equal(mixMasterExportBaseName('   .mp3'), 'Song');
+  assert.equal(mixMasterExportBaseName(''), 'Song');
+  assert.equal(mixMasterExportBaseName('x'.repeat(150) + '.wav').length, 100);
+});
+
+test('export file name: suffix + extension per format', () => {
+  assert.equal(
+    mixMasterExportFileName('My Song.mp3', 'wav'),
+    'My Song (MVMT Mix & Master).wav',
+  );
+  assert.equal(
+    mixMasterExportFileName('My Song.mp3', 'aac'),
+    'My Song (MVMT Mix & Master).m4a',
+  );
+});
+
+test('export file name uniqueness: first free name wins, counting up', () => {
+  const taken = new Set(['My Song (MVMT Mix & Master).wav']);
+  assert.equal(
+    resolveMixMasterExportFileName('My Song (MVMT Mix & Master).wav', (n) => taken.has(n)),
+    'My Song (MVMT Mix & Master) 2.wav',
+  );
+  taken.add('My Song (MVMT Mix & Master) 2.wav');
+  assert.equal(
+    resolveMixMasterExportFileName('My Song (MVMT Mix & Master).wav', (n) => taken.has(n)),
+    'My Song (MVMT Mix & Master) 3.wav',
+  );
+  assert.equal(
+    resolveMixMasterExportFileName('Fresh (MVMT Mix & Master).m4a', (n) => taken.has(n)),
+    'Fresh (MVMT Mix & Master).m4a',
+  );
+});
+
+test('export mime types: wav and aac', () => {
+  assert.equal(mixMasterExportMimeType('wav'), 'audio/wav');
+  assert.equal(mixMasterExportMimeType('aac'), 'audio/mp4');
+});
+
+test('export folder is the user-visible Documents/exports folder', () => {
+  assert.equal(MM_EXPORT_FOLDER, 'exports');
+});
+
+// --- Stage 4 export: use-in-project / restore ----------------------------
+
+const originalTrack = {
+  uri: 'file:///tracks/song.mp3',
+  name: 'My Song.mp3',
+  durationSeconds: 180,
+};
+
+test('use-in-project patch: track becomes the export, original recorded, suite off', () => {
+  const patch = mixMasterUseInProjectPatch(
+    originalTrack,
+    'file:///exports/My Song (MVMT Mix & Master).wav',
+    'My Song (MVMT Mix & Master).wav',
+  );
+  assert.equal(patch.track.uri, 'file:///exports/My Song (MVMT Mix & Master).wav');
+  assert.equal(patch.track.name, 'My Song (MVMT Mix & Master).wav');
+  // The render is the exact frame count — the duration carries over,
+  // so the region, the EDL and every take's sync offset stay valid.
+  assert.equal(patch.track.durationSeconds, 180);
+  assert.equal(patch.mixMasterEnabled, false);
+  assert.equal(patch.autoEqEnabled, false);
+  assert.deepEqual(patch.mixMasterSource, { uri: originalTrack.uri, name: originalTrack.name });
+});
+
+test('use-in-project patch: a second apply never overwrites the true original', () => {
+  const first = mixMasterUseInProjectPatch(
+    originalTrack,
+    'file:///exports/My Song (MVMT Mix & Master).wav',
+    'My Song (MVMT Mix & Master).wav',
+  );
+  const second = mixMasterUseInProjectPatch(
+    first.track,
+    'file:///exports/My Song (MVMT Mix & Master) 2.wav',
+    'My Song (MVMT Mix & Master) 2.wav',
+    first.mixMasterSource,
+  );
+  assert.equal(second.track.uri, 'file:///exports/My Song (MVMT Mix & Master) 2.wav');
+  assert.deepEqual(second.mixMasterSource, { uri: originalTrack.uri, name: originalTrack.name });
+});
+
+test('restore patch: track back to the original, suite back on, source cleared', () => {
+  const patch = mixMasterRestoreOriginalPatch(
+    { uri: originalTrack.uri, name: originalTrack.name },
+    180,
+  );
+  assert.equal(patch.track.uri, originalTrack.uri);
+  assert.equal(patch.track.name, originalTrack.name);
+  assert.equal(patch.track.durationSeconds, 180);
+  assert.equal(patch.mixMasterEnabled, true);
+  assert.equal(patch.mixMasterSource, undefined);
+});
+
+test('restore patch: a track without a known duration keeps none', () => {
+  const patch = mixMasterRestoreOriginalPatch({ uri: 'file:///x.mp3', name: 'x.mp3' });
+  assert.equal(patch.track.durationSeconds, undefined);
 });

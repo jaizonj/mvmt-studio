@@ -512,6 +512,7 @@ interface NativeMvmtCompositorModule {
     masterEnabled: boolean,
     masterIntensity: number,
   ): Promise<string | null>;
+  exportMixMasterAac(sourceUri: string, destinationUri: string): Promise<string | null>;
   isCaptureAvailable(): boolean;
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
@@ -738,6 +739,27 @@ export async function getMixMasterProfile(
       masterEnabled,
       masterIntensity,
     );
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mix & Master Stage 4: transcode a processed (Float32 WAV)
+ * render to AAC (.m4a, 256 kbps) at the given destination URI.
+ * Resolves to the destination URI on success, null when the
+ * engine is unavailable, the function is missing, or the transcode
+ * fails. Never rejects. The WAV export needs no native code (a
+ * plain file copy); only the compressed format comes through here.
+ */
+export async function exportMixMasterAac(
+  sourceUri: string,
+  destinationUri: string,
+): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.exportMixMasterAac !== 'function') return null;
+  try {
+    const result = await nativeModule.exportMixMasterAac(sourceUri, destinationUri);
     return typeof result === 'string' && result.length > 0 ? result : null;
   } catch {
     return null;

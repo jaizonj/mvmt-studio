@@ -175,6 +175,26 @@ no nested scroll views, no desktop panels.
   (no onProgress on that bridge), so there is nothing real to show.
 - **Stage 4 — Export**: WAV/AAC export, share sheet, "use in
   project".
+  SHIPPED (commit bedb738, 2026-11-12): `src/lib/mixMasterExport.ts`
+  (pure half — file names, uniqueness, use-in-project / restore
+  patches) + `exportMixMasterSongFile` in `src/lib/mixMaster.ts`
+  (re-prepares for the CURRENT settings first, so a stale render
+  can never be exported; WAV is the Float32 master copied as-is,
+  AAC is a native `exportMixMasterAac` transcode, AppleM4A 256 kbps
+  .m4a) + Export card on the Mix & Master screen (Export WAV /
+  Export AAC → share sheet via `shareFile`; "Use in this project"
+  behind a confirm, pointing the track at the EXPORT copy in
+  Documents/exports). "Use in project" patches the project
+  directly — NOT setTrack, which would reset the region and clear
+  the lyrics — so region, EDL, takes and lyrics carry over (the
+  render is the exact frame count, so every song-time position
+  stays valid); it turns Mix & Master + Auto EQ off (the chain is
+  baked into the file) and records the original in
+  `Project.mixMasterSource` (a second apply never overwrites it);
+  "Restore original song" switches back and turns Mix & Master on
+  again. Exports are disabled while the profile is loading and
+  when the song needs no corrections. Swift uncompiled until CI,
+  like all Swift work.
 - **Stage 5 — Later modules** (NOT promised in this programme):
   multiband compression, standard compression, de-essing, stereo
   imaging, saturation, limiting, loudness normalization. The chain

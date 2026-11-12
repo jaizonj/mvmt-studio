@@ -7,6 +7,10 @@ import { effectiveLook } from '../lib/looks';
 import { cleanDetectedLyrics, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { lyricTemplateById } from '../lib/lyricTemplates';
 import { resolveMixMasterStageSettings, type MixMasterStageSettings } from '../lib/mixMasterCurve';
+import {
+  mixMasterRestoreOriginalPatch,
+  mixMasterUseInProjectPatch,
+} from '../lib/mixMasterExport';
 import { loadProjects, saveProjects } from '../lib/persistence';
 import { findSongLibraryEntry, removeSongLibraryEntry, upsertSongLibraryEntry } from '../lib/songLibrary';
 import type {
@@ -177,6 +181,28 @@ interface StudioState {
    *  toggles and intensities come with the Stage 3 screen. */
   mixMasterStages: MixMasterStageSettings;
   setMixMasterStages: (patch: Partial<MixMasterStageSettings>) => void;
+
+  /**
+   * The ORIGINAL song this project's track was replaced from, when
+   * the Mix & Master render was saved as the track ("Use in
+   * project", Stage 4). Null when the track was never replaced —
+   * the Mix & Master screen offers "Restore original song" while
+   * this is set.
+   */
+  mixMasterSource: { uri: string; name: string } | null;
+  /**
+   * Save the processed song as the project's track (Stage 4 "Use in
+   * project"): the track becomes the exported processed file, Mix &
+   * Master turns off (the processing is baked into the file now),
+   * and the original song is recorded in `mixMasterSource` so it
+   * can be restored. Deliberately NOT setTrack: the region, the
+   * EDL, the takes and the lyrics all carry over — the render is
+   * the same song at the exact same length, so every song-time
+   * position stays valid.
+   */
+  applyMixMasterTrack: (processedUri: string, processedFileName: string) => void;
+  /** Switch the track back to the recorded original song (Stage 4). No-op when nothing was replaced. */
+  restoreMixMasterSource: () => void;
 
   /** The active project's lyrics (song-frame timed lines + style). */
   lyrics: ProjectLyrics | null;
@@ -538,6 +564,35 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchActiveProject],
   );
 
+  // Mix & Master Stage 4: the original song this project's track
+  // was replaced from ("Use in project"). Null = never replaced.
+  const mixMasterSource = activeProject?.mixMasterSource ?? null;
+
+  const applyMixMasterTrack = useCallback(
+    (processedUri: string, processedFileName: string) => {
+      const current = activeProjectRef.current;
+      const track = current?.track;
+      if (!track) return;
+      patchActiveProject(
+        mixMasterUseInProjectPatch(
+          track,
+          processedUri,
+          processedFileName,
+          current.mixMasterSource ?? null,
+        ),
+      );
+    },
+    [patchActiveProject],
+  );
+
+  const restoreMixMasterSource = useCallback(() => {
+    const current = activeProjectRef.current;
+    const source = current?.mixMasterSource;
+    const track = current?.track;
+    if (!source || !track) return;
+    patchActiveProject(mixMasterRestoreOriginalPatch(source, track.durationSeconds));
+  }, [patchActiveProject]);
+
   // ---- Lyrics (song-frame timed; see src/lib/lyrics.ts) ----
   const lyrics = activeProject?.lyrics ?? null;
   const lyricsEnabled = activeProject?.lyricsEnabled ?? ((activeProject?.lyrics?.lines.length ?? 0) > 0);
@@ -861,6 +916,9 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setMixMasterEnabled,
       mixMasterStages,
       setMixMasterStages,
+      mixMasterSource,
+      applyMixMasterTrack,
+      restoreMixMasterSource,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,
@@ -953,6 +1011,9 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setMixMasterEnabled,
       mixMasterStages,
       setMixMasterStages,
+      mixMasterSource,
+      applyMixMasterTrack,
+      restoreMixMasterSource,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,

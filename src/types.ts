@@ -444,6 +444,16 @@ export interface Project {
    * re-renders the processed song.
    */
   mixMasterStages?: MixMasterStageSettings;
+  /**
+   * Mix & Master Stage 4: when the processed song is saved as the
+   * project's track ("Use in project"), the ORIGINAL song is
+   * recorded here so the user can switch back. Undefined = the
+   * track was never replaced by a Mix & Master render (or it was
+   * restored). The track itself stays a plain AudioTrack — the
+   * render is the same song at the exact same length, so the
+   * region, the EDL, the takes and the lyrics all carry over.
+   */
+  mixMasterSource?: { uri: string; name: string };
   /** When the project's video was last successfully rendered (Export stamps it). */
   exportedAt?: number;
 }

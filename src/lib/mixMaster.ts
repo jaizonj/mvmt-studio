@@ -34,8 +34,14 @@
  * project's original song file, always.
  */
 import { useEffect, useState } from 'react';
+import { Directory, File, Paths } from 'expo-file-system';
 
-import { getMixMasterProfile, isCompositorAvailable, prepareMixMasterSong } from './compositor';
+import {
+  exportMixMasterAac,
+  getMixMasterProfile,
+  isCompositorAvailable,
+  prepareMixMasterSong,
+} from './compositor';
 import {
   mixMasterStageSettingsKey,
   parseMixMasterProfile,
@@ -43,6 +49,12 @@ import {
   type MixMasterProfile,
   type MixMasterStageSettings,
 } from './mixMasterCurve';
+import {
+  MM_EXPORT_FOLDER,
+  mixMasterExportFileName,
+  resolveMixMasterExportFileName,
+  type MixMasterExportFormat,
+} from './mixMasterExport';
 
 /** Session memo: one native preparation per song URI + stage settings, ever. */
 const preparations = new Map<string, Promise<string>>();
@@ -74,6 +86,58 @@ export function prepareMixMasterSongUri(
   })();
   preparations.set(key, promise);
   return promise;
+}
+
+/** One exported processed song: the file the share sheet opens. */
+export interface MixMasterExportResult {
+  uri: string;
+  fileName: string;
+  format: MixMasterExportFormat;
+}
+
+/**
+ * Export the processed song for the CURRENT stage settings
+ * (Stage 4). Freshness is the preparation itself: it re-runs
+ * `prepareMixMasterSongUri` for these settings — memoized, so it
+ * is free when the render already exists and re-renders when the
+ * settings changed — and never exports a stale render. Resolves
+ * to null when there is nothing to export (the engine is
+ * unavailable, the song needs no corrections so the "processed"
+ * file IS the original, or the write/transcode failed). Never
+ * rejects.
+ *
+ * WAV is the Float32 master render copied as-is (no re-encode);
+ * AAC is a native transcode of that render (256 kbps .m4a). The
+ * file lands in Documents/exports with a unique name, outside the
+ * render cache — it survives cache eviction and shows up in Files.
+ * The original song file is never touched.
+ */
+export async function exportMixMasterSongFile(
+  originalUri: string,
+  trackName: string,
+  stages?: Partial<MixMasterStageSettings> | null,
+  format: MixMasterExportFormat = 'wav',
+): Promise<MixMasterExportResult | null> {
+  try {
+    const processedUri = await prepareMixMasterSongUri(originalUri, stages);
+    if (!processedUri || processedUri === originalUri) return null;
+    const dir = new Directory(Paths.document, MM_EXPORT_FOLDER);
+    if (!dir.exists) dir.create();
+    const fileName = resolveMixMasterExportFileName(
+      mixMasterExportFileName(trackName, format),
+      (name) => new File(dir, name).exists,
+    );
+    const destination = new File(dir, fileName);
+    if (format === 'wav') {
+      await new File(processedUri).copy(destination);
+    } else {
+      const transcoded = await exportMixMasterAac(processedUri, destination.uri);
+      if (!transcoded) return null;
+    }
+    return { uri: destination.uri, fileName, format };
+  } catch {
+    return null;
+  }
 }
 
 /**

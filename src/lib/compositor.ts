@@ -15,6 +15,7 @@ export {
   cancelExport,
   CapturePreview,
   createPreview,
+  exportMixMasterAac,
   inspectAsset,
   isCaptureAvailable,
   isCompositorAvailable,

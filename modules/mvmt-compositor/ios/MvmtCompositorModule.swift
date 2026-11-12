@@ -4136,6 +4136,50 @@ private enum MvmtCompositorEngine {
     return String(data: data, encoding: .utf8)
   }
 
+  /// Mix & Master Stage 4: transcode a processed (Float32 WAV)
+  /// render to AAC (.m4a, AppleM4A preset — 256 kbps) at the given
+  /// destination, for sharing. Returns the destination URI on
+  /// success, nil on any failure — never throws, so the JS side
+  /// treats nil as "export failed" and the track is never touched.
+  /// The WAV export needs no native code at all (a plain file copy
+  /// on the JS side); only the compressed format comes through
+  /// here. A stale partial file at the destination would make the
+  /// session fail outright, so it starts clean — and a failed
+  /// session's partial output is removed so a retry starts clean.
+  static func exportMixMasterAac(sourceUri: String, destinationUri: String) async -> String? {
+    let sourceURL = resolveURL(sourceUri)
+    let destinationURL = resolveURL(destinationUri)
+    guard sourceURL.isFileURL, destinationURL.isFileURL else { return nil }
+    guard FileManager.default.fileExists(atPath: sourceURL.path) else { return nil }
+    if FileManager.default.fileExists(atPath: destinationURL.path) {
+      try? FileManager.default.removeItem(at: destinationURL)
+    }
+    let asset = AVURLAsset(url: sourceURL)
+    var createdExporter: AVAssetExportSession?
+    let exporterException = avTry {
+      guard
+        let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A)
+      else { return }
+      session.outputURL = destinationURL
+      session.outputFileType = .m4a
+      session.shouldOptimizeForNetworkUse = false
+      createdExporter = session
+    }
+    if exporterException != nil { return nil }
+    guard let exporter = createdExporter else { return nil }
+    let ok = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+      exporter.exportAsynchronously {
+        if exporter.status == .completed {
+          continuation.resume(returning: true)
+        } else {
+          try? FileManager.default.removeItem(at: destinationURL)
+          continuation.resume(returning: false)
+        }
+      }
+    }
+    return ok ? destinationURL.absoluteString : nil
+  }
+
   /// Measures the song in 1.0 s windows (50% overlap) and turns
   /// each window's band balance into per-band gains in dB (cuts
   /// only, 0 … −6 dB), then smooths the whole curve. Nil when the
@@ -8604,6 +8648,13 @@ public class MvmtCompositorModule: Module {
         correctiveIntensity: correctiveIntensity,
         masterEnabled: masterEnabled,
         masterIntensity: masterIntensity
+      )
+    }
+
+    AsyncFunction("exportMixMasterAac") { (sourceUri: String, destinationUri: String) -> String? in
+      await MvmtCompositorEngine.exportMixMasterAac(
+        sourceUri: sourceUri,
+        destinationUri: destinationUri
       )
     }
 
