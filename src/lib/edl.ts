@@ -26,6 +26,10 @@ export const EDL_VERSION = 1 as const;
 /** Project frame rate — editing grid and native frameDuration. */
 export const DEFAULT_FPS = 30;
 
+/** Playback-rate bounds for a segment's video (Edit Modes Stage 1). */
+export const MIN_SEGMENT_SPEED = 0.25;
+export const MAX_SEGMENT_SPEED = 2;
+
 export interface EdlSegment {
   id: string;
   takeId: string;
@@ -33,8 +37,55 @@ export interface EdlSegment {
   timelineStartFrame: number;
   /** First frame inside the source take (sync offset already applied). */
   sourceStartFrame: number;
-  /** Length of the segment, in frames. Always > 0 in a valid EDL. */
+  /** Length of the segment IN SOURCE FRAMES. Always > 0 in a valid EDL.
+   *  The length it occupies ON THE TIMELINE is
+   *  `segmentTimelineDurationFrames` — source frames divided by speed. */
   durationFrames: number;
+  /**
+   * Playback rate of the segment's VIDEO (0.25–2, undefined = 1):
+   * 0.5 plays the source at half speed (twice as long on the
+   * timeline), 2 at double speed. Video-only — the master song
+   * always plays at 1x over the whole cut, so speed never touches
+   * audio sync. The source range (`sourceStartFrame`,
+   * `durationFrames`) is unchanged; only the mapping stretches.
+   */
+  speed?: number;
+}
+
+/**
+ * Sanitised playback rate for a segment: finite, clamped to
+ * [0.25, 2], default 1. The single sanitisation point — every
+ * consumer (layout, validation, the composition request) reads
+ * speed through here, so a stale or out-of-range stored value can
+ * never break the timeline math.
+ */
+export function segmentSpeed(segment: { speed?: number }): number {
+  const s = segment.speed;
+  // Non-positive speeds are meaningless (0x = an infinitely long
+  // cut) — they fall back to 1x, not up to the 0.25 minimum.
+  if (typeof s !== 'number' || !Number.isFinite(s) || s <= 0) return 1;
+  return Math.min(MAX_SEGMENT_SPEED, Math.max(MIN_SEGMENT_SPEED, s));
+}
+
+/**
+ * Length of a segment ON THE TIMELINE, in frames — what the cut
+ * actually occupies. Slow segments stretch (source / 0.5 = 2× the
+ * frames), fast segments compress. Always ≥ 1.
+ */
+export function segmentTimelineDurationFrames(segment: EdlSegment): number {
+  return Math.max(1, Math.round(segment.durationFrames / segmentSpeed(segment)));
+}
+
+/**
+ * Source frame inside `segment` shown at timeline frame `frame`
+ * (which must lie inside the segment): the source advances `speed`
+ * frames per timeline frame, starting at `sourceStartFrame`. The
+ * segment's START still comes from the shared absolute mapping
+ * (`sourceFrameForTimelineFrame` at `timelineStartFrame`) — speed
+ * only changes how fast the source runs on from there.
+ */
+export function sourceFrameForSegmentFrame(segment: EdlSegment, timelineFrame: number): number {
+  return segment.sourceStartFrame + (timelineFrame - segment.timelineStartFrame) * segmentSpeed(segment);
 }
 
 export interface EdlAudio {
@@ -88,6 +139,11 @@ export function emptyEdl(fps: number = DEFAULT_FPS): Edl {
  * capture started late — then timeline frame F shows song position
  * regionStart + F/fps, which lives at take frame F − syncOffset·fps.
  * Callers pass the take's measured values; nobody else does this math.
+ *
+ * This mapping holds at SEGMENT STARTS (the shuffle bridge, the
+ * editor's re-anchor): a segment's first frame is its take's
+ * performance at that song position. INSIDE a segment the source
+ * advances at the segment's speed — see `sourceFrameForSegmentFrame`.
  */
 export function sourceFrameForTimelineFrame(
   timelineFrame: number,
@@ -132,9 +188,21 @@ export function takeSyncOffsetSeconds(
   );
 }
 
-/** Lay out segments back-to-back from frame 0, assigning timeline starts. */
+/**
+ * Lay out segments back-to-back from frame 0, assigning timeline
+ * starts. The cursor advances by each segment's TIMELINE length
+ * (`segmentTimelineDurationFrames`) — a slowed segment pushes the
+ * cuts after it later, a sped-up one pulls them earlier. `speed`
+ * rides along on the partials (undefined = 1x).
+ */
 export function layoutSegments(
-  partials: { id: string; takeId: string; sourceStartFrame: number; durationFrames: number }[],
+  partials: {
+    id: string;
+    takeId: string;
+    sourceStartFrame: number;
+    durationFrames: number;
+    speed?: number;
+  }[],
   base: Edl,
 ): Edl {
   let cursor = 0;
@@ -142,7 +210,7 @@ export function layoutSegments(
     .filter((p) => p.durationFrames > 0)
     .map((p) => {
       const segment: EdlSegment = { ...p, timelineStartFrame: cursor };
-      cursor += p.durationFrames;
+      cursor += segmentTimelineDurationFrames(segment);
       return segment;
     });
   return { ...base, segments, totalFrames: cursor };
@@ -165,7 +233,13 @@ export interface EdlValidation {
 export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
   const errors: string[] = [];
   const byId = new Map(assets.map((a) => [a.takeId, a.durationFrames]));
-  const kept: { id: string; takeId: string; sourceStartFrame: number; durationFrames: number }[] = [];
+  const kept: {
+    id: string;
+    takeId: string;
+    sourceStartFrame: number;
+    durationFrames: number;
+    speed?: number;
+  }[] = [];
 
   for (const segment of edl.segments) {
     const assetFrames = byId.get(segment.takeId);
@@ -185,7 +259,17 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
     if (start !== segment.sourceStartFrame || end - start !== segment.durationFrames) {
       errors.push(`Segment ${segment.id}: source range clamped to the take's real length.`);
     }
-    kept.push({ id: segment.id, takeId: segment.takeId, sourceStartFrame: start, durationFrames: end - start });
+    // Speed rides through validation untouched: it changes only the
+    // timeline length, never which source frames exist. The key is
+    // only set when present, so a 1x edit stays byte-identical
+    // through validation (the contract tests assert deepEqual).
+    kept.push({
+      id: segment.id,
+      takeId: segment.takeId,
+      sourceStartFrame: start,
+      durationFrames: end - start,
+      ...(segment.speed !== undefined ? { speed: segment.speed } : {}),
+    });
   }
 
   const laidOut = layoutSegments(kept, edl);
@@ -285,6 +369,11 @@ export function edlToCompositeRequest(
       uri,
       startSeconds: framesToSeconds(segment.sourceStartFrame, edl.fps),
       durationSeconds: framesToSeconds(segment.durationFrames, edl.fps),
+      // The native builder re-times this source range to
+      // durationSeconds / speed on the composition timeline — the
+      // SAME request feeds preview and export, so the speed is
+      // honoured identically in both. The master song is untouched.
+      speed: segmentSpeed(segment),
       muted: !options.includeTakeAudio,
       volume: 1,
     };
@@ -311,10 +400,14 @@ export function edlToCompositeRequest(
   };
 }
 
-/** The segment under a timeline frame, or null past the end. */
+/** The segment under a timeline frame, or null past the end. Spans
+ *  are TIMELINE spans — a slowed segment covers more frames. */
 export function segmentAtFrame(edl: Edl, frame: number): EdlSegment | null {
   for (const segment of edl.segments) {
-    if (frame >= segment.timelineStartFrame && frame < segment.timelineStartFrame + segment.durationFrames) {
+    if (
+      frame >= segment.timelineStartFrame &&
+      frame < segment.timelineStartFrame + segmentTimelineDurationFrames(segment)
+    ) {
       return segment;
     }
   }

@@ -189,6 +189,54 @@ export function buildEdlFromShuffle(input: BuildEdlFromShuffleInput): BuildEdlFr
 }
 
 /**
+ * SINGLE-TAKE PASSTHROUGH (Jaizon, 2026-11-12): a project with
+ * exactly one take can't shuffle — the engine needs 2+ takes — but
+ * the take IS the cut. One segment, the take's full duration laid
+ * end-to-end and clipped to the song region, with its source start
+ * from the SAME shared mapping the shuffle bridge uses
+ * (`sourceFrameForTimelineFrame` with `takeSyncOffsetSeconds`), so
+ * the editor, preview and export all see a valid, anchored EDL.
+ * A take with no usable duration yields an empty EDL.
+ */
+export interface BuildEdlFromSingleTakeInput {
+  take: ShuffleEdlTake;
+  /** Absolute track time (seconds) where the used region starts. */
+  regionStartSeconds: number;
+  /** Length of the used region, seconds — the cut never runs past it. */
+  regionLengthSeconds: number;
+  /** Master track URI for the EDL's audio (null = silent project). */
+  audioUri: string | null;
+  /** Project output canvas. Defaults to the EDL default (1080×1920). */
+  canvas?: { width: number; height: number };
+}
+
+export function buildEdlFromSingleTake(input: BuildEdlFromSingleTakeInput): Edl {
+  const { take, regionStartSeconds, regionLengthSeconds, audioUri, canvas } = input;
+  const fps = DEFAULT_FPS;
+  const regionFrames = Math.max(0, secondsToFrames(regionLengthSeconds, fps));
+  const base: Edl = {
+    ...emptyEdl(fps),
+    ...(canvas ? { canvas: { width: canvas.width, height: canvas.height } } : {}),
+    audio: { uri: audioUri, regionStartFrame: secondsToFrames(regionStartSeconds, fps), volume: 1 },
+  };
+  const takeFrames = secondsToFrames(take.durationSeconds ?? 0, fps);
+  const durationFrames = Math.min(takeFrames, regionFrames);
+  if (durationFrames <= 0) return base;
+  const offsetSeconds = takeSyncOffsetSeconds(take, regionStartSeconds, fps);
+  return layoutSegments(
+    [
+      {
+        id: 'seg-1',
+        takeId: take.id,
+        sourceStartFrame: Math.max(0, sourceFrameForTimelineFrame(0, offsetSeconds, fps)),
+        durationFrames,
+      },
+    ],
+    base,
+  );
+}
+
+/**
  * Novelty key for an EDL: its take ids in segment order, joined with
  * '|'. Compare keys (or feed `shuffleInfo.takeSequence` back as
  * `previousSequence`) to guarantee successive shuffles differ.

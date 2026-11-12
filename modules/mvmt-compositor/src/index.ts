@@ -23,6 +23,17 @@ export interface CompositeClipInput {
   startSeconds: number;
   /** How much of the clip to use, in seconds. */
   durationSeconds: number;
+  /**
+   * Playback rate of the clip's VIDEO (0.25–2, default 1): 0.5 plays
+   * the source at half speed (twice as long on the timeline), 2 at
+   * double speed. The native builder re-times the range with
+   * `scaleTimeRange`, so preview and export honour it identically.
+   * The master song is untouched — it always plays at 1x over the
+   * whole cut. When the clip's own audio is included it is retimed
+   * with the video, so A/V stay in sync (pitch follows the rate,
+   * as in any slow-mo/fast-mo).
+   */
+  speed?: number;
   /** When true, the clip's own audio is dropped entirely. */
   muted: boolean;
   /** Volume of the clip's own audio when not muted (0–1). */

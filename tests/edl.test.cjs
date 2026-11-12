@@ -7,14 +7,22 @@
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildEdlFromShuffle, validateAgainstAssets, sequenceKey } = require('./.build-edl/src/lib/shuffleEdl.js');
+const { buildEdlFromShuffle, buildEdlFromSingleTake, validateAgainstAssets, sequenceKey } = require('./.build-edl/src/lib/shuffleEdl.js');
 const { buildSections } = require('./.build-edl/src/lib/analysis.js');
 const {
   sourceFrameForTimelineFrame,
+  sourceFrameForSegmentFrame,
   takeSyncOffsetSeconds,
   secondsToFrames,
   framesToSeconds,
   canvasForTakes,
+  layoutSegments,
+  validateEdl,
+  emptyEdl,
+  segmentSpeed,
+  segmentTimelineDurationFrames,
+  segmentAtFrame,
+  edlToCompositeRequest,
   DEFAULT_FPS,
 } = require('./.build-edl/src/lib/edl.js');
 
@@ -53,9 +61,11 @@ function assertGapless(edl, expectedTotalFrames) {
   for (const segment of edl.segments) {
     assert.equal(segment.timelineStartFrame, cursor, `segment ${segment.id} must start where the previous ended`);
     assert.ok(segment.durationFrames > 0, `segment ${segment.id} must have positive duration`);
-    cursor += segment.durationFrames;
+    // The cursor advances by TIMELINE length — a slowed segment
+    // occupies more frames than its source (identical at 1x).
+    cursor += segmentTimelineDurationFrames(segment);
   }
-  assert.equal(edl.totalFrames, cursor, 'totalFrames must be the sum of segment durations');
+  assert.equal(edl.totalFrames, cursor, 'totalFrames must be the sum of segment timeline durations');
   if (expectedTotalFrames !== undefined) {
     assert.equal(edl.totalFrames, expectedTotalFrames);
   }
@@ -392,6 +402,196 @@ test('persistence: sync fields survive the project JSON round-trip', () => {
   assert.deepEqual(revived, take);
   // The revived take drives the shared offset identically.
   assert.equal(takeSyncOffsetSeconds(revived, 1, FPS), takeSyncOffsetSeconds(take, 1, FPS));
+});
+
+// ---------------------------------------------------------------------
+// Clip speed (Edit Modes Stage 1, 2026-11-12): per-segment playback
+// rate — video-only, the song stays 1x. Source ranges never change;
+// only the timeline length and the composition mapping stretch.
+// ---------------------------------------------------------------------
+
+test('speed: timeline duration is source / speed, laid out gapless', () => {
+  const laid = layoutSegments(
+    [
+      { id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 90, speed: 0.5 },
+      { id: 'seg-2', takeId: 'mid', sourceStartFrame: 0, durationFrames: 90, speed: 2 },
+      { id: 'seg-3', takeId: 'wild', sourceStartFrame: 0, durationFrames: 90 },
+    ],
+    emptyEdl(FPS),
+  );
+  // 90 source frames at 0.5x = 180 timeline frames; at 2x = 45; at 1x = 90.
+  assert.equal(segmentTimelineDurationFrames(laid.segments[0]), 180);
+  assert.equal(segmentTimelineDurationFrames(laid.segments[1]), 45);
+  assert.equal(segmentTimelineDurationFrames(laid.segments[2]), 90);
+  assert.deepEqual(
+    laid.segments.map((s) => s.timelineStartFrame),
+    [0, 180, 225],
+  );
+  assert.equal(laid.totalFrames, 315);
+  assertGapless(laid, 315);
+  assert.equal(segmentAtFrame(laid, 179)?.id, 'seg-1');
+  assert.equal(segmentAtFrame(laid, 180)?.id, 'seg-2');
+  assert.equal(segmentAtFrame(laid, 224)?.id, 'seg-2');
+  assert.equal(segmentAtFrame(laid, 225)?.id, 'seg-3');
+  assert.equal(segmentAtFrame(laid, 315), null);
+});
+
+test('speed: sanitisation — missing, invalid and out-of-range speeds read as 1x-bounded', () => {
+  assert.equal(segmentSpeed({}), 1);
+  assert.equal(segmentSpeed({ speed: undefined }), 1);
+  assert.equal(segmentSpeed({ speed: 0 }), 1);
+  assert.equal(segmentSpeed({ speed: -1 }), 1);
+  assert.equal(segmentSpeed({ speed: NaN }), 1);
+  assert.equal(segmentSpeed({ speed: 0.1 }), 0.25);
+  assert.equal(segmentSpeed({ speed: 5 }), 2);
+  assert.equal(segmentSpeed({ speed: 0.5 }), 0.5);
+  assert.equal(segmentSpeed({ speed: 2 }), 2);
+});
+
+test('speed: source mapping inside a segment advances at the segment speed', () => {
+  const seg = {
+    id: 'seg-1',
+    takeId: 'calm',
+    timelineStartFrame: 100,
+    sourceStartFrame: 50,
+    durationFrames: 60,
+    speed: 0.5,
+  };
+  assert.equal(sourceFrameForSegmentFrame(seg, 100), 50);
+  assert.equal(sourceFrameForSegmentFrame(seg, 120), 60); // 20 timeline frames × 0.5
+  assert.equal(sourceFrameForSegmentFrame({ ...seg, speed: 2 }, 110), 70);
+  assert.equal(sourceFrameForSegmentFrame({ ...seg, speed: undefined }, 110), 60);
+});
+
+test('speed: validation clamps source ranges and keeps the speed', () => {
+  const raw = layoutSegments(
+    [
+      { id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 90, speed: 0.5 },
+      { id: 'seg-2', takeId: 'mid', sourceStartFrame: 400, durationFrames: 90, speed: 2 },
+    ],
+    emptyEdl(FPS),
+  );
+  // 'mid' only has 450 frames of footage: its range [400, 490)
+  // clamps to [400, 450) — and both speeds survive the clamp.
+  const validated = validateEdl(raw, [
+    { takeId: 'calm', durationFrames: 450 },
+    { takeId: 'mid', durationFrames: 450 },
+  ]);
+  assert.equal(validated.ok, false);
+  assert.equal(validated.edl.segments[0].speed, 0.5);
+  assert.equal(validated.edl.segments[1].speed, 2);
+  assert.equal(validated.edl.segments[1].durationFrames, 50);
+  // Timeline: 90/0.5 = 180, then 50/2 = 25 → gapless at 0, 180, total 205.
+  assert.deepEqual(
+    validated.edl.segments.map((s) => s.timelineStartFrame),
+    [0, 180],
+  );
+  assert.equal(validated.edl.totalFrames, 205);
+  assertGapless(validated.edl, 205);
+});
+
+test('speed: export request carries the rate; source range and song are untouched', () => {
+  const raw = layoutSegments(
+    [
+      { id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 90, speed: 0.5 },
+      { id: 'seg-2', takeId: 'mid', sourceStartFrame: 90, durationFrames: 90, speed: 2 },
+    ],
+    { ...emptyEdl(FPS), audio: { uri: 'file:///track.mp3', regionStartFrame: 0, volume: 1 } },
+  );
+  const request = edlToCompositeRequest(raw, (id) => `file:///${id}.mp4`);
+  assert.equal(request.clips[0].speed, 0.5);
+  assert.equal(request.clips[1].speed, 2);
+  // Source ranges are the un-retimed source: 3s each starting at 0s / 3s.
+  assert.equal(request.clips[0].startSeconds, 0);
+  assert.equal(request.clips[0].durationSeconds, 3);
+  assert.equal(request.clips[1].startSeconds, 3);
+  assert.equal(request.clips[1].durationSeconds, 3);
+  // The song rides 1x over the whole (now longer) cut: 6s of source
+  // at 0.5x + 1.5s at 2x = 7.5s of timeline.
+  assert.equal(request.audioUri, 'file:///track.mp3');
+  assert.equal(request.audioStartSeconds, 0);
+  assert.equal(raw.totalFrames, 225); // 180 + 45
+});
+
+test('speed: survives the project JSON round-trip', () => {
+  const seg = {
+    id: 'seg-1',
+    takeId: 'calm',
+    timelineStartFrame: 0,
+    sourceStartFrame: 0,
+    durationFrames: 90,
+    speed: 0.5,
+  };
+  const revived = JSON.parse(JSON.stringify(seg));
+  assert.equal(segmentSpeed(revived), 0.5);
+  assert.equal(segmentTimelineDurationFrames(revived), 180);
+});
+
+// ---------------------------------------------------------------------
+// Single-take passthrough (2026-11-12): one take can't shuffle, but
+// it IS the cut — one segment over the region.
+// ---------------------------------------------------------------------
+
+test('single take: one take over the region builds a valid one-segment cut', () => {
+  const take = makeTakes(0)[0]; // 'calm', 15s, window at region start
+  const edl = buildEdlFromSingleTake({
+    take,
+    regionStartSeconds: 0,
+    regionLengthSeconds: REGION_SECONDS,
+    audioUri: 'file:///track.mp3',
+  });
+  assert.equal(edl.segments.length, 1);
+  assert.equal(edl.segments[0].takeId, 'calm');
+  assert.equal(edl.segments[0].timelineStartFrame, 0);
+  assert.equal(edl.segments[0].sourceStartFrame, 0);
+  assert.equal(edl.segments[0].durationFrames, REGION_FRAMES);
+  assert.equal(edl.totalFrames, REGION_FRAMES);
+  assert.equal(edl.audio.uri, 'file:///track.mp3');
+  assert.equal(edl.audio.regionStartFrame, 0);
+  // It validates clean against the take's real duration.
+  assert.equal(validateAgainstAssets(edl, makeTakes(0), FPS).ok, true);
+});
+
+test('single take: clips to the region when the take is longer; clips to the take when it is shorter', () => {
+  const long = buildEdlFromSingleTake({
+    take: { ...makeTakes(0)[0], durationSeconds: 60 },
+    regionStartSeconds: 0,
+    regionLengthSeconds: REGION_SECONDS,
+    audioUri: null,
+  });
+  assert.equal(long.segments[0].durationFrames, REGION_FRAMES);
+
+  const short = buildEdlFromSingleTake({
+    take: { ...makeTakes(0)[0], durationSeconds: 10 },
+    regionStartSeconds: 0,
+    regionLengthSeconds: REGION_SECONDS,
+    audioUri: null,
+  });
+  assert.equal(short.segments[0].durationFrames, 10 * FPS);
+  assert.equal(short.totalFrames, 10 * FPS);
+
+  // No usable duration = no cut (the editor's handler reports it).
+  const empty = buildEdlFromSingleTake({
+    take: { id: 'x', trackOffsetSeconds: 0 },
+    regionStartSeconds: 0,
+    regionLengthSeconds: REGION_SECONDS,
+    audioUri: null,
+  });
+  assert.deepEqual(empty.segments, []);
+});
+
+test('single take: source start follows the shared sync mapping', () => {
+  // Take recorded from track time 0, region starts at 5s, capture
+  // ran 0.5s late: the region's first frame is 4.5s into the take.
+  const edl = buildEdlFromSingleTake({
+    take: { ...makeTakes(0)[0], trackOffsetSeconds: 0, durationSeconds: 20, syncOffsetSeconds: 0.5 },
+    regionStartSeconds: 5,
+    regionLengthSeconds: REGION_SECONDS,
+    audioUri: 'file:///track.mp3',
+  });
+  assert.equal(edl.segments[0].sourceStartFrame, 135);
+  assert.equal(edl.segments[0].durationFrames, REGION_FRAMES);
+  assert.equal(edl.audio.regionStartFrame, 5 * FPS);
 });
 
 test('canvas: follows the largest RECORDED take; imports never vote', () => {

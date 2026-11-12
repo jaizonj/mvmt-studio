@@ -42,6 +42,8 @@ import {
   framesToSeconds,
   layoutSegments,
   secondsToFrames,
+  segmentSpeed,
+  segmentTimelineDurationFrames,
   sourceFrameForTimelineFrame,
   takeSyncOffsetSeconds,
   validateEdl,
@@ -52,7 +54,7 @@ import {
 import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
-import { buildEdlFromShuffle, validateAgainstAssets } from '../../lib/shuffleEdl';
+import { buildEdlFromShuffle, buildEdlFromSingleTake, validateAgainstAssets } from '../../lib/shuffleEdl';
 import { useStudio } from '../../store/StudioContext';
 import type { ShuffleFrequency, Take } from '../../types';
 import { colors, formatTime, radius, spacing, type as typeScale } from '../../theme';
@@ -102,9 +104,22 @@ function randomSeed(): number {
   return (Math.random() * 0xffffffff) >>> 0;
 }
 
-/** The layoutSegments input shape for one existing segment. */
-function partialOf(s: EdlSegment): { id: string; takeId: string; sourceStartFrame: number; durationFrames: number } {
-  return { id: s.id, takeId: s.takeId, sourceStartFrame: s.sourceStartFrame, durationFrames: s.durationFrames };
+/** The layoutSegments input shape for one existing segment. Speed
+ *  rides along (undefined = 1x) so re-layouts never drop it. */
+function partialOf(s: EdlSegment): {
+  id: string;
+  takeId: string;
+  sourceStartFrame: number;
+  durationFrames: number;
+  speed?: number;
+} {
+  return {
+    id: s.id,
+    takeId: s.takeId,
+    sourceStartFrame: s.sourceStartFrame,
+    durationFrames: s.durationFrames,
+    ...(s.speed !== undefined ? { speed: s.speed } : {}),
+  };
 }
 
 /**
@@ -374,6 +389,40 @@ function EditorWorkspace() {
     setSweepKey((k) => k + 1);
   };
 
+  // ---- Single-take passthrough --------------------------------------
+  // A project with exactly one take can't shuffle — but the take IS
+  // the cut (Jaizon, 2026-11-12, performance-type videos). One
+  // segment, the take's full duration over the region, built with the
+  // same sync mapping as the shuffle bridge, committed through the
+  // normal path so the editor, preview and export all see a valid
+  // EDL. Reshuffle stays disabled (canShuffle is still 2+ takes).
+  const handleSingleTakePassthrough = () => {
+    const take = takes[0];
+    if (!take) return;
+    const regionLengthSeconds =
+      effectiveRegion(studio.trackRegion, track?.durationSeconds)?.lengthSeconds ??
+      take.durationSeconds ??
+      0;
+    const built = buildEdlFromSingleTake({
+      take,
+      regionStartSeconds,
+      regionLengthSeconds,
+      audioUri: track?.uri ?? null,
+      // The cut renders at the take's own size (4K take → 4K cut).
+      ...(canvasForTakes(takes) ? { canvas: canvasForTakes(takes)! } : {}),
+    });
+    if (built.segments.length === 0) {
+      setShuffleNote("That didn't cut — check the song is loaded, then try again.");
+      return;
+    }
+    commitEdl(built);
+    setSelectedSegmentId(null);
+    setShuffleNote(null);
+    setPositionSeconds(0);
+    setPaused(false); // the cut auto-plays from the top
+    setSweepKey((k) => k + 1);
+  };
+
   // ---- Open on a shuffled cut --------------------------------------
   // The shuffle landing must always open on a finished cut (Jaizon,
   // 2026-11-09): when the project has no edit yet, the first shuffle
@@ -383,8 +432,10 @@ function EditorWorkspace() {
   // trigger a surprise re-shuffle, so the guard is consumed either way.
   const autoShuffledRef = useRef(false);
   const handleShuffleRef = useRef(handleShuffle);
+  const handleSingleTakeRef = useRef(handleSingleTakePassthrough);
   useEffect(() => {
     handleShuffleRef.current = handleShuffle;
+    handleSingleTakeRef.current = handleSingleTakePassthrough;
   });
   useEffect(() => {
     if (autoShuffledRef.current) return;
@@ -393,6 +444,16 @@ function EditorWorkspace() {
       return;
     }
     if (takes.length === 0) return; // takes haven't landed yet — wait
+    if (takes.length === 1) {
+      // Single-take passthrough: one performance video can't
+      // shuffle, but it IS the cut — lay it end-to-end over the
+      // region instead of opening on an empty landing.
+      const frame = requestAnimationFrame(() => {
+        autoShuffledRef.current = true;
+        handleSingleTakeRef.current();
+      });
+      return () => cancelAnimationFrame(frame);
+    }
     if (!canShuffle) {
       autoShuffledRef.current = true;
       return;
@@ -447,6 +508,21 @@ function EditorWorkspace() {
     );
   };
 
+  // ---- Clip speed (Edit Modes Stage 1) ------------------------------
+  /** Speed chips for the selected cut — one tap, through the normal
+   *  commit path (undoable, re-laid-out, re-anchored, validated).
+   *  The song never changes: speed is video-only. */
+  const SPEED_OPTIONS = [0.25, 0.5, 1, 1.5, 2] as const;
+  const handleSetSpeed = (segment: EdlSegment, speed: number) => {
+    if (!edl || segmentSpeed(segment) === speed) return;
+    commitEdl({
+      ...edl,
+      segments: edl.segments.map((s) =>
+        s.id === segment.id ? { ...s, speed: speed === 1 ? undefined : speed } : s,
+      ),
+    });
+  };
+
   /** Would switching `segment` to `take` start past the take's end? */
   const switchWouldEmpty = (segment: EdlSegment, take: Take): boolean => {
     if (!edl) return false;
@@ -482,10 +558,18 @@ function EditorWorkspace() {
     const index = edl.segments.findIndex((s) => s.id === event.clipId);
     if (index === -1) return;
     const segment = edl.segments[index];
+    const speed = segmentSpeed(segment);
+    // The drag distance is in TIMELINE frames; a segment's source
+    // advances `speed` source frames per timeline frame, so each
+    // side's source-duration change is the drag × that segment's
+    // speed (a slowed cut trims more source per pixel dragged).
     const deltaFrames = Math.round(event.deltaSeconds * edl.fps);
     const partials = edl.segments.map(partialOf);
     if (event.edge === 'end') {
-      const durationFrames = Math.max(MIN_CUT_FRAMES, segment.durationFrames + deltaFrames);
+      const durationFrames = Math.max(
+        MIN_CUT_FRAMES,
+        segment.durationFrames + Math.round(deltaFrames * speed),
+      );
       if (durationFrames === segment.durationFrames) {
         setDraftEdl(null);
         return;
@@ -497,16 +581,26 @@ function EditorWorkspace() {
         setDraftEdl(null);
         return;
       }
+      const prevSpeed = segmentSpeed(prev);
+      // `applied` is timeline frames: the boundary follows the
+      // finger. The ceil/floor keep each side's source duration at
+      // or above the UI floor after the ×speed conversion.
       const applied = Math.max(
-        -(prev.durationFrames - MIN_CUT_FRAMES),
-        Math.min(deltaFrames, segment.durationFrames - MIN_CUT_FRAMES),
+        Math.ceil((MIN_CUT_FRAMES - prev.durationFrames) / prevSpeed),
+        Math.min(deltaFrames, Math.floor((segment.durationFrames - MIN_CUT_FRAMES) / speed)),
       );
       if (applied === 0) {
         setDraftEdl(null);
         return;
       }
-      partials[index - 1] = { ...partials[index - 1], durationFrames: prev.durationFrames + applied };
-      partials[index] = { ...partials[index], durationFrames: segment.durationFrames - applied };
+      partials[index - 1] = {
+        ...partials[index - 1],
+        durationFrames: prev.durationFrames + Math.round(applied * prevSpeed),
+      };
+      partials[index] = {
+        ...partials[index],
+        durationFrames: segment.durationFrames - Math.round(applied * speed),
+      };
     }
     const laid = layoutSegments(partials, edl);
     setDraftEdl({ ...laid, segments: reanchorSegments(laid.segments, laid.fps) });
@@ -633,7 +727,10 @@ function EditorWorkspace() {
             return {
               id: seg.id,
               label: `Take ${takeIndexById.get(seg.takeId) ?? ''}`,
-              lengthSeconds: framesToSeconds(seg.durationFrames, displayEdl.fps),
+              // TIMELINE length — a slowed cut is wider on the strip
+              // (the strip maps filmstrip frames through `speed`).
+              lengthSeconds: framesToSeconds(segmentTimelineDurationFrames(seg), displayEdl.fps),
+              speed: segmentSpeed(seg),
               sourceUri: take?.uri,
               sourceStartSeconds: framesToSeconds(seg.sourceStartFrame, displayEdl.fps),
             };
@@ -818,7 +915,7 @@ function EditorWorkspace() {
                 </View>
                 {!canShuffle ? (
                   <Text style={styles.caption}>
-                    Shuffle needs at least 2 takes — record one more to mix between takes.
+                    Your single take is the cut — record one more take to shuffle between takes.
                   </Text>
                 ) : shuffleNote ? (
                   <Text style={styles.caption}>{shuffleNote}</Text>
@@ -983,13 +1080,18 @@ function EditorWorkspace() {
               <View style={styles.panel}>
                 <Text style={styles.cutTitle}>
                   Cut {selectedIndex + 1} · Take {takeIndexById.get(selected.takeId) ?? ''}
+                  {segmentSpeed(selected) !== 1 ? ` · ${segmentSpeed(selected)}×` : ''}
                 </Text>
                 <Text style={styles.caption}>
                   {formatTime(framesToSeconds(selected.timelineStartFrame, edl.fps))} –{' '}
                   {formatTime(
-                    framesToSeconds(selected.timelineStartFrame + selected.durationFrames, edl.fps),
+                    framesToSeconds(
+                      selected.timelineStartFrame + segmentTimelineDurationFrames(selected),
+                      edl.fps,
+                    ),
                   )}{' '}
-                  on the timeline · {formatTime(framesToSeconds(selected.durationFrames, edl.fps))} long
+                  on the timeline ·{' '}
+                  {formatTime(framesToSeconds(segmentTimelineDurationFrames(selected), edl.fps))} long
                 </Text>
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
                   <View style={styles.chipRow}>
@@ -1026,6 +1128,38 @@ function EditorWorkspace() {
                     })}
                   </View>
                 </ScrollView>
+                <Text style={styles.panelLabel}>Speed</Text>
+                <View style={styles.speedRow}>
+                  {SPEED_OPTIONS.map((speed) => {
+                    const active = segmentSpeed(selected) === speed;
+                    return (
+                      <Pressable
+                        key={speed}
+                        onPress={() => handleSetSpeed(selected, speed)}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected: active }}
+                        accessibilityLabel={
+                          speed === 1
+                            ? 'Normal speed'
+                            : speed < 1
+                              ? `Slow motion, ${speed} times speed`
+                              : `Fast, ${speed} times speed`
+                        }
+                        style={[styles.speedChip, active && styles.speedChipActive]}>
+                        <Text style={[styles.speedChipText, active && styles.speedChipTextActive]}>
+                          {speed === 1 ? '1×' : `${speed}×`}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                <Text style={styles.caption}>
+                  {segmentSpeed(selected) === 1
+                    ? 'The song never changes speed — only this cut’s video does.'
+                    : segmentSpeed(selected) < 1
+                      ? 'Slow motion — this cut stretches on the timeline, the song plays on.'
+                      : 'Fast — this cut compresses on the timeline, the song plays on.'}
+                </Text>
                 <Text style={styles.caption}>Drag the ends of a cut to trim it.</Text>
               </View>
             </View>
@@ -1047,7 +1181,7 @@ function EditorWorkspace() {
               </Pressable>
               {!canShuffle ? (
                 <Text style={styles.caption}>
-                  Shuffle needs at least 2 takes — record one more to mix between takes.
+                  Your single take is the cut — record one more take to shuffle between takes.
                 </Text>
               ) : shuffleNote ? (
                 <Text style={styles.caption}>{shuffleNote}</Text>
@@ -1279,6 +1413,19 @@ const styles = StyleSheet.create({
   takeChipThumb: { width: 40, height: 40, borderRadius: radius.sm },
   takeChipThumbPlaceholder: { backgroundColor: colors.elevated },
   takeChipText: { color: colors.label, fontSize: 14, fontWeight: '600' },
+  speedRow: { flexDirection: 'row', gap: spacing.sm },
+  speedChip: {
+    flex: 1,
+    alignItems: 'center',
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.separator,
+    borderRadius: radius.pill,
+    paddingVertical: 9,
+  },
+  speedChipActive: { borderColor: colors.accent, borderWidth: 2, backgroundColor: colors.accentDim },
+  speedChipText: { color: colors.label, fontSize: 15, fontWeight: '600', fontVariant: ['tabular-nums'] },
+  speedChipTextActive: { color: colors.accent },
   emptyCard: {
     alignItems: 'center',
     gap: spacing.sm,

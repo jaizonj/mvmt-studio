@@ -25,8 +25,14 @@ export interface TimelineStripClip {
   id: string;
   /** Display label, e.g. "Take 2". */
   label: string;
-  /** Played length of this clip in the cut, seconds. */
+  /** Played length of this clip in the cut, seconds — the TIMELINE
+   *  length. A slowed clip is wider here (it occupies more of the
+   *  cut); its source length is `lengthSeconds × speed`. */
   lengthSeconds: number;
+  /** Playback rate of the clip's video (0.25–2, default 1). Used
+   *  only to map filmstrip frames into source time and to show the
+   *  speed badge; the width above already carries the timeline. */
+  speed?: number;
   /** Source video for filmstrip thumbnails. */
   sourceUri?: string;
   /** Where this clip starts inside its source video, seconds. */
@@ -278,7 +284,9 @@ export function TimelineStrip({
   // length out evenly — frame i covers an equal slice of the cut's
   // duration and is sampled at the CENTRE of that slice, mapped into
   // the take's source time. The frame COUNT targets ~76pt per frame,
-  // so longer cuts simply get more (or wider) frames.
+  // so longer cuts simply get more (or wider) frames. A slowed clip
+  // is WIDER on the timeline but covers LESS source time per tile:
+  // the source span is the timeline length × speed.
   const samples = useMemo(() => {
     const perClip = new Map<string, number[]>();
     for (const clip of clips) {
@@ -286,7 +294,8 @@ export function TimelineStrip({
       const width = Math.max(18, clip.lengthSeconds * pxPerSecond);
       const tiles = Math.max(1, Math.round(width / TARGET_FRAME_WIDTH));
       const start = clip.sourceStartSeconds ?? 0;
-      const tileSeconds = clip.lengthSeconds / tiles;
+      const sourceSeconds = clip.lengthSeconds * (clip.speed ?? 1);
+      const tileSeconds = sourceSeconds / tiles;
       const times: number[] = [];
       for (let i = 0; i < tiles; i++) {
         times.push(Math.round((start + (i + 0.5) * tileSeconds) * 20) / 20);
@@ -433,7 +442,7 @@ export function TimelineStrip({
                       onPress={() => onSelectClip?.(clip.id)}
                       accessibilityRole="button"
                       accessibilityState={{ selected }}
-                      accessibilityLabel={`${clip.label}, cut ${i + 1} of ${clips.length}, ${formatTime(clip.lengthSeconds)}. Tap to select this cut.`}>
+                      accessibilityLabel={`${clip.label}, cut ${i + 1} of ${clips.length}, ${formatTime(clip.lengthSeconds)}${clip.speed && clip.speed !== 1 ? `, ${clip.speed} times speed` : ''}. Tap to select this cut.`}>
                       <View style={styles.filmstrip}>
                         {times.length > 0
                           ? times.map((t, ti) => {
@@ -458,6 +467,13 @@ export function TimelineStrip({
                           {clip.label}
                         </Text>
                       </View>
+                      {clip.speed !== undefined && clip.speed !== 1 ? (
+                        <View style={styles.speedBadge}>
+                          <Text style={styles.speedBadgeText} numberOfLines={1}>
+                            {clip.speed}×
+                          </Text>
+                        </View>
+                      ) : null}
                     </Pressable>
                     {selected && onTrimDrag ? (
                       <>
@@ -585,6 +601,16 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   labelChipText: { color: colors.label, fontSize: 9, fontWeight: '700' },
+  speedBadge: {
+    position: 'absolute',
+    top: 3,
+    right: 3,
+    backgroundColor: colors.accent,
+    borderRadius: 4,
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+  },
+  speedBadgeText: { color: colors.onAccent, fontSize: 9, fontWeight: '800', fontVariant: ['tabular-nums'] },
   playhead: {
     position: 'absolute',
     top: 0,

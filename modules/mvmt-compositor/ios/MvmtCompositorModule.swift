@@ -20,6 +20,13 @@ struct CompositeClipRecord: Record {
   @Field
   var durationSeconds: Double
 
+  /// Playback rate of the clip's VIDEO (0.25–2, default 1): 0.5 plays
+  /// the source at half speed (twice as long on the timeline), 2 at
+  /// double speed. The builder re-times the range with
+  /// `scaleTimeRange`; the master song is untouched (always 1x).
+  @Field
+  var speed: Double = 1.0
+
   @Field
   var muted: Bool = false
 
@@ -733,6 +740,26 @@ private func insertTimeRangeGuarded(
   }
 }
 
+/// Guarded `AVMutableCompositionTrack.scaleTimeRange`: the call
+/// itself doesn't throw, but an invalid range raises an NSException
+/// — it becomes an ordinary thrown error here, like
+/// insertTimeRangeGuarded. Used for per-clip speed (Edit Modes
+/// Stage 1): re-timing a segment's range on the composition
+/// timeline.
+private func scaleTimeRangeGuarded(
+  _ track: AVMutableCompositionTrack,
+  _ range: CMTimeRange,
+  toDuration duration: CMTime,
+  _ what: String
+) throws {
+  let exception = avTry {
+    track.scaleTimeRange(range, toDuration: duration)
+  }
+  if let exception {
+    throw exceptionError(what, exception)
+  }
+}
+
 // MARK: - Shared composition builder output
 
 private struct BuiltComposition {
@@ -998,10 +1025,32 @@ private enum MvmtCompositorEngine {
         duration: CMTime(seconds: clampedDuration, preferredTimescale: timescale)
       )
 
+      // Clip speed (Edit Modes Stage 1): the source range is
+      // unchanged — it is re-timed on the composition timeline, so
+      // the segment occupies duration/speed in the cut (0.5x = twice
+      // as long, 2x = half as long). Sanitised here (finite, clamped
+      // to 0.25–2) so a stale or out-of-range request can never
+      // produce a zero or negative segment. The master song is
+      // inserted later at 1x and is untouched by this.
+      let speed: Double = {
+        let s = clip.speed
+        return s.isFinite && s > 0 ? min(max(s, 0.25), 2.0) : 1.0
+      }()
+      let scaledDuration = CMTime(seconds: clampedDuration / speed, preferredTimescale: timescale)
+
       try insertTimeRangeGuarded(
         into: compositionVideoTrack, range, of: sourceVideoTrack, at: cursor,
         "Clip \(index + 1)'s video could not be added to the composition"
       )
+
+      if abs(speed - 1.0) > 0.001 {
+        try scaleTimeRangeGuarded(
+          compositionVideoTrack,
+          CMTimeRange(start: cursor, duration: range.duration),
+          toDuration: scaledDuration,
+          "Clip \(index + 1)'s video could not be retimed"
+        )
+      }
 
       // Normalise this segment into the project canvas: apply the
       // source's preferredTransform, take its display size, then scale
@@ -1024,11 +1073,17 @@ private enum MvmtCompositorEngine {
       let centreX = (canvasSize.width - displaySize.width * fillScale) / 2
       let centreY = (canvasSize.height - displaySize.height * fillScale) / 2
       transform = transform.concatenating(CGAffineTransform(translationX: centreX, y: centreY))
-      segmentRanges.append(CMTimeRange(start: cursor, duration: range.duration))
+      // The video composition instruction covers the RETIMED range:
+      // the segment's span on the composition timeline is the scaled
+      // duration, not the source duration.
+      segmentRanges.append(CMTimeRange(start: cursor, duration: scaledDuration))
       segmentTransforms.append(transform)
 
       // Clip's own audio, only when wanted (the app mutes takes by
-      // default — song-only is the product default).
+      // default — song-only is the product default). When the clip
+      // is retimed, its audio is retimed by the same factor so A/V
+      // stay in sync (pitch follows the rate, as in any slow-mo /
+      // fast-mo); muted clips never reach here.
       if !clip.muted, clip.volume > 0 {
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         if let sourceAudioTrack = audioTracks.first {
@@ -1037,6 +1092,14 @@ private enum MvmtCompositorEngine {
             into: targetTrack, range, of: sourceAudioTrack, at: cursor,
             "Clip \(index + 1)'s audio could not be added to the composition"
           )
+          if abs(speed - 1.0) > 0.001 {
+            try scaleTimeRangeGuarded(
+              targetTrack,
+              CMTimeRange(start: cursor, duration: range.duration),
+              toDuration: scaledDuration,
+              "Clip \(index + 1)'s audio could not be retimed"
+            )
+          }
           if clipAudioMixParameters == nil {
             clipAudioMixParameters = AVMutableAudioMixInputParameters(track: targetTrack)
           }
@@ -1046,7 +1109,7 @@ private enum MvmtCompositorEngine {
         }
       }
 
-      cursor = CMTimeAdd(cursor, range.duration)
+      cursor = CMTimeAdd(cursor, scaledDuration)
     }
 
     let totalDuration = cursor
