@@ -1727,11 +1727,46 @@ private enum MvmtCompositorEngine {
     min(max(value, lower), upper)
   }
 
-  /// Parses "#RRGGBB" / "#RRGGBBAA" (the '#' is optional). Nil when
-  /// unparseable — callers substitute their own default.
+  /// The JS overlay's easing (src/lib/lyricAnimations.ts header):
+  /// easeOutCubic / easeInCubic. The sampled line animation below
+  /// reproduces them exactly; the per-word CABasicAnimations still
+  /// use CAMediaTimingFunction easeOut, which is the same family
+  /// (known tolerance, docs/STYLES-PARITY.md).
+  private static func lyricEaseOutCubic(_ x: Double) -> Double {
+    1 - pow(1 - lyricClamp(x, 0, 1), 3)
+  }
+
+  private static func lyricEaseInCubic(_ x: Double) -> Double {
+    let c = lyricClamp(x, 0, 1)
+    return c * c * c
+  }
+
+  /// Parses "#RRGGBB" / "#RRGGBBAA" (the '#' is optional) and
+  /// CSS "rgb(r,g,b)" / "rgba(r,g,b,a)". Nil when unparseable —
+  /// callers substitute their own default. The rgba form matters:
+  /// template pill backgrounds are authored as rgba() (Neon Sign,
+  /// Retro TV, Spotlight, Storybook) and the old hex-only parse
+  /// silently fell back to black — Spotlight's warm-white pill
+  /// rendered black in export (Stage 4 parity audit).
   private static func lyricColor(_ hex: String?) -> UIColor? {
     guard var text = hex?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
       return nil
+    }
+    let lower = text.lowercased()
+    if lower.hasPrefix("rgba(") || lower.hasPrefix("rgb(") {
+      guard let close = text.firstIndex(of: ")") else { return nil }
+      let inner = text[text.index(after: text.firstIndex(of: "(")!)..<close]
+      let parts = inner.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+      guard parts.count == 3 || parts.count == 4,
+        let r = Double(parts[0]), let g = Double(parts[1]), let b = Double(parts[2])
+      else { return nil }
+      let a = parts.count == 4 ? (Double(parts[3]) ?? 1) : 1
+      return UIColor(
+        red: CGFloat(lyricClamp(r / 255, 0, 1)),
+        green: CGFloat(lyricClamp(g / 255, 0, 1)),
+        blue: CGFloat(lyricClamp(b / 255, 0, 1)),
+        alpha: CGFloat(lyricClamp(a, 0, 1))
+      )
     }
     if text.hasPrefix("#") {
       text.removeFirst()
@@ -1910,17 +1945,25 @@ private enum MvmtCompositorEngine {
   }
 
   /// The enter "from" transform shared by the line and word
-  /// appliers: x/y offsets (fractions × line width/height, CALayer
-  /// y-up), then rotation, then scale.
+  /// appliers: x/y offsets (fractions × line width/height), then
+  /// rotation, then scale. Sign flip (Stage 4 parity audit): the
+  /// layer space is y-up, so a positive Y translation moves the
+  /// layer UP on screen and a positive rotation is
+  /// counter-clockwise — the JS overlay (y-down) reads both the
+  /// other way. The catalog spec says fromYOffsetFrac + = starts
+  /// LOWER ("Rise" uses +0.8) and fromRotateDeg + = clockwise, so
+  /// both are negated here. Before this fix every preset with a
+  /// vertical offset or rotation ran mirrored in export (Rise fell
+  /// instead of rising; Flip tilted the wrong way).
   private static func lyricFromTransform(
     _ animation: LyricAnimationRecord,
     lineHeight: CGFloat,
     lineWidth: CGFloat
   ) -> CATransform3D {
     let scale = CGFloat(lyricClamp(lyricFinite(animation.fromScale, 1), 0.05, 20))
-    let yOffset = CGFloat(lyricFinite(animation.fromYOffsetFrac, 0)) * lineHeight
+    let yOffset = -CGFloat(lyricFinite(animation.fromYOffsetFrac, 0)) * lineHeight
     let xOffset = CGFloat(lyricFinite(animation.fromXOffsetFrac, 0)) * lineWidth
-    let rotation = CGFloat(lyricFinite(animation.fromRotateDeg, 0)) * .pi / 180
+    let rotation = -CGFloat(lyricFinite(animation.fromRotateDeg, 0)) * .pi / 180
     return CATransform3DConcat(
       CATransform3DMakeTranslation(xOffset, yOffset, 0),
       CATransform3DConcat(
@@ -1928,22 +1971,6 @@ private enum MvmtCompositorEngine {
         CATransform3DMakeScale(scale, scale, 1)
       )
     )
-  }
-
-  /// Per-segment timing for the line keyframes: easeOut for the
-  /// first (enter) segment, easeIn for the last (exit), easeInOut
-  /// between.
-  private static func lyricTimingFunctions(count: Int) -> [CAMediaTimingFunction] {
-    guard count >= 2 else { return [] }
-    return (0..<(count - 1)).map { index in
-      if index == 0 {
-        return CAMediaTimingFunction(name: .easeOut)
-      }
-      if index == count - 2 {
-        return CAMediaTimingFunction(name: .easeIn)
-      }
-      return CAMediaTimingFunction(name: .easeInEaseOut)
-    }
   }
 
   /// The visibility window: discrete opacity over the WHOLE
@@ -1977,17 +2004,33 @@ private enum MvmtCompositorEngine {
   }
 
   /// Enter / exit / emphasis keyframes for one line, on its inner
-  /// layer. Enter: opacity fromOpacity→1, y-offset→0, scale→1,
-  /// rotation→0 over enterSecs (easeOut). Exit mirrors it over the
-  /// last exitSecs (easeIn), ending exactly at the line's end.
-  /// Emphasis (emphasisScale > 1) pulses the scale mid-line. When
-  /// applyEnter is false (the per-word modes animate their own
-  /// entrances) the line starts at its resting state and only the
-  /// exit + emphasis are applied.
+  /// layer — SAMPLED from the JS overlay's envelope formulas
+  /// (src/lib/lyricAnimations.ts header), so preview == export
+  /// instead of "same family, different curve":
+  ///   enterP = enterSecs <= 0 ? 1 : easeOutCubic(tIn / enterSecs)
+  ///   exitP  = exitSecs  <= 0 ? 1 : easeInCubic(tOut / exitSecs)
+  ///   e = min(enterP, exitP)
+  ///   opacity = lerp(fromOpacity, 1, e)
+  ///   scale   = lerp(fromScale, 1, e) (× the pulse, below)
+  ///   offsetX = fromXOffsetFrac × (1 − e) × lineWidth
+  ///   offsetY = fromYOffsetFrac × (1 − e) × lineHeight
+  ///   rotate  = fromRotateDeg × (1 − e)
+  /// The emphasis pulse (emphasisScale > 1) is the catalog's
+  /// breathing pulse — 1 + (emphasisScale − 1) ×
+  /// (0.5 − 0.5·cos(2π·tIn / P)), P = min(1.2s, line duration),
+  /// repeating — and it applies ONLY in 'none' word mode
+  /// (applyPulse). The old code swelled once at the line's
+  /// midpoint AND pulsed karaoke lines, where the JS overlay never
+  /// pulses at all (the current word pops instead). When applyEnter
+  /// is false (the per-word modes animate their own entrances)
+  /// the line starts at its resting state and only the exit
+  /// envelope is applied. 25 samples with linear interpolation
+  /// reproduce the eased curves to well under a percent.
   private static func addLyricLineAnimations(
     to layer: CALayer,
     animation: LyricAnimationRecord,
     applyEnter: Bool,
+    applyPulse: Bool,
     start: Double,
     lineDuration: Double,
     lineHeight: CGFloat,
@@ -1996,75 +2039,58 @@ private enum MvmtCompositorEngine {
     let enter = max(0, lyricFinite(animation.enterSecs, 0))
     let exit = max(0, lyricFinite(animation.exitSecs, 0))
     let fromOpacity = lyricClamp(lyricFinite(animation.fromOpacity, 0), 0, 1)
+    let fromScale = CGFloat(lyricClamp(lyricFinite(animation.fromScale, 1), 0.05, 20))
     let emphasisScale = CGFloat(lyricClamp(lyricFinite(animation.emphasisScale, 1), 1, 20))
-    let fromTransform = lyricFromTransform(animation, lineHeight: lineHeight, lineWidth: lineWidth)
-    let identity = CATransform3DIdentity
+    let fromX = CGFloat(lyricFinite(animation.fromXOffsetFrac, 0))
+    let fromY = CGFloat(lyricFinite(animation.fromYOffsetFrac, 0))
+    let fromRotate = CGFloat(lyricFinite(animation.fromRotateDeg, 0))
+    let pulsePeriod = min(1.2, max(0.2, lineDuration))
 
-    let enterFraction = enter > 0 ? min(enter / lineDuration, 1) : 0
-    let exitStartFraction = exit > 0 ? max(1 - exit / lineDuration, enterFraction) : 1
-
+    let sampleCount = 25
     var opacityStops: [(Double, Double)] = []
     var transformStops: [(Double, CATransform3D)] = []
-    if applyEnter, enter > 0 {
-      opacityStops.append((0, fromOpacity))
-      transformStops.append((0, fromTransform))
-      opacityStops.append((enterFraction, 1))
-      transformStops.append((enterFraction, identity))
-    } else {
-      opacityStops.append((0, 1))
-      transformStops.append((0, identity))
-    }
-
-    // Emphasis pulse, only when a hold region exists to pulse in:
-    // hold at rest, swell to emphasisScale at the line's midpoint,
-    // settle back — a pulse, not a slow zoom.
-    if emphasisScale > 1, exitStartFraction > enterFraction {
-      let span = exitStartFraction - enterFraction
-      let mid = (enterFraction + exitStartFraction) / 2
-      let halfWidth = max(0.02, min(0.08, span * 0.2))
-      let rise = mid - halfWidth
-      if rise > (transformStops.last?.0 ?? 0) {
-        opacityStops.append((rise, 1))
-        transformStops.append((rise, identity))
+    for i in 0..<sampleCount {
+      let f = Double(i) / Double(sampleCount - 1)
+      let tIn = f * lineDuration
+      let tOut = (1 - f) * lineDuration
+      let enterP: Double = !applyEnter ? 1 : (enter <= 0 ? 1 : lyricEaseOutCubic(tIn / enter))
+      let exitP: Double = exit <= 0 ? 1 : lyricEaseInCubic(tOut / exit)
+      let e = min(enterP, exitP)
+      let opacity = fromOpacity + (1 - fromOpacity) * e
+      var scale = fromScale + (1 - fromScale) * CGFloat(e)
+      if applyPulse, emphasisScale > 1 {
+        scale *= 1 + (emphasisScale - 1) * (0.5 - 0.5 * cos(2 * .pi * tIn / pulsePeriod))
       }
-      opacityStops.append((mid, 1))
-      transformStops.append((mid, CATransform3DMakeScale(emphasisScale, emphasisScale, 1)))
-      let back = min(exitStartFraction, mid + halfWidth)
-      if back > mid {
-        opacityStops.append((back, 1))
-        transformStops.append((back, identity))
-      }
+      // Layer space is y-up: negate the Y offset and the rotation
+      // (same flip as lyricFromTransform).
+      let dx = fromX * CGFloat(1 - e) * lineWidth
+      let dy = -fromY * CGFloat(1 - e) * lineHeight
+      let rotation = -fromRotate * CGFloat(1 - e) * .pi / 180
+      let transform = CATransform3DConcat(
+        CATransform3DMakeTranslation(dx, dy, 0),
+        CATransform3DConcat(
+          CATransform3DMakeRotation(rotation, 0, 0, 1),
+          CATransform3DMakeScale(scale, scale, 1)
+        )
+      )
+      opacityStops.append((f, opacity))
+      transformStops.append((f, transform))
     }
-
-    if exitStartFraction < 1, let lastFraction = transformStops.last?.0, exitStartFraction > lastFraction {
-      opacityStops.append((exitStartFraction, 1))
-      transformStops.append((exitStartFraction, identity))
-    }
-    opacityStops.append((1, exit > 0 ? fromOpacity : 1))
-    transformStops.append((1, exit > 0 ? fromTransform : identity))
-
-    guard
-      let cleanOpacity = lyricSanitizedStops(opacityStops),
-      let cleanTransform = lyricSanitizedStops(transformStops),
-      cleanOpacity.count >= 2, cleanTransform.count >= 2
-    else { return }
 
     let opacityAnimation = CAKeyframeAnimation(keyPath: "opacity")
-    opacityAnimation.values = cleanOpacity.map { NSNumber(value: $0.1) }
-    opacityAnimation.keyTimes = cleanOpacity.map { NSNumber(value: $0.0) }
+    opacityAnimation.values = opacityStops.map { NSNumber(value: $0.1) }
+    opacityAnimation.keyTimes = opacityStops.map { NSNumber(value: $0.0) }
     opacityAnimation.duration = lineDuration
     opacityAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + start
-    opacityAnimation.timingFunctions = lyricTimingFunctions(count: cleanOpacity.count)
     opacityAnimation.fillMode = .both
     opacityAnimation.isRemovedOnCompletion = false
     layer.add(opacityAnimation, forKey: "lyricOpacity")
 
     let transformAnimation = CAKeyframeAnimation(keyPath: "transform")
-    transformAnimation.values = cleanTransform.map { NSValue(caTransform3D: $0.1) }
-    transformAnimation.keyTimes = cleanTransform.map { NSNumber(value: $0.0) }
+    transformAnimation.values = transformStops.map { NSValue(caTransform3D: $0.1) }
+    transformAnimation.keyTimes = transformStops.map { NSNumber(value: $0.0) }
     transformAnimation.duration = lineDuration
     transformAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + start
-    transformAnimation.timingFunctions = lyricTimingFunctions(count: cleanTransform.count)
     transformAnimation.fillMode = .both
     transformAnimation.isRemovedOnCompletion = false
     layer.add(transformAnimation, forKey: "lyricTransform")
@@ -2146,6 +2172,39 @@ private enum MvmtCompositorEngine {
     layer.add(pop, forKey: "lyricWordPop")
   }
 
+  /// Karaoke current-word pop (Stage 4 parity audit): the JS
+  /// overlay scales the word being sung by emphasisScale (× 1.25
+  /// for a comic-burst emphasis word, whose image is already
+  /// rendered 1.25× — the layer scale is just emphasisScale) and
+  /// back to 1 once it is sung. Discrete, on the same clock as the
+  /// opacity pop above. Skipped when emphasisScale is 1 (no pop).
+  private static func addLyricWordHighlightScaleAnimation(
+    to layer: CALayer,
+    wordStart: Double,
+    wordEnd: Double,
+    lineStart: Double,
+    lineDuration: Double,
+    emphasisScale: Double
+  ) {
+    guard emphasisScale > 1.001, lineDuration > 0 else { return }
+    let startFraction = lyricClamp((wordStart - lineStart) / lineDuration, 0, 1)
+    let endFraction = lyricClamp((wordEnd - lineStart) / lineDuration, 0, 1)
+    guard
+      let clean = lyricSanitizedStops([
+        (0, emphasisScale), (startFraction, emphasisScale), (endFraction, 1), (1, 1),
+      ])
+    else { return }
+    let pop = CAKeyframeAnimation(keyPath: "transform.scale")
+    pop.values = clean.map { NSNumber(value: $0.1) }
+    pop.keyTimes = clean.map { NSNumber(value: $0.0) }
+    pop.duration = lineDuration
+    pop.beginTime = AVCoreAnimationBeginTimeAtZero + lineStart
+    pop.calculationMode = .discrete
+    pop.fillMode = .both
+    pop.isRemovedOnCompletion = false
+    layer.add(pop, forKey: "lyricWordHighlightScale")
+  }
+
   /// A jagged starburst polygon (comic-burst): `spikes` outer
   /// points alternating with inner points at `innerRatio` of the
   /// rect's radii.
@@ -2179,6 +2238,7 @@ private enum MvmtCompositorEngine {
     decor: LyricDecorRecord,
     lineIndex: Int,
     containerSize: CGSize,
+    contentWidth: CGFloat,
     fontSize: CGFloat
   ) {
     let rect = CGRect(origin: .zero, size: containerSize)
@@ -2186,16 +2246,19 @@ private enum MvmtCompositorEngine {
     case "chat-bubble":
       // Sender (even line) in decor.color, receiver (odd line) in
       // decor.secondaryColor — the alternating conversation. The
-      // tail hangs off the bottom edge.
+      // tail hangs off the bottom edge, 0.72 × font size in from
+      // the sender/receiver edge (Stage 4 parity audit — the old
+      // 22%-of-width position was far too far in), sticking out
+      // 0.22 × font size with its base 0.06 × font size inside.
       let isSender = lineIndex % 2 == 0
       let fill = lyricColor(isSender ? decor.color : decor.secondaryColor) ?? .white
-      let path = UIBezierPath(roundedRect: rect, cornerRadius: containerSize.height * 0.35)
-      let tailW = fontSize * 0.45
-      let tailH = fontSize * 0.3
-      let tailX = isSender ? rect.maxX - rect.width * 0.22 : rect.minX + rect.width * 0.22
-      path.move(to: CGPoint(x: tailX - tailW / 2, y: 1))
+      let path = UIBezierPath(roundedRect: rect, cornerRadius: fontSize * 0.5)
+      let tailW = fontSize * 0.44
+      let tailH = fontSize * 0.22
+      let tailX = isSender ? rect.maxX - fontSize * 0.72 : rect.minX + fontSize * 0.72
+      path.move(to: CGPoint(x: tailX - tailW / 2, y: fontSize * 0.06))
       path.addLine(to: CGPoint(x: tailX, y: -tailH))
-      path.addLine(to: CGPoint(x: tailX + tailW / 2, y: 1))
+      path.addLine(to: CGPoint(x: tailX + tailW / 2, y: fontSize * 0.06))
       path.close()
       let shape = CAShapeLayer()
       shape.path = path.cgPath
@@ -2226,23 +2289,31 @@ private enum MvmtCompositorEngine {
           label.contentsScale = 2
           label.contentsGravity = .resize
           label.bounds = CGRect(origin: .zero, size: rendered.displaySize)
+          // Top-right, half-outside the burst (Stage 4 parity
+          // audit): the JS overlay places the label's centre
+          // 0.35 × font size above the container top and flush
+          // with the right edge (+ 0.2 × font size); the old
+          // code sat it 0.15 × font size inside.
           label.position = CGPoint(
-            x: containerSize.width - rendered.displaySize.width / 2,
-            y: containerSize.height - rendered.displaySize.height / 2 + fontSize * 0.15
+            x: containerSize.width + fontSize * 0.2 - rendered.displaySize.width / 2,
+            y: containerSize.height + fontSize * 0.35 - rendered.displaySize.height / 2
           )
           label.transform = CATransform3DMakeRotation(-8 * .pi / 180, 0, 0, 1)
           layer.addSublayer(label)
         }
       }
     case "sticker-frame":
-      // White frame, slightly rotated, with coloured corner dots.
+      // White frame with coloured corner dots. The −2° tilt
+      // lives on the gate layer (it rotates the whole frame
+      // including the text, like the JS overlay) — the old
+      // per-shape rotation tilted the frame the wrong way and
+      // left the text and dots untilted.
       let frame = CAShapeLayer()
       frame.path = UIBezierPath(roundedRect: rect, cornerRadius: fontSize * 0.2).cgPath
       frame.fillColor = nil
       frame.strokeColor = UIColor.white.cgColor
       frame.lineWidth = max(2, fontSize * 0.07)
       frame.frame = rect
-      frame.transform = CATransform3DMakeRotation(-2 * .pi / 180, 0, 0, 1)
       layer.addSublayer(frame)
       let dotSize = fontSize * 0.22
       let dotColors = [
@@ -2264,25 +2335,34 @@ private enum MvmtCompositorEngine {
         layer.addSublayer(dot)
       }
     case "pill":
-      // A wide subtitle bar, broader than the text.
+      // A wide subtitle bar, broader than the text. Rounded by
+      // 0.4 × font size, like the JS overlay (Stage 4 audit —
+      // the old stadium radius made the bar fully round-ended).
       let base = lyricColor(decor.color) ?? .black
       let alpha = CGFloat(lyricClamp(lyricFinite(decor.opacity, 0.7), 0, 1))
       let bar = CALayer()
       bar.frame = rect
       bar.backgroundColor = base.withAlphaComponent(alpha).cgColor
-      bar.cornerRadius = containerSize.height / 2
+      bar.cornerRadius = fontSize * 0.4
       layer.addSublayer(bar)
     case "rule":
       // Thin horizontal rules above and below the line (Magazine,
       // Elegant Script, Storybook) — the same fractions the JS
-      // preview uses, in the same colours.
+      // preview uses, in the same colours. The rules sit at the
+      // container's top and bottom edges: decorPadY reserves
+      // the rule + gap outside the text, so they no longer
+      // strike through it (Stage 4 parity audit).
       let ruleColor = (lyricColor(decor.color) ?? .white)
         .withAlphaComponent(CGFloat(lyricClamp(lyricFinite(decor.opacity, 0.9), 0, 1)))
-      let ruleHeight = max(1, fontSize * 0.05)
-      for y in [ruleHeight / 2 + fontSize * 0.15, rect.height - ruleHeight / 2 - fontSize * 0.15] {
+      let ruleHeight = max(1, fontSize * 0.04)
+      for y in [ruleHeight / 2, rect.height - ruleHeight / 2] {
         let rule = CALayer()
         rule.backgroundColor = ruleColor.cgColor
-        rule.bounds = CGRect(origin: .zero, size: CGSize(width: rect.width, height: ruleHeight))
+        // Text width, not container width (Stage 4 audit): the
+        // JS overlay's rules span the line, and on Storybook —
+        // a rule template WITH a style pill — the container is
+        // wider than the text by the pill padding.
+        rule.bounds = CGRect(origin: .zero, size: CGSize(width: contentWidth, height: ruleHeight))
         rule.position = CGPoint(x: rect.width / 2, y: y)
         layer.addSublayer(rule)
       }
@@ -2313,7 +2393,7 @@ private enum MvmtCompositorEngine {
       let isSender = lineIndex % 2 == 0
       let fill = lyricColor(isSender ? decor.color : decor.secondaryColor) ?? .white
       let bubble = CAShapeLayer()
-      bubble.path = UIBezierPath(roundedRect: rect, cornerRadius: containerSize.height * 0.35).cgPath
+      bubble.path = UIBezierPath(roundedRect: rect, cornerRadius: fontSize * 0.5).cgPath
       bubble.fillColor = fill.cgColor
       bubble.frame = rect
       layer.addSublayer(bubble)
@@ -2345,10 +2425,13 @@ private enum MvmtCompositorEngine {
     let duration = min(enter, available)
     let fromOpacity = lyricClamp(lyricFinite(animation.fromOpacity, 0), 0, 1)
     let radians = CGFloat(angleDeg) * .pi / 180
+    // Translation: +sin is UP in layer space, matching the JS
+    // overlay's −sin in screen space. Rotation: negated, same flip
+    // as lyricFromTransform (layer space is y-up).
     let fromTransform = CATransform3DConcat(
       CATransform3DMakeTranslation(cos(radians) * distance, sin(radians) * distance, 0),
       CATransform3DConcat(
-        CATransform3DMakeRotation(CGFloat(lyricFinite(animation.fromRotateDeg, 0)) * .pi / 180, 0, 0, 1),
+        CATransform3DMakeRotation(-CGFloat(lyricFinite(animation.fromRotateDeg, 0)) * .pi / 180, 0, 0, 1),
         CATransform3DMakeScale(0.3, 0.3, 1)
       )
     )
@@ -2373,10 +2456,15 @@ private enum MvmtCompositorEngine {
     layer.add(transformAnimation, forKey: "lyricWordTransform")
   }
 
-  /// Per-word entrance for the 'bounce' decor (Bounce House): the
-  /// word pops in with a scale overshoot — fromScale, over 1.25,
-  /// under 0.9, settle 1.05, rest 1 — instead of the shared
-  /// from-transform. Opacity fades in on the same clock.
+  /// Per-word entrance for the 'bounce' decor (Bounce House):
+  /// SAMPLED from the JS overlay's formula (LyricsOverlay):
+  ///   e = easeOutCubic(τ / enterSecs)
+  ///   scale = lerp(fromScale, 1, e) × (1 + 0.3·sin(2πe)·(1−e))
+  ///   opacity = lerp(fromOpacity, 1, e)
+  /// The old keyframe stops (fromScale → 1.25 → 0.9 → 1.05 → 1)
+  /// were a different curve that only agreed with the preview at
+  /// the endpoints. 13 samples with linear interpolation
+  /// reproduce the wobble exactly.
   private static func addLyricWordBounceAnimation(
     to layer: CALayer,
     animation: LyricAnimationRecord,
@@ -2394,27 +2482,30 @@ private enum MvmtCompositorEngine {
     let fromOpacity = lyricClamp(lyricFinite(animation.fromOpacity, 0), 0, 1)
     let fromScale = lyricClamp(lyricFinite(animation.fromScale, 1), 0.05, 20)
 
-    let opacityAnimation = CABasicAnimation(keyPath: "opacity")
-    opacityAnimation.fromValue = NSNumber(value: fromOpacity)
-    opacityAnimation.toValue = NSNumber(value: 1.0)
+    let sampleCount = 13
+    var opacityStops: [(Double, Double)] = []
+    var scaleStops: [(Double, Double)] = []
+    for i in 0..<sampleCount {
+      let u = Double(i) / Double(sampleCount - 1)
+      let e = lyricEaseOutCubic(u * duration / enter)
+      opacityStops.append((u, fromOpacity + (1 - fromOpacity) * e))
+      let base = Double(fromScale) + (1 - Double(fromScale)) * e
+      scaleStops.append((u, base * (1 + 0.3 * sin(2 * .pi * e) * (1 - e))))
+    }
+    let opacityAnimation = CAKeyframeAnimation(keyPath: "opacity")
+    opacityAnimation.values = opacityStops.map { NSNumber(value: $0.1) }
+    opacityAnimation.keyTimes = opacityStops.map { NSNumber(value: $0.0) }
     opacityAnimation.duration = duration
     opacityAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + wordBegin
-    opacityAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
     opacityAnimation.fillMode = .both
     opacityAnimation.isRemovedOnCompletion = false
     layer.add(opacityAnimation, forKey: "lyricWordOpacity")
 
-    guard
-      let cleanScale = lyricSanitizedStops([
-        (0, fromScale), (0.35, 1.25), (0.6, 0.9), (0.8, 1.05), (1, 1.0),
-      ])
-    else { return }
     let scaleAnimation = CAKeyframeAnimation(keyPath: "transform.scale")
-    scaleAnimation.values = cleanScale.map { NSNumber(value: $0.1) }
-    scaleAnimation.keyTimes = cleanScale.map { NSNumber(value: $0.0) }
+    scaleAnimation.values = scaleStops.map { NSNumber(value: $0.1) }
+    scaleAnimation.keyTimes = scaleStops.map { NSNumber(value: $0.0) }
     scaleAnimation.duration = duration
     scaleAnimation.beginTime = AVCoreAnimationBeginTimeAtZero + wordBegin
-    scaleAnimation.timingFunctions = lyricTimingFunctions(count: cleanScale.count)
     scaleAnimation.fillMode = .both
     scaleAnimation.isRemovedOnCompletion = false
     layer.add(scaleAnimation, forKey: "lyricWordBounce")
@@ -2502,16 +2593,49 @@ private enum MvmtCompositorEngine {
       ? animation.wordMode
       : "none"
 
+    var font = lyricFont(postScriptName: style.fontPostScriptName, size: baseFontSize, bold: style.bold)
+    // Container padding, computed FIRST (Stage 4 parity audit):
+    // the padding values are the JS overlay's (LyricsOverlay) —
+    // the old Swift numbers were roomier (chat-bubble 0.8/0.4 vs
+    // 0.55/0.22, pill 1.1/0.3 vs 0.9/0.2, style pill 0.55/0.24
+    // vs 0.45/0.16), so every backed line rendered bigger in
+    // export than in preview. A decor background shape (bubble /
+    // burst / frame / bar) replaces the style pill — the decor
+    // draws the backing.
+    let decorBackgroundKinds: Set<String> = ["chat-bubble", "comic-burst", "sticker-frame", "pill", "typing-dots"]
+    let wantsPill = style.background == "pill" && !decorBackgroundKinds.contains(decorKind)
+    let pillPadX = wantsPill ? font.pointSize * 0.45 : 0
+    let pillPadY = wantsPill ? font.pointSize * 0.16 : 0
+    var decorPadX: CGFloat = 0
+    var decorPadY: CGFloat = 0
+    switch decorKind {
+    case "chat-bubble", "typing-dots": decorPadX = font.pointSize * 0.55; decorPadY = font.pointSize * 0.22
+    case "comic-burst": decorPadX = font.pointSize * 0.7; decorPadY = font.pointSize * 0.35
+    case "sticker-frame": decorPadX = font.pointSize * 0.4; decorPadY = font.pointSize * 0.28
+    case "pill": decorPadX = font.pointSize * 0.9; decorPadY = font.pointSize * 0.2
+    // Rules sit OUTSIDE the text (a rule-height bar plus the
+    // 0.25 × font size gap the JS preview uses) — the old code
+    // drew them 0.15 × font size inside the container edge, so
+    // they struck through the text on pad-less templates.
+    case "rule": decorPadY = max(1, font.pointSize * 0.04) + font.pointSize * 0.25
+    default: break
+    }
+
     // Line width (Jaizon, 2026-11-12): a line never runs past
     // this fraction of the canvas width — it wraps onto more
     // rows instead of clipping at the frame's edges (the old
     // shrink-to-fit also ignored the per-word image pads, so
     // long lines still overflowed). The font stays at the
     // style's sizeRatio; wrapping is what keeps a long line
-    // readable at the chosen size.
-    let maxTextWidth = renderSize.width
-      * CGFloat(lyricClamp(lyricFinite(style.maxWidthRatio ?? 0.88, 0.88), 0.3, 1.0))
-    var font = lyricFont(postScriptName: style.fontPostScriptName, size: baseFontSize, bold: style.bold)
+    // readable at the chosen size. The limit applies to the
+    // WHOLE container (text + padding), as the JS overlay's
+    // lineBox maxWidth does — the old text-only limit let a
+    // backed line run past maxWidthRatio by its padding.
+    let maxTextWidth = max(
+      renderSize.width * CGFloat(lyricClamp(lyricFinite(style.maxWidthRatio ?? 0.88, 0.88), 0.3, 1.0))
+        - (pillPadX + decorPadX) * 2,
+      renderSize.width * 0.2
+    )
     let initialMeasure: [NSAttributedString.Key: Any] = [.font: font, .kern: baseFontSize * CGFloat(trackingFrac)]
     let measured = NSAttributedString(string: text, attributes: initialMeasure).size()
     guard measured.width > 0, measured.height > 0 else { return nil }
@@ -2660,19 +2784,28 @@ private enum MvmtCompositorEngine {
         // full strength and pops in at the word's start.
         let baseFill = isKaraoke ? lineFillColor.withAlphaComponent(0.45) : lineFillColor
         // Comic-burst emphasis: a flagged word renders 25% larger.
+        // In karaoke mode the sizing is stateful (Stage 4 parity
+        // audit): the JS overlay shows an unsung emphasis word at
+        // 1× and grows it to 1.25× only once sung — so the BASE
+        // (unsung, 45%) image uses the plain font and the
+        // HIGHLIGHT twin uses the enlarged one. The old code had
+        // it backwards (big unsung word, plain sung word) and the
+        // highlight never popped to emphasisScale while current.
         let isEmphasis = decorKind == "comic-burst" && emphasisIndices.contains(index)
         let wordFont = isEmphasis
           ? lyricFont(postScriptName: style.fontPostScriptName, size: baseFontSize * 1.25, bold: style.bold)
           : font
+        let baseWordFont = isKaraoke ? font : wordFont
+        let baseWordBoldFallback = style.bold && !baseWordFont.fontDescriptor.symbolicTraits.contains(.traitBold)
         let wordBoldFallback = style.bold && !wordFont.fontDescriptor.symbolicTraits.contains(.traitBold)
         guard
           let rendered = lyricTextImage(
             word.text,
-            font: wordFont,
+            font: baseWordFont,
             fillColor: baseFill,
             strokeColor: strokeColor,
             strokeFractionOfFont: strokeFraction,
-            boldStrokeFallback: wordBoldFallback,
+            boldStrokeFallback: baseWordBoldFallback,
             pad: wordPad,
             scale: renderScale,
             tracking: trackingPts
@@ -2689,11 +2822,11 @@ private enum MvmtCompositorEngine {
         if isKaraoke,
           let highlighted = lyricTextImage(
             word.text,
-            font: font,
+            font: wordFont,
             fillColor: lineFillColor,
             strokeColor: strokeColor,
             strokeFractionOfFont: strokeFraction,
-            boldStrokeFallback: boldFallback,
+            boldStrokeFallback: wordBoldFallback,
             pad: wordPad,
             scale: renderScale,
             tracking: trackingPts
@@ -2732,9 +2865,10 @@ private enum MvmtCompositorEngine {
         // (amplitude 0.35 × font size × decor scale, one period
         // per three words). centerY is top-down, so a positive
         // offset moves the word down, like the preview's
-        // translateY.
+        // translateY. Stagger-only, like the preview: in any
+        // other word mode the JS overlay shows the line flat.
         let waveOffset: CGFloat =
-          decorKind == "wave-path"
+          decorKind == "wave-path" && wordMode == "stagger"
           ? CGFloat(sin(Double(index) * 2 * .pi / 3)) * font.pointSize * 0.35
             * CGFloat(lyricClamp(lyricFinite(decor?.scale ?? 1, 1), 0.25, 3))
           : 0
@@ -2801,21 +2935,8 @@ private enum MvmtCompositorEngine {
     guard contentSize.width > 0, contentSize.height > 0 else { return nil }
 
     // ---- Container: the pill adds padding around the content ----
-    // A decor background shape (bubble / burst / frame / bar)
-    // replaces the style pill — the decor draws the backing.
-    let decorBackgroundKinds: Set<String> = ["chat-bubble", "comic-burst", "sticker-frame", "pill", "typing-dots"]
-    let wantsPill = style.background == "pill" && !decorBackgroundKinds.contains(decorKind)
-    let pillPadX = wantsPill ? font.pointSize * 0.55 : 0
-    let pillPadY = wantsPill ? font.pointSize * 0.24 : 0
-    var decorPadX: CGFloat = 0
-    var decorPadY: CGFloat = 0
-    switch decorKind {
-    case "chat-bubble", "typing-dots": decorPadX = font.pointSize * 0.8; decorPadY = font.pointSize * 0.4
-    case "comic-burst": decorPadX = font.pointSize * 1.0; decorPadY = font.pointSize * 0.55
-    case "sticker-frame": decorPadX = font.pointSize * 0.55; decorPadY = font.pointSize * 0.4
-    case "pill": decorPadX = font.pointSize * 1.1; decorPadY = font.pointSize * 0.3
-    default: break
-    }
+    // (Pads were computed up top, before the wrap limit, so the
+    // maxWidthRatio limit already accounts for them.)
     let containerSize = CGSize(
       width: contentSize.width + (pillPadX + decorPadX) * 2,
       height: contentSize.height + (pillPadY + decorPadY) * 2
@@ -2823,14 +2944,25 @@ private enum MvmtCompositorEngine {
 
     // Anchor: horizontally per the decor align (Minimal Mono
     // sits left, at the 4% margin; 'right' mirrors it; 'center'
-    // is the classic behaviour); vertically per style.position
-    // with a 10%-of-height margin for top/bottom, clamped on-canvas.
+    // is the classic behaviour); vertically per style.position.
+    // The margins are fractions of the canvas WIDTH — the JS
+    // overlay pads top by 0.16 × width and bottom by 0.20 ×
+    // width (0.09 / 0.1125 of a 9:16 height), and the old
+    // 10%-of-height margins sat ~1% off the preview in both
+    // directions (Stage 4 parity audit).
     // CALayer space is bottom-left origin, y up.
-    let centreX: CGFloat
+    var centreX: CGFloat
     switch decor?.align ?? "center" {
     case "left": centreX = containerSize.width / 2 + renderSize.width * 0.04
     case "right": centreX = renderSize.width - containerSize.width / 2 - renderSize.width * 0.04
     default: centreX = renderSize.width / 2
+    }
+    // Chat bubbles (and typing-dots bubbles) shift sideways by
+    // line: sender right, receiver left, 6% of the canvas width
+    // — the JS overlay translates the bubble View the same way;
+    // the old code never shifted, so every bubble sat centred.
+    if decorKind == "chat-bubble" || decorKind == "typing-dots" {
+      centreX += (lineIndex % 2 == 0 ? 1 : -1) * renderSize.width * 0.06
     }
     // Duet: lines alternate top/bottom by line index — sender
     // low, receiver high (the JS preview mirrors this).
@@ -2838,11 +2970,11 @@ private enum MvmtCompositorEngine {
     var rawCentreY: CGFloat
     switch effectivePosition {
     case "top":
-      rawCentreY = renderSize.height * 0.90 - containerSize.height / 2
+      rawCentreY = renderSize.height - renderSize.width * 0.16 - containerSize.height / 2
     case "center":
       rawCentreY = renderSize.height / 2
     default: // "bottom" and anything unrecognised
-      rawCentreY = renderSize.height * 0.10 + containerSize.height / 2
+      rawCentreY = renderSize.width * 0.20 + containerSize.height / 2
     }
     // Fine vertical nudge (Jaizon): a fraction of the canvas
     // height on top of the anchor — positive moves the line UP
@@ -2860,12 +2992,21 @@ private enum MvmtCompositorEngine {
     gateLayer.position = CGPoint(x: centreX, y: centreY)
     gateLayer.opacity = 0
     addLyricGateAnimation(to: gateLayer, start: start, end: end, totalDuration: durationSeconds)
-    // Static rotation (Graffiti decor): on the gate layer, whose
-    // only animation is opacity — the inner layer carries the
-    // enter/exit transform, so rotating it would be wiped out.
-    let rotationDeg = lyricFinite(decor?.rotationDeg ?? 0, 0)
-    if rotationDeg != 0 {
-      gateLayer.transform = CATransform3DMakeRotation(CGFloat(rotationDeg) * .pi / 180, 0, 0, 1)
+    // Static rotation, on the gate layer, whose only animation is
+    // opacity — the inner layer carries the enter/exit transform,
+    // so rotating it would be wiped out. Sign flip (Stage 4
+    // parity audit): layer space is y-up, so a JS −3° (3°
+    // counter-clockwise on screen) is +3° here. The gate also
+    // carries the comic-burst and sticker-frame containers'
+    // −2° tilt (the JS overlay rotates those whole frames,
+    // text included, so the tilt belongs on the gate, not on
+    // the background shape alone — the old code tilted the
+    // sticker frame shape but left the text untilted).
+    let gateRotationDeg =
+      -lyricFinite(decor?.rotationDeg ?? 0, 0)
+      + (decorKind == "comic-burst" || decorKind == "sticker-frame" ? 2 : 0)
+    if gateRotationDeg != 0 {
+      gateLayer.transform = CATransform3DMakeRotation(CGFloat(gateRotationDeg) * .pi / 180, 0, 0, 1)
     }
 
     let innerLayer = CALayer()
@@ -2878,7 +3019,9 @@ private enum MvmtCompositorEngine {
       pillLayer.frame = CGRect(origin: .zero, size: containerSize)
       let pillColor = lyricColor(style.backgroundColor) ?? UIColor.black.withAlphaComponent(0.55)
       pillLayer.backgroundColor = pillColor.cgColor
-      pillLayer.cornerRadius = containerSize.height / 2
+      // Rounded corners, not a stadium: the JS overlay rounds
+      // the style pill by 0.35 × font size (Stage 4 audit).
+      pillLayer.cornerRadius = font.pointSize * 0.35
       innerLayer.addSublayer(pillLayer)
     }
 
@@ -2889,6 +3032,7 @@ private enum MvmtCompositorEngine {
         decor: decor,
         lineIndex: lineIndex,
         containerSize: containerSize,
+        contentWidth: contentSize.width,
         fontSize: font.pointSize
       )
     }
@@ -2938,10 +3082,18 @@ private enum MvmtCompositorEngine {
       innerLayer.addSublayer(singleLayer)
     }
     for entry in wordEntries {
-      // Each row is centred within the content width; centerY is
-      // measured from the content's top (layer space is y-up, so
-      // it flips here).
-      let rowOriginX = (containerSize.width - rowWidths[entry.row]) / 2
+      // Rows are aligned within the content width per the decor
+      // align (Stage 4 parity audit): the JS overlay left/right
+      // aligns Minimal Mono's rows, and the old code centred
+      // every row on both sides. contentOriginX is the left edge
+      // of the text block inside the container.
+      let contentOriginX = (containerSize.width - contentSize.width) / 2
+      let rowOriginX: CGFloat
+      switch decor?.align ?? "center" {
+      case "left": rowOriginX = contentOriginX
+      case "right": rowOriginX = contentOriginX + contentSize.width - rowWidths[entry.row]
+      default: rowOriginX = contentOriginX + (contentSize.width - rowWidths[entry.row]) / 2
+      }
       let position = CGPoint(
         x: rowOriginX + entry.centerX,
         y: contentCentre.y + (contentSize.height / 2 - entry.centerY)
@@ -2969,6 +3121,19 @@ private enum MvmtCompositorEngine {
           lineStart: start,
           lineDuration: lineDuration
         )
+        // Karaoke current-word pop: the highlight scales to
+        // emphasisScale while its word is sung (1.18 karaoke,
+        // 1.3 karaoke-pop), then back to 1 — matching the JS
+        // overlay's scaleX on the current word (Stage 4 audit;
+        // the old code never popped the highlight at all).
+        addLyricWordHighlightScaleAnimation(
+          to: highlight,
+          wordStart: entry.wordStart,
+          wordEnd: entry.index < words.count ? words[entry.index].end : entry.wordStart,
+          lineStart: start,
+          lineDuration: lineDuration,
+          emphasisScale: animation.emphasisScale
+        )
       }
       switch wordMode {
       case "stagger":
@@ -2983,7 +3148,11 @@ private enum MvmtCompositorEngine {
           let angle = decorKind == "rain"
             ? 90
             : 30 + (count > 1 ? Double(entry.index) / Double(count - 1) * 120 : 60)
-          let distance = max(contentSize.width, contentSize.height) * 0.55
+          // Flight distance (Stage 4 parity audit): the JS
+          // overlay flies words 2.2 × font size × scale — the
+          // old content-size-based distance (≈ 4× larger on a
+          // wide line) sent them off the frame.
+          let distance = font.pointSize * 2.2
             * CGFloat(lyricClamp(lyricFinite(decor?.scale ?? 1, 1), 0.25, 3))
           addLyricWordBurstAnimation(
             to: entry.layer,
@@ -3002,13 +3171,16 @@ private enum MvmtCompositorEngine {
             lineEnd: end
           )
         } else {
+          // Container size, not content size (Stage 4 audit):
+          // the JS overlay scales the enter offsets by the line
+          // box, which includes the padding.
           addLyricWordEnterAnimation(
             to: entry.layer,
             animation: animation,
             wordBegin: wordBegin,
             lineEnd: end,
-            lineHeight: contentSize.height,
-            lineWidth: contentSize.width
+            lineHeight: containerSize.height,
+            lineWidth: containerSize.width
           )
         }
       case "typewriter":
@@ -3049,7 +3221,14 @@ private enum MvmtCompositorEngine {
         ghost.contentsScale = entry.layer.contentsScale
         ghost.contentsGravity = .resize
         ghost.bounds = entry.layer.bounds
-        let rowOriginX = (containerSize.width - rowWidths[entry.row]) / 2
+        // Same align-aware row origin as the live words above.
+        let contentOriginX = (containerSize.width - contentSize.width) / 2
+        let rowOriginX: CGFloat
+        switch decor?.align ?? "center" {
+        case "left": rowOriginX = contentOriginX
+        case "right": rowOriginX = contentOriginX + contentSize.width - rowWidths[entry.row]
+        default: rowOriginX = contentOriginX + (contentSize.width - rowWidths[entry.row]) / 2
+        }
         let position = CGPoint(
           x: rowOriginX + entry.centerX,
           y: contentCentre.y + (contentSize.height / 2 - entry.centerY)
@@ -3064,34 +3243,61 @@ private enum MvmtCompositorEngine {
     }
 
     // Scanlines (Extra Styles — Hologram): thin translucent lines
-    // across the container, drawn over the text.
+    // across the text, drawn over it. The JS overlay measures
+    // them against the CONTENT height/width (plus one font size
+    // of overhang) — the old code used the container, so the
+    // lines were spaced and sized to the padding, not the text.
     if decorKind == "scanlines", let decor = decor, let scanColor = lyricColor(decor.color) {
       let lineCount = 8
       let scanHeight = containerSize.height / CGFloat(lineCount * 4)
       let alpha = CGFloat(lyricClamp(lyricFinite(decor.opacity, 0.5), 0, 1)) * 0.4
+      let scanWidth = contentSize.width + font.pointSize
       for i in 0..<lineCount {
         let scan = CALayer()
         scan.backgroundColor = scanColor.withAlphaComponent(alpha).cgColor
-        scan.bounds = CGRect(origin: .zero, size: CGSize(width: containerSize.width, height: scanHeight))
+        scan.bounds = CGRect(origin: .zero, size: CGSize(width: scanWidth, height: scanHeight))
         scan.position = CGPoint(
-          x: containerSize.width / 2,
-          y: containerSize.height * (CGFloat(i) + 0.5) / CGFloat(lineCount)
+          x: contentCentre.x,
+          // y in layer space: content-relative, top row first
+          // — (i + 0.5) / 8 down from the content's top.
+          y: contentCentre.y + contentSize.height * (0.5 - (CGFloat(i) + 0.5) / CGFloat(lineCount))
         )
         innerLayer.addSublayer(scan)
       }
     }
 
     // Cursor (Extra Styles — Typewriter Classic): a blinking block
-    // after the text, on the text's centre line.
-    if decorKind == "cursor", let decor = decor, let cursorColor = lyricColor(decor.color) {
+    // after the text, on the text's centre line. Typewriter-only
+    // (Stage 4 parity audit): the JS overlay shows the cursor
+    // only for typewriter lines; the old code drew it for any
+    // line carrying the decor. It sits after the LAST word of
+    // the LAST row — the old code put it at the content's right
+    // edge at the text-block centre, which is wrong on a
+    // wrapped line.
+    if decorKind == "cursor", wordMode == "typewriter", let decor = decor, let cursorColor = lyricColor(decor.color) {
       let cursorWidth = font.pointSize * 0.45
       let cursorHeight = max(textHeight * 0.8, font.pointSize * 0.8)
       let cursor = CALayer()
       cursor.backgroundColor = cursorColor.cgColor
       cursor.bounds = CGRect(origin: .zero, size: CGSize(width: cursorWidth, height: cursorHeight))
+      let lastRow = max(0, rowWidths.count - 1)
+      let lastWord = wordEntries.filter { $0.row == lastRow }.max(by: { $0.centerX < $1.centerX })
+      let contentOriginX = (containerSize.width - contentSize.width) / 2
+      let lastRowOriginX: CGFloat
+      switch decor?.align ?? "center" {
+      case "left": lastRowOriginX = contentOriginX
+      case "right": lastRowOriginX = contentOriginX + contentSize.width - rowWidths[lastRow]
+      default: lastRowOriginX = contentOriginX + (contentSize.width - rowWidths[lastRow]) / 2
+      }
+      let lastWordRight = lastWord.map {
+        lastRowOriginX + $0.centerX + $0.layer.bounds.width / 2
+      } ?? (contentCentre.x + contentSize.width / 2)
+      let lastWordCentreY = lastWord.map {
+        contentCentre.y + (contentSize.height / 2 - $0.centerY)
+      } ?? textCentreY
       cursor.position = CGPoint(
-        x: contentCentre.x + contentSize.width / 2 + cursorWidth,
-        y: textCentreY
+        x: lastWordRight + cursorWidth / 2,
+        y: lastWordCentreY
       )
       cursor.opacity = 0
       // Blink: discrete 1/0 every 0.5 s across the line window.
@@ -3148,15 +3354,20 @@ private enum MvmtCompositorEngine {
     // Line enter/exit/emphasis on the inner layer. The per-word
     // modes animate their own entrances (stagger / typewriter), so
     // their inner layer carries only the exit + emphasis; 'none'
-    // and 'karaoke' lines enter as a whole.
+    // and 'karaoke' lines enter as a whole. The enter offsets are
+    // scaled by the CONTAINER size — the JS overlay measures the
+    // line box (text + padding), not the bare text. The emphasis
+    // pulse applies only in 'none' word mode, matching the JS
+    // overlay (Stage 4 parity audit).
     addLyricLineAnimations(
       to: innerLayer,
       animation: animation,
       applyEnter: wordMode == "none" || wordMode == "karaoke",
+      applyPulse: wordMode == "none",
       start: start,
       lineDuration: lineDuration,
-      lineHeight: contentSize.height,
-      lineWidth: contentSize.width
+      lineHeight: containerSize.height,
+      lineWidth: containerSize.width
     )
 
     return gateLayer

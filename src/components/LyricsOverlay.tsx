@@ -1,5 +1,6 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { StyleSheet, Text, View, type TextStyle, type ViewStyle } from 'react-native';
+import Svg, { Polygon } from 'react-native-svg';
 
 import type {
   CompositeLyrics,
@@ -176,15 +177,24 @@ export function LyricsOverlay({
     letterSpacing: trackingPts,
     lineHeight: fontSize * 1.22,
     // Glow decor (Neon Sign, Karaoke Pop): a soft halo around the
-    // glyphs — the preview stand-in for the native shadow.
+    // glyphs — the preview stand-in for the native shadow. Radius
+    // 0.4 × font size and the decor's opacity, matching the Swift
+    // burn-in (Stage 4 parity audit — the old full-strength
+    // 0.5 × halo was stronger than export's).
     ...(decor?.kind === 'glow'
-      ? { textShadowColor: decor.color, textShadowOffset: { width: 0, height: 0 }, textShadowRadius: fontSize * 0.5 }
+      ? {
+          textShadowColor: hexWithAlpha(decor.color, decor.opacity ?? 0.6),
+          textShadowOffset: { width: 0, height: 0 },
+          textShadowRadius: fontSize * 0.4,
+        }
       : {}),
     // Hard drop shadow (Big Bold Billboard): offset down-right,
-    // tight radius — the native layer shadow's stand-in.
+    // tight radius — the native layer shadow's stand-in, at the
+    // decor's opacity (Stage 4 audit — the old opaque shadow
+    // was darker than export's 0.85).
     ...(decor?.kind === 'shadow'
       ? {
-          textShadowColor: decor.color,
+          textShadowColor: hexWithAlpha(decor.color, decor.opacity ?? 0.85),
           textShadowOffset: { width: fontSize * 0.08, height: fontSize * 0.08 },
           textShadowRadius: fontSize * 0.08,
         }
@@ -315,19 +325,28 @@ export function LyricsOverlay({
       );
     });
     // Typewriter cursor: a block after the last word, blinking
-    // every 0.5 s off the playhead (no timer needed).
+    // every 0.5 s on LINE-relative time (Stage 4 parity audit —
+    // the old absolute-playhead phase drifted against the
+    // export's line-relative blink). Height matches the native
+    // burn-in: 0.8 × the line height, at least 0.8 × font size.
     const cursorNode =
-      decor?.kind === 'cursor' && wordMode === 'typewriter' ? (
-        <View
-          style={{
-            width: fontSize * 0.45,
-            height: fontSize * 1.1,
-            backgroundColor: decor.color,
-            borderRadius: 2,
-            opacity: Math.floor(positionSeconds * 2) % 2 === 0 ? 1 : 0,
-          }}
-        />
-      ) : null;
+      decor?.kind === 'cursor' && wordMode === 'typewriter'
+        ? (() => {
+            const steps = Math.max(1, Math.floor(duration / 0.5));
+            const stepDur = duration / steps;
+            return (
+              <View
+                style={{
+                  width: fontSize * 0.45,
+                  height: Math.max(lineH * 0.8, fontSize * 0.8),
+                  backgroundColor: decor.color,
+                  borderRadius: 2,
+                  opacity: Math.floor(tIn / stepDur) % 2 === 0 ? 1 : 0,
+                }}
+              />
+            );
+          })()
+        : null;
     // Split Screen Words: two rows — even words on top, odd words
     // below — stacked with the same gap the native burn-in uses
     // (1.2 × font size). Otherwise one wrapping row. The gap
@@ -353,10 +372,19 @@ export function LyricsOverlay({
   }
 
   // Emoji row (Extra Styles): the line's stored emoji above the
-  // text, inside the line's own animated unit.
+  // text, inside the line's own animated unit. The 0.25 × font
+  // size gap under the emoji matches the native burn-in (Stage 4
+  // parity audit — the old preview glued the emoji to the text).
   const emojiNode =
     decor?.kind === 'emoji-row' && active.emoji ? (
-      <Text style={{ fontSize: fontSize * 1.15 * (decor.scale ?? 1), textAlign: 'center' }}>{active.emoji}</Text>
+      <Text
+        style={{
+          fontSize: fontSize * 1.15 * (decor.scale ?? 1),
+          textAlign: 'center',
+          marginBottom: fontSize * 0.25,
+        }}>
+        {active.emoji}
+      </Text>
     ) : null;
 
   let content: ReactNode = (
@@ -416,17 +444,43 @@ export function LyricsOverlay({
       </View>
     );
   } else if (decor?.kind === 'comic-burst') {
+    // Jagged 12-spike starburst (Stage 4 parity audit): the old
+    // preview was a rounded rect, while the native burn-in draws
+    // a starburst — the shape itself is the template's look, so
+    // the preview now draws the same polygon. Points mirror the
+    // Swift lyricStarburstPath (12 spikes, inner ratio 0.78,
+    // inset −0.35 × font size), y-flipped into screen space.
+    const burstPad = fontSize * 0.35;
+    const burstW = lineW + fontSize * 1.4 + burstPad * 2;
+    const burstH = lineH + fontSize * 0.7 + burstPad * 2;
+    const burstCx = burstW / 2;
+    const burstCy = burstH / 2;
+    const burstPoints = Array.from({ length: 24 }, (_, i) => {
+      const angle = (i * Math.PI) / 12 - Math.PI / 2;
+      const r = i % 2 === 0 ? 1 : 0.78;
+      const x = burstCx + Math.cos(angle) * (burstW / 2) * r;
+      const y = burstCy - Math.sin(angle) * (burstH / 2) * r;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
     content = (
       <View
         style={{
-          backgroundColor: decor.color,
-          borderRadius: fontSize * 0.35,
-          borderWidth: Math.max(2, fontSize * 0.06),
-          borderColor: decor.secondaryColor,
           paddingHorizontal: fontSize * 0.7,
           paddingVertical: fontSize * 0.35,
           transform: [{ rotate: '-2deg' }],
         }}>
+        <Svg
+          width={burstW}
+          height={burstH}
+          style={{ position: 'absolute', left: -burstPad, top: -burstPad }}
+          pointerEvents="none">
+          <Polygon
+            points={burstPoints}
+            fill={decor.color}
+            stroke={decor.secondaryColor}
+            strokeWidth={Math.max(2, fontSize * 0.06)}
+          />
+        </Svg>
         {content}
         {decor.text ? (
           <Text

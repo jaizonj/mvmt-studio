@@ -177,7 +177,10 @@ reuse that keeps 30 templates maintainable.
 - **Stage 3 — Remaining 20 Extra Styles** on the same architecture.
 - **Stage 4 — Parity audit**: preview vs export per template, clip
   check (maxWidthRatio respected), performance (decor layers are
-  cheap CALayers; no per-frame re-render).
+  cheap CALayers; no per-frame re-render). **SHIPPED** — full audit
+  in `docs/STYLES-PARITY.md`: 42 findings, 24 Swift fixes + 5 JS
+  fixes, 5 new parity tests (lyrics 66 total); known limitations
+  documented, no template's look redesigned.
 
 ## 5. Acceptance (Jaizon's list, mapped)
 - Existing styles reorganized → Stage 1.

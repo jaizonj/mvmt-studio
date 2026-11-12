@@ -1077,3 +1077,140 @@ test('intelligence: detection stores decor on the line', () => {
   assert.equal(lines[0].decor.emoji, '❤️');
   assert.equal(lines[0].decor.tone, 'love');
 });
+
+// ── Preview == export parity (Styles Redesign Stage 4) ─────────────
+// The JS overlay (src/components/LyricsOverlay.tsx) and the Swift
+// burn-in (modules/mvmt-compositor/ios/MvmtCompositorModule.swift)
+// are separate renderers fed by ONE composite payload. A device
+// can only judge pixels; these tests pin everything that CAN be
+// automated: one deterministic payload, the wrap limit carried in
+// it, animation resolution on both sides, every decor kind
+// branched in both sources, and the audited geometry constants
+// agreeing between the two renderers.
+const SWIFT_PATH = path.join(__dirname, '..', 'modules', 'mvmt-compositor', 'ios', 'MvmtCompositorModule.swift');
+const OVERLAY_PATH = path.join(__dirname, '..', 'src', 'components', 'LyricsOverlay.tsx');
+const swiftSource = fs.readFileSync(SWIFT_PATH, 'utf8');
+const overlaySource = fs.readFileSync(OVERLAY_PATH, 'utf8');
+
+test('parity: every decor kind has a branch in both renderers', () => {
+  for (const kind of LYRIC_DECOR_KINDS) {
+    assert.ok(overlaySource.includes(`'${kind}'`), `JS overlay has no branch for decor kind ${kind}`);
+    assert.ok(swiftSource.includes(`"${kind}"`), `Swift burn-in has no branch for decor kind ${kind}`);
+  }
+});
+
+test('parity: the resolved payload is deterministic and round-trips (one payload feeds both sides)', () => {
+  const line = {
+    id: 'a',
+    text: 'I love you NEVER',
+    startFrame: 0,
+    endFrame: 60,
+    words: [
+      { text: 'I', startFrame: 0, endFrame: 10 },
+      { text: 'love', startFrame: 10, endFrame: 25 },
+      { text: 'you', startFrame: 25, endFrame: 40 },
+      { text: 'NEVER', startFrame: 40, endFrame: 60 },
+    ],
+    decor: analyzeLyricLine('I love you NEVER'),
+  };
+  for (const t of LYRIC_TEMPLATES) {
+    // Built the way the app builds it: picking a template folds
+    // its style overrides into the project style at pick time
+    // (setLyricTemplate in StudioContext) and stores templateId
+    // for the decor — the payload builder itself resolves style
+    // from lyrics.style and decor from templateId.
+    const project = { ...payloadProject([line], { ...t.style }), templateId: t.id };
+    const first = JSON.stringify(buildCompositeLyrics(project, 0, FPS));
+    const second = JSON.stringify(buildCompositeLyrics(project, 0, FPS));
+    assert.equal(first, second, `${t.id} payload is not deterministic`);
+    // Round-trip: parsing the serialised payload and serialising
+    // it again gives the same bytes (a fresh build is NOT
+    // deep-equal to the parsed form — it carries undefined-valued
+    // keys that JSON drops — so compare through JSON on both sides).
+    assert.equal(JSON.stringify(JSON.parse(first)), first, `${t.id} payload does not round-trip`);
+    // The payload the Swift side receives carries the resolved
+    // decor and animation — never a raw template id.
+    const parsed = JSON.parse(first);
+    assert.equal(parsed.decor.kind, t.decor.kind, `${t.id} decor kind`);
+    assert.equal(parsed.style.animation.wordMode, lyricAnimationById(t.style.animationId ?? 'karaoke').wordMode);
+  }
+});
+
+test('parity: maxWidthRatio is carried in the payload for every template, and the Swift wrap limit is container-wide', () => {
+  for (const t of LYRIC_TEMPLATES) {
+    const payload = buildCompositeLyrics(
+      payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }], { ...t.style }),
+      0,
+      FPS,
+    );
+    const ratio = payload.style.maxWidthRatio;
+    assert.ok(typeof ratio === 'number' && ratio >= 0.3 && ratio <= 1, `${t.id} maxWidthRatio ${ratio}`);
+  }
+  // Default 0.88 when unset.
+  const classic = buildCompositeLyrics(payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }]), 0, FPS);
+  assert.equal(classic.style.maxWidthRatio, 0.88);
+  // The Swift limit subtracts the pill + decor padding, so the
+  // limit applies to the whole container (text + padding) exactly
+  // like the JS overlay's lineBox maxWidth.
+  assert.ok(
+    swiftSource.includes('(pillPadX + decorPadX) * 2'),
+    'Swift maxTextWidth does not subtract the container padding',
+  );
+});
+
+test('parity: every template animationId resolves on both sides, aliases included', () => {
+  // The Swift side switches on the resolved wordMode literals.
+  for (const mode of ['stagger', 'karaoke', 'typewriter']) {
+    assert.ok(swiftSource.includes(`wordMode == "${mode}"`), `Swift never handles word mode ${mode}`);
+  }
+  assert.ok(swiftSource.includes('"none"'), 'Swift never handles the none word mode');
+  for (const t of LYRIC_TEMPLATES) {
+    const resolved = lyricAnimationById(t.style.animationId);
+    assert.notEqual(resolved.id, undefined, `${t.id} animationId does not resolve`);
+    assert.ok(['none', 'stagger', 'karaoke', 'typewriter'].includes(resolved.wordMode), `${t.id} wordMode ${resolved.wordMode}`);
+  }
+  // Aliased ids resolve to the same survivor on the JS side that
+  // the payload carries to Swift (spot-check the full alias map
+  // contract in the catalog tests above).
+  assert.equal(lyricAnimationById('soft-rise').id, 'rise');
+  assert.equal(lyricAnimationById('glow-pulse').id, 'pulse');
+  assert.equal(lyricAnimationById('word-drop').id, 'word-rise');
+});
+
+test('parity: the audited geometry constants agree between the two renderers', () => {
+  // [what, JS pattern, Swift pattern] — each pair is one number
+  // the Stage 4 audit found (or confirmed) equal on both sides.
+  // A drift here is a preview/export mismatch by construction.
+  const pairs = [
+    ['emoji gap 0.25', /fontSize \* 0\.25/, /baseFontSize \* 0\.25/],
+    ['glow radius 0.4', /textShadowRadius: fontSize \* 0\.4/, /font\.pointSize \* 0\.4/],
+    ['shadow offset/radius 0.08', /fontSize \* 0\.08/, /font\.pointSize \* 0\.08/],
+    ['burst/rain flight 2.2', /fontSize \* 2\.2/, /font\.pointSize \* 2\.2/],
+    ['wave amplitude 0.35', /fontSize \* 0\.35/, /font\.pointSize \* 0\.35/],
+    ['bounce wobble 0.3', /0\.3 \* Math\.sin/, /0\.3 \* sin/],
+    ['chat translate 0.06', /width \* 0\.06/, /renderSize\.width \* 0\.06/],
+    ['chat bubble radius 0.5', /borderRadius: fontSize \* 0\.5/, /cornerRadius: fontSize \* 0\.5/],
+    ['chat tail stick-out 0.22', /bottom: -fontSize \* 0\.22/, /tailH = fontSize \* 0\.22/],
+    ['comic pad 0.7', /paddingHorizontal: fontSize \* 0\.7/, /decorPadX = font\.pointSize \* 0\.7/],
+    ['sticker pad 0.4', /paddingHorizontal: fontSize \* 0\.4/, /decorPadX = font\.pointSize \* 0\.4/],
+    ['decor pill radius 0.4', /borderRadius: fontSize \* 0\.4/, /cornerRadius = fontSize \* 0\.4/],
+    ['style pill radius 0.35', /borderRadius: fontSize \* 0\.35/, /cornerRadius = font\.pointSize \* 0\.35/],
+    ['rule height 0.04', /fontSize \* 0\.04/, /fontSize \* 0\.04/],
+    ['split gap 1.2', /gap: fontSize \* 1\.2/, /font\.pointSize \* 1\.2/],
+    ['ghost offset 0.5', /ghostShift = fontSize \* 0\.5/, /dx = font\.pointSize \* 0\.5/],
+    ['scanlines 8', /const scanCount = 8/, /let lineCount = 8/],
+    ['cursor width 0.45', /width: fontSize \* 0\.45/, /cursorWidth = font\.pointSize \* 0\.45/],
+    // Typing dots: JS lays the row out from the right edge
+    // (right 0.47 + half a 0.16 dot = rightmost centre 0.55);
+    // Swift positions each dot's centre directly.
+    ['typing dots 0.55/0.32', /right: fontSize \* 0\.47/, /0\.55 \+ CGFloat\(2 - i\) \* 0\.32/],
+    ['pulse period 1.2/0.2', /Math\.min\(1\.2, Math\.max\(0\.2, duration\)\)/, /min\(1\.2, max\(0\.2, lineDuration\)\)/],
+    ['karaoke unsung opacity 0.45', /opacity: 0\.45/, /withAlphaComponent\(0\.45\)/],
+    ['comic emphasis 1.25', /1\.25/, /baseFontSize \* 1\.25/],
+    ['starburst 12 spikes / 0.78', /length: 24/, /spikes: 12, innerRatio: 0\.78/],
+  ];
+  for (const [label, jsPattern, swiftPattern] of pairs) {
+    assert.ok(jsPattern.test(overlaySource), `JS overlay drifted on ${label}`);
+    assert.ok(swiftPattern.test(swiftSource), `Swift burn-in drifted on ${label}`);
+  }
+});
