@@ -10,6 +10,14 @@ const assert = require('node:assert/strict');
 const { buildEdlFromShuffle, buildEdlFromSingleTake, validateAgainstAssets, sequenceKey } = require('./.build-edl/src/lib/shuffleEdl.js');
 const { buildSections } = require('./.build-edl/src/lib/analysis.js');
 const {
+  REPEAT_MODE,
+  STUTTER_MODE,
+  applyFastCuts,
+  applyFastSlowFast,
+  applyRepeat,
+  clipEdlToFrames,
+} = require('./.build-edl/src/lib/editModes.js');
+const {
   sourceFrameForTimelineFrame,
   sourceFrameForSegmentFrame,
   takeSyncOffsetSeconds,
@@ -592,6 +600,259 @@ test('single take: source start follows the shared sync mapping', () => {
   assert.equal(edl.segments[0].sourceStartFrame, 135);
   assert.equal(edl.segments[0].durationFrames, REGION_FRAMES);
   assert.equal(edl.audio.regionStartFrame, 5 * FPS);
+});
+
+// ---------------------------------------------------------------------
+// Edit Modes Stage 2 — rhythm modes (2026-11-12): pure Edl → Edl
+// transforms applied once from Edit mode, through commitEdl.
+// ---------------------------------------------------------------------
+
+/** Three 5 s segments (calm/mid/wild), 15 s total = the region. */
+function makeCut() {
+  return layoutSegments(
+    [
+      { id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 150 },
+      { id: 'seg-2', takeId: 'mid', sourceStartFrame: 0, durationFrames: 150 },
+      { id: 'seg-3', takeId: 'wild', sourceStartFrame: 0, durationFrames: 150 },
+    ],
+    { ...emptyEdl(FPS), audio: { uri: 'file:///track.mp3', regionStartFrame: 0, volume: 1 } },
+  );
+}
+
+const TAKE_IDS = ['calm', 'mid', 'wild'];
+
+test('modes: fast cuts split into ~0.75 s pieces alternating takes, total length unchanged', () => {
+  const result = applyFastCuts(makeCut(), TAKE_IDS);
+  assert.ok(result);
+  // 150 frames = 23×6 + 12 per segment → 7 pieces each, 21 total.
+  assert.equal(result.segments.length, 21);
+  assert.equal(result.totalFrames, REGION_FRAMES);
+  assertGapless(result, REGION_FRAMES);
+  // Pieces are ~0.75 s: 23 frames, tails 12.
+  for (const s of result.segments) {
+    assert.ok(s.durationFrames === 23 || s.durationFrames === 12, `piece ${s.id} is ${s.durationFrames}f`);
+  }
+  // Round-robin from the opening take: calm, mid, wild, calm, …
+  assert.deepEqual(
+    result.segments.slice(0, 6).map((s) => s.takeId),
+    ['calm', 'mid', 'wild', 'calm', 'mid', 'wild'],
+  );
+  // Consecutive pieces never show the same take.
+  for (let i = 1; i < result.segments.length; i += 1) {
+    assert.notEqual(result.segments[i].takeId, result.segments[i - 1].takeId);
+  }
+  // Source continuity per original segment: the first segment's
+  // pieces cover [0, 150) exactly, in order.
+  const first = result.segments.slice(0, 7);
+  assert.deepEqual(
+    first.map((s) => s.sourceStartFrame),
+    [0, 23, 46, 69, 92, 115, 138],
+  );
+  assert.deepEqual(
+    first.map((s) => s.durationFrames),
+    [23, 23, 23, 23, 23, 23, 12],
+  );
+});
+
+test('modes: splitting preserves source continuity (tail merges, no slivers)', () => {
+  const single = layoutSegments(
+    [{ id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 100 }],
+    emptyEdl(FPS),
+  );
+  const result = applyFastCuts(single, ['calm', 'mid']);
+  assert.ok(result);
+  // 100 frames: points at 23/46/69; the 8-frame tail at 92 merges
+  // into the previous piece instead of becoming a sliver.
+  assert.deepEqual(
+    result.segments.map((s) => [s.sourceStartFrame, s.durationFrames]),
+    [
+      [0, 23],
+      [23, 23],
+      [46, 23],
+      [69, 31],
+    ],
+  );
+  assert.deepEqual(
+    result.segments.map((s) => s.takeId),
+    ['calm', 'mid', 'calm', 'mid'],
+  );
+  assert.equal(result.totalFrames, 100);
+});
+
+test('modes: fast cuts keep a segment slow — pieces inherit its speed', () => {
+  const slow = layoutSegments(
+    [{ id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 90, speed: 0.5 }],
+    emptyEdl(FPS),
+  );
+  const result = applyFastCuts(slow, ['calm', 'mid']);
+  assert.ok(result);
+  for (const s of result.segments) assert.equal(s.speed, 0.5);
+  // Source coverage is still exact (90 frames) and the timeline
+  // still stretches 2× (180 frames).
+  assert.equal(result.segments.reduce((sum, s) => sum + s.durationFrames, 0), 90);
+  assert.equal(result.totalFrames, 180);
+  assertGapless(result, 180);
+});
+
+test('modes: fast cuts and fast–slow–fast refuse a single take', () => {
+  assert.equal(applyFastCuts(makeCut(), ['calm']), null);
+  assert.equal(applyFastSlowFast(makeCut(), ['calm'], REGION_FRAMES), null);
+  assert.equal(applyFastCuts(emptyEdl(FPS), TAKE_IDS), null);
+});
+
+test('modes: fast–slow–fast — fast thirds around one 0.5x middle stretch', () => {
+  // A 10 s cut inside a 15 s region: thirds of 100 frames, the
+  // slow middle doubles to 200, total 400 — nothing clipped.
+  const cut = layoutSegments(
+    [
+      { id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 150 },
+      { id: 'seg-2', takeId: 'mid', sourceStartFrame: 0, durationFrames: 150 },
+    ],
+    { ...emptyEdl(FPS), audio: { uri: 'file:///track.mp3', regionStartFrame: 0, volume: 1 } },
+  );
+  const result = applyFastSlowFast(cut, TAKE_IDS, REGION_FRAMES);
+  assert.ok(result);
+  assert.equal(result.totalFrames, 400);
+  assertGapless(result, 400);
+  // First third (timeline 0–100): fast-cut pieces of seg-1.
+  const first = result.segments.filter((s) => s.timelineStartFrame < 100);
+  assert.equal(first.length, 4);
+  assert.ok(first.every((s) => s.speed === undefined));
+  // Middle third (timeline 100–300): the two segments covering it,
+  // each at 0.5x — one continuous slow stretch.
+  const middle = result.segments.filter((s) => s.timelineStartFrame >= 100 && s.timelineStartFrame < 300);
+  assert.equal(middle.length, 2);
+  assert.ok(middle.every((s) => s.speed === 0.5));
+  assert.deepEqual(
+    middle.map((s) => s.takeId),
+    ['calm', 'mid'],
+  );
+  // Final third (timeline 300–400): fast cuts again.
+  const last = result.segments.filter((s) => s.timelineStartFrame >= 300);
+  assert.equal(last.length, 4);
+  assert.ok(last.every((s) => s.speed === undefined));
+});
+
+test('modes: fast–slow–fast re-clips to the region — the slow stretch eats the budget', () => {
+  // Full 15 s cut, 15 s region: thirds of 150; the middle doubles
+  // to 300, so first (150) + middle (300) fills the region exactly
+  // and the final third is clipped away.
+  const result = applyFastSlowFast(makeCut(), TAKE_IDS, REGION_FRAMES);
+  assert.ok(result);
+  assert.equal(result.totalFrames, REGION_FRAMES);
+  assertGapless(result, REGION_FRAMES);
+  // 7 fast-cut pieces of the first third + the slowed middle; the
+  // final third's 7 pieces were clipped away entirely. (The first
+  // third's own pieces still alternate takes, wild included.)
+  assert.equal(result.segments.length, 8);
+  assert.equal(result.segments[result.segments.length - 1].takeId, 'mid');
+  assert.equal(result.segments[result.segments.length - 1].speed, 0.5);
+  assert.equal(result.segments[result.segments.length - 1].durationFrames, 150);
+});
+
+test('modes: repeat loops the 1 s slice, then the remainder continues', () => {
+  const result = applyRepeat(makeCut(), 'seg-2', REGION_FRAMES, REPEAT_MODE);
+  assert.ok(result);
+  // seg-1 (150) + 4× the 30-frame slice + the 120-frame remainder,
+  // then seg-3 clipped from 150 to 60 to fit the 450-frame region.
+  assert.deepEqual(
+    result.segments.map((s) => s.id),
+    ['seg-1', 'seg-2', 'seg-2-r2', 'seg-2-r3', 'seg-2-r4', 'seg-2-rest', 'seg-3'],
+  );
+  assert.deepEqual(
+    result.segments.map((s) => [s.takeId, s.sourceStartFrame, s.durationFrames]),
+    [
+      ['calm', 0, 150],
+      ['mid', 0, 30],
+      ['mid', 0, 30],
+      ['mid', 0, 30],
+      ['mid', 0, 30],
+      ['mid', 30, 120],
+      ['wild', 0, 60],
+    ],
+  );
+  // Every piece of the loop — copies AND remainder — is pinned, so
+  // the re-anchor can't undo the replay or skip the continuation.
+  assert.ok(result.segments.slice(1, 6).every((s) => s.fixedSource === true));
+  assert.equal(result.segments[0].fixedSource, undefined);
+  assert.equal(result.segments[6].fixedSource, undefined);
+  assert.equal(result.totalFrames, REGION_FRAMES);
+  assertGapless(result, REGION_FRAMES);
+  // The looped cut still validates clean against the takes.
+  assert.equal(
+    validateEdl(result, [
+      { takeId: 'calm', durationFrames: 450 },
+      { takeId: 'mid', durationFrames: 450 },
+      { takeId: 'wild', durationFrames: 450 },
+    ]).ok,
+    true,
+  );
+});
+
+test('modes: repeat of a sub-second segment loops the whole thing', () => {
+  const short = layoutSegments(
+    [{ id: 'seg-1', takeId: 'calm', sourceStartFrame: 40, durationFrames: 20 }],
+    emptyEdl(FPS),
+  );
+  const result = applyRepeat(short, 'seg-1', REGION_FRAMES, REPEAT_MODE);
+  assert.ok(result);
+  assert.equal(result.segments.length, 4);
+  assert.ok(result.segments.every((s) => s.durationFrames === 20 && s.sourceStartFrame === 40));
+  assert.ok(result.segments.every((s) => s.fixedSource === true));
+  assert.equal(result.totalFrames, 80);
+});
+
+test('modes: stutter plays the 0.3 s slice three times, then continues', () => {
+  const result = applyRepeat(makeCut(), 'seg-2', REGION_FRAMES, STUTTER_MODE);
+  assert.ok(result);
+  // seg-1 (150) + 3× the 9-frame slice + the 141-frame remainder,
+  // then seg-3 clipped from 150 to 132.
+  assert.deepEqual(
+    result.segments.map((s) => s.id),
+    ['seg-1', 'seg-2', 'seg-2-r2', 'seg-2-r3', 'seg-2-rest', 'seg-3'],
+  );
+  assert.deepEqual(
+    result.segments.slice(1, 5).map((s) => [s.sourceStartFrame, s.durationFrames]),
+    [
+      [0, 9],
+      [0, 9],
+      [0, 9],
+      [9, 141],
+    ],
+  );
+  assert.ok(result.segments.slice(1, 5).every((s) => s.fixedSource === true));
+  assert.equal(result.totalFrames, REGION_FRAMES);
+  assertGapless(result, REGION_FRAMES);
+});
+
+test('modes: repeat returns null for an unknown segment', () => {
+  assert.equal(applyRepeat(makeCut(), 'nope', REGION_FRAMES, REPEAT_MODE), null);
+});
+
+test('modes: clip to the region truncates the last segment; a slowed one shrinks by speed', () => {
+  const long = layoutSegments(
+    [
+      { id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 300 },
+      { id: 'seg-2', takeId: 'mid', sourceStartFrame: 0, durationFrames: 300 },
+    ],
+    emptyEdl(FPS),
+  );
+  const clipped = clipEdlToFrames(long, REGION_FRAMES);
+  assert.equal(clipped.segments[0].durationFrames, 300);
+  assert.equal(clipped.segments[1].durationFrames, 150);
+  assert.equal(clipped.totalFrames, REGION_FRAMES);
+
+  const slow = layoutSegments(
+    [{ id: 'seg-1', takeId: 'calm', sourceStartFrame: 0, durationFrames: 300, speed: 0.5 }],
+    emptyEdl(FPS),
+  );
+  const clippedSlow = clipEdlToFrames(slow, REGION_FRAMES);
+  // 450 timeline frames at 0.5x need 225 source frames.
+  assert.equal(clippedSlow.segments[0].durationFrames, 225);
+  assert.equal(clippedSlow.totalFrames, REGION_FRAMES);
+
+  // No region known (0) leaves the cut untouched.
+  assert.equal(clipEdlToFrames(long, 0).totalFrames, 600);
 });
 
 test('canvas: follows the largest RECORDED take; imports never vote', () => {

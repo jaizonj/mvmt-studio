@@ -43,6 +43,7 @@ import {
   framesToSeconds,
   layoutSegments,
   secondsToFrames,
+  segmentAtFrame,
   segmentSpeed,
   segmentTimelineDurationFrames,
   sourceFrameForTimelineFrame,
@@ -52,6 +53,15 @@ import {
   type Edl,
   type EdlSegment,
 } from '../../lib/edl';
+import {
+  REPEAT_MODE,
+  RHYTHM_MODES,
+  STUTTER_MODE,
+  applyFastCuts,
+  applyFastSlowFast,
+  applyRepeat,
+  type RhythmModeId,
+} from '../../lib/editModes';
 import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
@@ -106,13 +116,15 @@ function randomSeed(): number {
 }
 
 /** The layoutSegments input shape for one existing segment. Speed
- *  rides along (undefined = 1x) so re-layouts never drop it. */
+ *  rides along (undefined = 1x) so re-layouts never drop it, and so
+ *  does the pinned-source flag (loops keep their source). */
 function partialOf(s: EdlSegment): {
   id: string;
   takeId: string;
   sourceStartFrame: number;
   durationFrames: number;
   speed?: number;
+  fixedSource?: boolean;
 } {
   return {
     id: s.id,
@@ -120,6 +132,7 @@ function partialOf(s: EdlSegment): {
     sourceStartFrame: s.sourceStartFrame,
     durationFrames: s.durationFrames,
     ...(s.speed !== undefined ? { speed: s.speed } : {}),
+    ...(s.fixedSource ? { fixedSource: true } : {}),
   };
 }
 
@@ -298,6 +311,11 @@ function EditorWorkspace() {
   const reanchorSegments = useCallback(
     (segments: EdlSegment[], fps: number): EdlSegment[] =>
       segments.map((s) => {
+        // Pinned loop pieces (Repeat / Stutter) replay the SAME
+        // source range at a later song position — the anchor would
+        // undo the loop by re-deriving the source from the timeline
+        // position, so it leaves them alone.
+        if (s.fixedSource) return s;
         const take = takes.find((t) => t.id === s.takeId);
         if (!take) return s;
         return {
@@ -501,9 +519,15 @@ function EditorWorkspace() {
     );
     commitEdl(
       layoutSegments(
-        edl.segments.map((s) =>
-          s.id === segment.id ? { ...partialOf(s), takeId: take.id, sourceStartFrame } : partialOf(s),
-        ),
+        edl.segments.map((s) => {
+          if (s.id !== segment.id) return partialOf(s);
+          // A pinned loop's source range belongs to its old take —
+          // swapping takes drops the pin so the new take re-anchors
+          // to its performance at this song position instead of
+          // being clamped out of existence by validation.
+          const { fixedSource: _dropped, ...rest } = partialOf(s);
+          return { ...rest, takeId: take.id, sourceStartFrame };
+        }),
         edl,
       ),
     );
@@ -522,6 +546,56 @@ function EditorWorkspace() {
         s.id === segment.id ? { ...s, speed: speed === 1 ? undefined : speed } : s,
       ),
     });
+  };
+
+  // ---- Rhythm modes (Edit Modes Stage 2) ---------------------------
+  // Length of the used song region, in frames — modes that stretch
+  // the cut (Fast–Slow–Fast, Repeat, Stutter) re-clip to it.
+  const regionLengthSeconds = useMemo(
+    () => effectiveRegion(studio.trackRegion, track?.durationSeconds)?.lengthSeconds ?? 0,
+    [studio.trackRegion, track],
+  );
+  const regionFrames = secondsToFrames(regionLengthSeconds, DEFAULT_FPS);
+  /** The cut Repeat / Stutter loops: the selected one, or the one
+   *  under the playhead when nothing is selected. */
+  const modeTarget = selected ?? (edl ? segmentAtFrame(edl, secondsToFrames(positionSeconds, edl.fps)) : null);
+  /** One tap, through the normal commit path — undoable, and the
+   *  preview rebuilds from the same EDL the exporter will use. A
+   *  mode that can't apply says so in the notice instead of failing
+   *  silently. The song never changes: modes only re-cut video. */
+  const handleApplyMode = (modeId: RhythmModeId) => {
+    if (!edl || !hasCut) return;
+    const takeIds = takes.map((t) => t.id);
+    let next: Edl | null = null;
+    if (modeId === 'fast-cuts') {
+      next = applyFastCuts(edl, takeIds);
+      if (!next) {
+        setShuffleNote('Fast Cuts needs at least two takes to alternate between.');
+        return;
+      }
+    } else if (modeId === 'fast-slow-fast') {
+      next = applyFastSlowFast(edl, takeIds, regionFrames);
+      if (!next) {
+        setShuffleNote('Fast–Slow–Fast needs at least two takes to alternate between.');
+        return;
+      }
+    } else {
+      if (!modeTarget) {
+        setShuffleNote('Tap a cut first — Repeat and Stutter loop the cut you pick.');
+        return;
+      }
+      next = applyRepeat(edl, modeTarget.id, regionFrames, modeId === 'repeat' ? REPEAT_MODE : STUTTER_MODE);
+      if (!next) {
+        setShuffleNote('Could not loop that cut.');
+        return;
+      }
+    }
+    commitEdl(next);
+    setSelectedSegmentId(null);
+    setShuffleNote(null);
+    setPositionSeconds(0);
+    setPaused(false); // the new cut auto-plays from the top, like a shuffle
+    setSweepKey((k) => k + 1);
   };
 
   /** Would switching `segment` to `take` start past the take's end? */
@@ -1080,6 +1154,44 @@ function EditorWorkspace() {
             )}
           </View>
 
+          {/* Edit modes — one-tap rhythm patterns over the cut.
+              Cut-wide modes (Fast Cuts, Fast–Slow–Fast) need 2+
+              takes; Repeat and Stutter loop the selected cut (or the
+              one under the playhead). Nothing here runs on its own. */}
+          {hasCut ? (
+            <View style={styles.section}>
+              <View style={styles.panel}>
+                <Text style={styles.panelLabel}>Edit modes</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
+                  <View style={styles.chipRow}>
+                    {RHYTHM_MODES.map((mode) => {
+                      const disabled =
+                        (mode.needsTwoTakes && takes.length < 2) || (mode.needsTarget && !modeTarget);
+                      return (
+                        <Pressable
+                          key={mode.id}
+                          onPress={() => handleApplyMode(mode.id)}
+                          disabled={disabled}
+                          accessibilityRole="button"
+                          accessibilityState={{ disabled }}
+                          accessibilityLabel={`${mode.name} — ${mode.description}`}
+                          style={[styles.modeCard, disabled && styles.modeCardDisabled]}>
+                          <Text style={[styles.modeCardName, disabled && styles.modeCardNameDisabled]}>
+                            {mode.name}
+                          </Text>
+                          <Text style={styles.modeCardDesc}>{mode.description}</Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </ScrollView>
+                <Text style={styles.caption}>
+                  One tap re-cuts the timeline — undo takes it straight back. The song never changes.
+                </Text>
+              </View>
+            </View>
+          ) : null}
+
           {/* Selected-cut panel — appears when a cut is tapped: swap
               its take from the chips; trimming is drag-only, on the
               timeline itself. */}
@@ -1431,6 +1543,19 @@ const styles = StyleSheet.create({
     borderRadius: radius.pill,
     paddingVertical: 9,
   },
+  modeCard: {
+    width: 168,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.separator,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    gap: 4,
+  },
+  modeCardDisabled: { opacity: 0.4 },
+  modeCardName: { ...typeScale.headline, color: colors.label },
+  modeCardNameDisabled: { color: colors.labelTertiary },
+  modeCardDesc: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 17 },
   speedChipActive: { borderColor: colors.accent, borderWidth: 2, backgroundColor: colors.accentDim },
   speedChipText: { color: colors.label, fontSize: 15, fontWeight: '600', fontVariant: ['tabular-nums'] },
   speedChipTextActive: { color: colors.accent },

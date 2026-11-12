@@ -50,6 +50,19 @@ export interface EdlSegment {
    * `durationFrames`) is unchanged; only the mapping stretches.
    */
   speed?: number;
+  /**
+   * When true, the editor's sync re-anchor leaves this segment's
+   * `sourceStartFrame` alone (Edit Modes Stage 2 — Repeat /
+   * Stutter). A looped slice deliberately replays the SAME source
+   * range at a later song position, which the anchor would
+   * otherwise undo by re-deriving the source from the timeline
+   * position — and the remainder after a loop is pinned too, so it
+   * continues from where the slice ends instead of skipping ahead.
+   * Only loops set this; every other segment stays song-anchored,
+   * and swapping a pinned segment's take clears it (the new take
+   * re-anchors to its performance at that song position).
+   */
+  fixedSource?: boolean;
 }
 
 /**
@@ -202,6 +215,7 @@ export function layoutSegments(
     sourceStartFrame: number;
     durationFrames: number;
     speed?: number;
+    fixedSource?: boolean;
   }[],
   base: Edl,
 ): Edl {
@@ -239,6 +253,7 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
     sourceStartFrame: number;
     durationFrames: number;
     speed?: number;
+    fixedSource?: boolean;
   }[] = [];
 
   for (const segment of edl.segments) {
@@ -263,12 +278,15 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
     // timeline length, never which source frames exist. The key is
     // only set when present, so a 1x edit stays byte-identical
     // through validation (the contract tests assert deepEqual).
+    // fixedSource rides through the same way: validation clamps
+    // source ranges, it never re-anchors them.
     kept.push({
       id: segment.id,
       takeId: segment.takeId,
       sourceStartFrame: start,
       durationFrames: end - start,
       ...(segment.speed !== undefined ? { speed: segment.speed } : {}),
+      ...(segment.fixedSource ? { fixedSource: true } : {}),
     });
   }
 
