@@ -6,6 +6,7 @@ import type { Edl } from '../lib/edl';
 import { effectiveLook } from '../lib/looks';
 import { cleanDetectedLyrics, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { lyricTemplateById } from '../lib/lyricTemplates';
+import { resolveMixMasterStageSettings, type MixMasterStageSettings } from '../lib/mixMasterCurve';
 import { loadProjects, saveProjects } from '../lib/persistence';
 import { findSongLibraryEntry, removeSongLibraryEntry, upsertSongLibraryEntry } from '../lib/songLibrary';
 import type {
@@ -169,6 +170,13 @@ interface StudioState {
    *  always uses the original. */
   mixMasterEnabled: boolean;
   setMixMasterEnabled: (enabled: boolean) => void;
+
+  /** Effective Mix & Master stage settings for the active
+   *  project — stored values win; unset reads as both stages ON
+   *  at 100%. Only matters while `mixMasterEnabled` is on; the
+   *  toggles and intensities come with the Stage 3 screen. */
+  mixMasterStages: MixMasterStageSettings;
+  setMixMasterStages: (patch: Partial<MixMasterStageSettings>) => void;
 
   /** The active project's lyrics (song-frame timed lines + style). */
   lyrics: ProjectLyrics | null;
@@ -515,6 +523,21 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchActiveProject],
   );
 
+  // Mix & Master stage settings (Stage 2): the resolved set for
+  // the active project — stored partial values merged over the
+  // defaults (both stages ON at 100%). The setter patches the
+  // stored object, so a toggle/intensity change re-renders the
+  // processed song (the native cache key includes the settings).
+  const mixMasterStages = resolveMixMasterStageSettings(activeProject?.mixMasterStages);
+
+  const setMixMasterStages = useCallback(
+    (patch: Partial<MixMasterStageSettings>) => {
+      const current = resolveMixMasterStageSettings(activeProjectRef.current?.mixMasterStages);
+      patchActiveProject({ mixMasterStages: { ...current, ...patch } });
+    },
+    [patchActiveProject],
+  );
+
   // ---- Lyrics (song-frame timed; see src/lib/lyrics.ts) ----
   const lyrics = activeProject?.lyrics ?? null;
   const lyricsEnabled = activeProject?.lyricsEnabled ?? ((activeProject?.lyrics?.lines.length ?? 0) > 0);
@@ -836,6 +859,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setAutoEqEnabled,
       mixMasterEnabled,
       setMixMasterEnabled,
+      mixMasterStages,
+      setMixMasterStages,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,
@@ -926,6 +951,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setAutoEqEnabled,
       mixMasterEnabled,
       setMixMasterEnabled,
+      mixMasterStages,
+      setMixMasterStages,
       lyrics,
       lyricsEnabled,
       setLyricsEnabled,

@@ -468,7 +468,13 @@ interface NativeMvmtCompositorModule {
   ): Promise<TakeSyncMeasurement>;
   waveformPeaks(uri: string, buckets: number): Promise<WaveformPeaks | null>;
   prepareEqSong(uri: string): Promise<string>;
-  prepareMixMasterSong(uri: string): Promise<string>;
+  prepareMixMasterSong(
+    uri: string,
+    correctiveEnabled: boolean,
+    correctiveIntensity: number,
+    masterEnabled: boolean,
+    masterIntensity: number,
+  ): Promise<string>;
   isCaptureAvailable(): boolean;
   startCapture(args: CaptureStartArgs): Promise<void>;
   stopCapture(): Promise<CaptureResult>;
@@ -644,11 +650,28 @@ export async function prepareEqSong(uri: string): Promise<string> {
  * the original file.
  *
  * @param uri The original song file (`file://` URI or absolute path).
+ * @param correctiveEnabled / correctiveIntensity / masterEnabled /
+ *   masterIntensity Per-stage controls (Stage 2): each stage's
+ *   toggle and intensity (0–100, scaling that stage's gains
+ *   toward 0). The native side clamps them; the cache key
+ *   includes them, so a settings change re-renders.
  */
-export async function prepareMixMasterSong(uri: string): Promise<string> {
+export async function prepareMixMasterSong(
+  uri: string,
+  correctiveEnabled: boolean,
+  correctiveIntensity: number,
+  masterEnabled: boolean,
+  masterIntensity: number,
+): Promise<string> {
   if (!nativeModule || typeof nativeModule.prepareMixMasterSong !== 'function') return uri;
   try {
-    const result = await nativeModule.prepareMixMasterSong(uri);
+    const result = await nativeModule.prepareMixMasterSong(
+      uri,
+      correctiveEnabled,
+      correctiveIntensity,
+      masterEnabled,
+      masterIntensity,
+    );
     return typeof result === 'string' && result.length > 0 ? result : uri;
   } catch {
     return uri;

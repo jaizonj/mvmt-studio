@@ -3180,7 +3180,10 @@ private enum MvmtCompositorEngine {
   /// Recipe version for the Stage 1 analysis + render. Part of the
   /// cache key; bump when the window layout, gain logic or render
   /// chain changes.
-  private static let mixMasterProfileVersion = 1
+  /// Bumped to 2 in Stage 2: the Master EQ stage joined the
+  /// chain, so Stage 1 renders must never be served for Stage 2
+  /// settings. Mirrors MIX_MASTER_PROFILE_VERSION.
+  private static let mixMasterProfileVersion = 2
 
   /// Analysis windows: 1.0 s long, 50% overlap — a new analysis
   /// point every 0.5 s.
@@ -3205,6 +3208,24 @@ private enum MvmtCompositorEngine {
   /// as the harsh bands (250 Hz, 500 Hz).
   private static let mmMudBandIndices: Set<Int> = [1, 2]
 
+  /// Master EQ target curve, dB per band (same band order as
+  /// Auto EQ: 125, 250, 500, 1k, 2k, 3k, 4k, 6k, 8k, 12k Hz): a
+  /// slight low-end shelf, flat mids, a gentle high shelf. A
+  /// constant, tuned by ear on device — not per-song magic.
+  /// Mirrors MM_MASTER_TARGET_DB in src/lib/mixMasterCurve.ts.
+  private static let mmMasterTargetDb: [Double] = [
+    1.5, 1.0, 0.5, 0, 0, 0, 0, 0.5, 1.0, 1.5,
+  ]
+  /// Master EQ gain clamp, dB — cuts AND boosts are allowed here.
+  private static let mmMasterMaxGainDb = 3.0
+  /// A song quieter than this broadband takes no master EQ at all.
+  private static let mmMasterSilenceDbfs = -60.0
+  /// Corrected band levels at or below this floor count as no energy.
+  private static let mmMasterLevelFloorDb = -80.0
+  /// A band carries energy when its corrected level is within this
+  /// many dB of the loudest band.
+  private static let mmMasterActiveBelowPeakDb = 25.0
+
   private struct MixMasterWindowRecord: Codable {
     var timeSeconds: Double
     var gainsDb: [Double]
@@ -3217,6 +3238,44 @@ private enum MvmtCompositorEngine {
     var reason: String
   }
 
+  /// Per-stage controls (Stage 2), as stored in the profile and
+  /// as passed in from JS (resolved there; the native resolver
+  /// below is the backstop for direct callers). The master switch
+  /// is separate (`mixMasterEnabled` on the project): these only
+  /// matter while the suite is on. Unset reads as both stages ON
+  /// at full intensity.
+  private struct MixMasterStageSettingsRecord: Codable {
+    var correctiveEnabled: Bool
+    var correctiveIntensity: Double
+    var masterEnabled: Bool
+    var masterIntensity: Double
+  }
+
+  /// Clamp raw bridge arguments to the effective settings set.
+  private static func resolveMmStageSettings(
+    correctiveEnabled: Bool,
+    correctiveIntensity: Double,
+    masterEnabled: Bool,
+    masterIntensity: Double
+  ) -> MixMasterStageSettingsRecord {
+    func intensity(_ value: Double) -> Double {
+      value.isFinite ? min(100, max(0, value)) : 100
+    }
+    return MixMasterStageSettingsRecord(
+      correctiveEnabled: correctiveEnabled,
+      correctiveIntensity: intensity(correctiveIntensity),
+      masterEnabled: masterEnabled,
+      masterIntensity: intensity(masterIntensity)
+    )
+  }
+
+  /// Canonical cache-key fragment for a resolved settings set.
+  /// Mirrors mixMasterStageSettingsKey in mixMasterCurve.ts.
+  private static func mmStageSettingsKey(_ settings: MixMasterStageSettingsRecord) -> String {
+    "c\(settings.correctiveEnabled ? 1 : 0):\(Int(settings.correctiveIntensity))" +
+      "|m\(settings.masterEnabled ? 1 : 0):\(Int(settings.masterIntensity))"
+  }
+
   private struct MixMasterProfileRecord: Codable {
     var version: Int
     var songKey: String
@@ -3224,6 +3283,10 @@ private enum MvmtCompositorEngine {
     var durationSeconds: Double
     var windows: [MixMasterWindowRecord]
     var findings: [MixMasterFindingRecord]
+    /// Master EQ gains as applied (post toggle/intensity).
+    var masterGainsDb: [Double]
+    /// The stage settings the render was made with.
+    var stages: MixMasterStageSettingsRecord
   }
 
   /// Smooths raw per-window gains: (a) a 3-point moving average
@@ -3281,6 +3344,69 @@ private enum MvmtCompositorEngine {
     return last.gainsDb
   }
 
+  /// Mean applied corrective gain per band, over the stored
+  /// windows. Mirrors meanGainPerBand in mixMasterCurve.ts.
+  private static func mmMeanGains(_ windows: [MixMasterWindowRecord]) -> [Double] {
+    let bandCount = eqBandCentersHz.count
+    guard !windows.isEmpty else { return [Double](repeating: 0, count: bandCount) }
+    var sums = [Double](repeating: 0, count: bandCount)
+    for window in windows {
+      for b in 0..<bandCount {
+        sums[b] += window.gainsDb[b]
+      }
+    }
+    return sums.map { $0 / Double(windows.count) }
+  }
+
+  /// The Master EQ gain set for a song: one static gain per band,
+  /// driving the whole-song balance toward the target curve.
+  /// Mirrors computeMasterGains in mixMasterCurve.ts exactly
+  /// (same order of operations): the balance is measured on the
+  /// CORRECTED signal (raw overall level + mean applied
+  /// corrective gain per band), the reference is the mean of
+  /// (corrected level − target) over the bands that carry energy
+  /// (peak-relative, within 25 dB of the loudest band), gains are
+  /// clamped to ±3 dB, and a near-silent song gets no master EQ.
+  /// Returns the RAW master gains (pre toggle/intensity) — the
+  /// caller scales them.
+  private static func mmMasterGains(
+    overallLevelsDb: [Double],
+    meanCorrectiveGainsDb: [Double],
+    broadbandDbfs: Double
+  ) -> [Double] {
+    let bandCount = eqBandCentersHz.count
+    guard overallLevelsDb.count == bandCount,
+          meanCorrectiveGainsDb.count == bandCount
+    else {
+      return [Double](repeating: 0, count: bandCount)
+    }
+    guard broadbandDbfs >= mmMasterSilenceDbfs else {
+      return [Double](repeating: 0, count: bandCount)
+    }
+    let floored = overallLevelsDb.enumerated().map { (b, level) in
+      max(level + meanCorrectiveGainsDb[b], mmMasterLevelFloorDb)
+    }
+    guard let peak = floored.max() else {
+      return [Double](repeating: 0, count: bandCount)
+    }
+    let active = floored.map { $0 > peak - mmMasterActiveBelowPeakDb }
+    var referenceSum = 0.0
+    var activeCount = 0
+    for b in 0..<bandCount where active[b] {
+      referenceSum += floored[b] - mmMasterTargetDb[b]
+      activeCount += 1
+    }
+    guard activeCount > 0 else {
+      return [Double](repeating: 0, count: bandCount)
+    }
+    let reference = referenceSum / Double(activeCount)
+    return floored.enumerated().map { (b, level) in
+      guard active[b] else { return 0 }
+      let gain = reference + mmMasterTargetDb[b] - level
+      return max(-mmMasterMaxGainDb, min(mmMasterMaxGainDb, gain))
+    }
+  }
+
   /// The on-disk home of one Mix & Master render + profile:
   /// Application Support, keyed by an FNV-1a hash of the cache key
   /// (same scheme as the Auto EQ cache, separate directory).
@@ -3326,16 +3452,32 @@ private enum MvmtCompositorEngine {
     }
   }
 
-  /// Mix & Master Stage 1 entry point (bridge:
-  /// `prepareMixMasterSong`). Returns the URI composition builds
-  /// should use for this song: a cached, dynamically-EQ'd copy when
-  /// the song measures harsh or muddy anywhere, or the ORIGINAL uri
-  /// when it doesn't — and the original on ANY failure. Never
-  /// throws, so a preview or export can never be blocked on it.
-  /// Only composition builds consume the result; capture,
-  /// record-time playback and the sync measurement always use the
-  /// original file.
-  static func prepareMixMasterSong(_ uri: String) async -> String {
+  /// Mix & Master entry point (bridge: `prepareMixMasterSong`).
+  /// Returns the URI composition builds should use for this song:
+  /// a cached, processed copy when either stage has anything to
+  /// do, or the ORIGINAL uri when it doesn't — and the original
+  /// on ANY failure. Never throws, so a preview or export can
+  /// never be blocked on it. Only composition builds consume the
+  /// result; capture, record-time playback and the sync
+  /// measurement always use the original file.
+  ///
+  /// Stage 2: the chain is [dynamic corrective EQ] → [static
+  /// Master EQ], each with its own toggle + intensity. The
+  /// settings ride the cache key, so a settings change re-renders
+  /// and identical settings never re-render twice.
+  static func prepareMixMasterSong(
+    _ uri: String,
+    correctiveEnabled: Bool,
+    correctiveIntensity: Double,
+    masterEnabled: Bool,
+    masterIntensity: Double
+  ) async -> String {
+    let settings = resolveMmStageSettings(
+      correctiveEnabled: correctiveEnabled,
+      correctiveIntensity: correctiveIntensity,
+      masterEnabled: masterEnabled,
+      masterIntensity: masterIntensity
+    )
     let sourceURL = resolveURL(uri)
     guard sourceURL.isFileURL else { return uri }
     let attrs = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
@@ -3343,7 +3485,7 @@ private enum MvmtCompositorEngine {
     let fileMtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
     guard fileSize > 0 else { return uri }
     let cacheKey =
-      "\(sourceURL.path)|\(fileSize)|\(fileMtime)|mmv\(mixMasterProfileVersion)"
+      "\(sourceURL.path)|\(fileSize)|\(fileMtime)|mmv\(mixMasterProfileVersion)|\(mmStageSettingsKey(settings))"
     if let cached = EqRenderCache.shared.get(cacheKey) {
       return cached
     }
@@ -3353,7 +3495,7 @@ private enum MvmtCompositorEngine {
       // Render cached; make sure its profile is beside it (an
       // interrupted earlier run could have left the WAV without one).
       if !FileManager.default.fileExists(atPath: profileURL.path),
-         let analysis = await analyzeMixMaster(asset: AVURLAsset(url: sourceURL)) {
+         let analysis = await analyzeMixMaster(asset: AVURLAsset(url: sourceURL), settings: settings) {
         writeMixMasterProfile(
           MixMasterProfileRecord(
             version: mixMasterProfileVersion,
@@ -3361,7 +3503,9 @@ private enum MvmtCompositorEngine {
             sampleRate: analysis.sampleRate,
             durationSeconds: analysis.durationSeconds,
             windows: analysis.windows,
-            findings: analysis.findings
+            findings: analysis.findings,
+            masterGainsDb: analysis.masterGainsDb,
+            stages: settings
           ),
           to: profileURL
         )
@@ -3369,17 +3513,24 @@ private enum MvmtCompositorEngine {
       EqRenderCache.shared.set(cacheKey, outputURL.absoluteString)
       return outputURL.absoluteString
     }
-    guard let analysis = await analyzeMixMaster(asset: AVURLAsset(url: sourceURL)) else {
+    guard let analysis = await analyzeMixMaster(asset: AVURLAsset(url: sourceURL), settings: settings) else {
       return uri
     }
-    // Nothing worth cutting anywhere: the original IS the answer
+    // Nothing worth changing anywhere: the original IS the answer
     // (and what the session remembers, so the song isn't
-    // re-analyzed on every preview rebuild).
-    if analysis.windows.allSatisfy({ $0.gainsDb.allSatisfy({ $0 == 0 }) }) {
+    // re-analyzed on every preview rebuild). Both stages count —
+    // a master-only correction still renders.
+    if analysis.windows.allSatisfy({ $0.gainsDb.allSatisfy({ $0 == 0 }) })
+        && analysis.masterGainsDb.allSatisfy({ $0 == 0 }) {
       EqRenderCache.shared.set(cacheKey, uri)
       return uri
     }
-    guard renderMixMasterSong(sourceURL: sourceURL, windows: analysis.windows, outputURL: outputURL) else {
+    guard renderMixMasterSong(
+      sourceURL: sourceURL,
+      windows: analysis.windows,
+      masterGainsDb: analysis.masterGainsDb,
+      outputURL: outputURL
+    ) else {
       return uri
     }
     writeMixMasterProfile(
@@ -3389,7 +3540,9 @@ private enum MvmtCompositorEngine {
         sampleRate: analysis.sampleRate,
         durationSeconds: analysis.durationSeconds,
         windows: analysis.windows,
-        findings: analysis.findings
+        findings: analysis.findings,
+        masterGainsDb: analysis.masterGainsDb,
+        stages: settings
       ),
       to: profileURL
     )
@@ -3415,11 +3568,20 @@ private enum MvmtCompositorEngine {
   /// Overlapping windows are handled with two live accumulators:
   /// each sample's filtered energy lands in every window that
   /// covers it.
+  ///
+  /// Stage 2: the same decode pass also accumulates the
+  /// WHOLE-SONG band levels for the Master EQ, and the returned
+  /// windows are the APPLIED gains (smoothed, then scaled by the
+  /// corrective stage's toggle/intensity). The master gains are
+  /// computed from the corrected overall levels (see the tail of
+  /// this function). `settings` is already resolved.
   private static func analyzeMixMaster(
-    asset: AVURLAsset
+    asset: AVURLAsset,
+    settings: MixMasterStageSettingsRecord
   ) async -> (
     windows: [MixMasterWindowRecord],
     findings: [MixMasterFindingRecord],
+    masterGainsDb: [Double],
     sampleRate: Double,
     durationSeconds: Double
   )? {
@@ -3547,6 +3709,13 @@ private enum MvmtCompositorEngine {
       rawWindows.append((timeSeconds, gainsDb))
     }
 
+    // Whole-song accumulators for the Master EQ (Stage 2): the
+    // same filtered values, summed over the entire decode, so the
+    // master stage measures the full song in the same pass.
+    var wholeBandSums = zeroBandSums()
+    var wholeRawSums = [Double](repeating: 0, count: measuredChannels)
+    var wholeFrames = 0
+
     var active: [WindowAccumulator] = [
       WindowAccumulator(startFrame: 0, bandSums: zeroBandSums(), rawSums: [Double](repeating: 0, count: measuredChannels), frames: 0)
     ]
@@ -3596,10 +3765,18 @@ private enum MvmtCompositorEngine {
               active[w].bandSums[channel][band] += f * f
             }
           }
+          // Whole-song accumulators (Master EQ): same values,
+          // summed over the entire decode.
+          wholeRawSums[channel] += sample * sample
+          for band in 0..<bandCount where measurable[band] {
+            let f = filtered[band]
+            wholeBandSums[channel][band] += f * f
+          }
         }
         for w in active.indices {
           active[w].frames += 1
         }
+        wholeFrames += 1
         frameIndex += 1
         while let first = active.first, frameIndex >= first.startFrame + windowFrames {
           flushWindow(first)
@@ -3629,6 +3806,19 @@ private enum MvmtCompositorEngine {
     if let lastTime = rawWindows.last?.timeSeconds {
       findings.removeAll { $0.timeSeconds > lastTime }
     }
+    // Findings report the cuts that will actually be rendered:
+    // scale them by the corrective stage's intensity (and drop
+    // them entirely when the stage is off), so the "what changed
+    // and why" list never claims a cut that never happened.
+    let correctiveFactor = settings.correctiveEnabled
+      ? settings.correctiveIntensity / 100 : 0
+    findings = findings
+      .map { finding in
+        var scaled = finding
+        scaled.cutDb *= correctiveFactor
+        return scaled
+      }
+      .filter { $0.cutDb >= mmFindingMinCutDb }
     findings.sort { $0.cutDb > $1.cutDb }
     if findings.count > mmMaxFindings {
       findings = Array(findings.prefix(mmMaxFindings))
@@ -3636,24 +3826,62 @@ private enum MvmtCompositorEngine {
     findings.sort { $0.timeSeconds < $1.timeSeconds }
 
     let smoothed = smoothMmGains(rawWindows.map { $0.gainsDb })
+    // The stored windows are the APPLIED gains: smoothed, then
+    // scaled by the corrective stage's intensity (0 when off), so
+    // the profile and the render always agree.
     let windows = zip(rawWindows, smoothed).map {
-      MixMasterWindowRecord(timeSeconds: $0.0.timeSeconds, gainsDb: $0.1)
+      MixMasterWindowRecord(
+        timeSeconds: $0.0.timeSeconds,
+        gainsDb: $0.1.map { $0 * correctiveFactor }
+      )
     }
+    // Master EQ (Stage 2): the whole-song balance vs the target
+    // curve, measured on the CORRECTED levels — the raw overall
+    // level plus the mean applied corrective gain per band.
+    let meanCorrective = mmMeanGains(windows)
+    var overallLevelsDb = [Double](repeating: -120, count: bandCount)
+    var wholeBroadbandDb = -120.0
+    if wholeFrames > 0 {
+      let wholeBroadbandEnergy =
+        wholeRawSums.reduce(0, +) / Double(measuredChannels) / Double(wholeFrames)
+      if wholeBroadbandEnergy > 0 {
+        wholeBroadbandDb = 10.0 * log10(wholeBroadbandEnergy)
+      }
+      for band in 0..<bandCount where measurable[band] {
+        var energy = 0.0
+        for channel in 0..<measuredChannels {
+          energy += wholeBandSums[channel][band]
+        }
+        energy /= Double(measuredChannels) * Double(wholeFrames)
+        if energy > 0 {
+          overallLevelsDb[band] = 10.0 * log10(energy)
+        }
+      }
+    }
+    let masterFactor = settings.masterEnabled ? settings.masterIntensity / 100 : 0
+    let masterGainsDb = mmMasterGains(
+      overallLevelsDb: overallLevelsDb,
+      meanCorrectiveGainsDb: meanCorrective,
+      broadbandDbfs: wholeBroadbandDb
+    ).map { $0 * masterFactor }
     return (
       windows: windows,
       findings: findings,
+      masterGainsDb: masterGainsDb,
       sampleRate: sampleRate,
       durationSeconds: durationSeconds
     )
   }
 
-  /// Renders the full song through an AVAudioUnitEQ in offline
-  /// manual-rendering mode, with the band gains driven by the
+  /// Renders the full song through TWO AVAudioUnitEQs in offline
+  /// manual-rendering mode — [dynamic corrective EQ] → [static
+  /// Master EQ] — with the corrective band gains driven by the
   /// smoothed curve: before each 4096-frame block the engine sets
   /// every band's gain from the curve at that block's timestamp
-  /// (linear interpolation between analysis points). The EQ unit
-  /// stays attached for the whole render, so its filter state is
-  /// continuous and the gains move at most the slew limit between
+  /// (linear interpolation between analysis points). The master
+  /// gains are static, set once at setup. Both units stay attached
+  /// for the whole render, so their filter state is continuous and
+  /// the corrective gains move at most the slew limit between
   /// blocks — no clicks, no per-second switching. Bands are never
   /// bypassed (a band at 0 dB at the song's start may cut later in
   /// the song; a 0 dB band is sonically inert anyway). Otherwise
@@ -3663,11 +3891,13 @@ private enum MvmtCompositorEngine {
   private static func renderMixMasterSong(
     sourceURL: URL,
     windows: [MixMasterWindowRecord],
+    masterGainsDb: [Double],
     outputURL: URL
   ) -> Bool {
     let tempURL = outputURL.deletingPathExtension()
       .appendingPathExtension("tmp-\(UUID().uuidString).wav")
     defer { try? FileManager.default.removeItem(at: tempURL) }
+    guard masterGainsDb.count == eqBandCentersHz.count else { return false }
     do {
       let sourceFile = try AVAudioFile(forReading: sourceURL)
       let format = sourceFile.processingFormat
@@ -3679,10 +3909,13 @@ private enum MvmtCompositorEngine {
       let engine = AVAudioEngine()
       let player = AVAudioPlayerNode()
       let eq = AVAudioUnitEQ(numberOfBands: eqBandCentersHz.count)
+      let masterEq = AVAudioUnitEQ(numberOfBands: eqBandCentersHz.count)
       engine.attach(player)
       engine.attach(eq)
+      engine.attach(masterEq)
       engine.connect(player, to: eq, format: format)
-      engine.connect(eq, to: engine.mainMixerNode, format: format)
+      engine.connect(eq, to: masterEq, format: format)
+      engine.connect(masterEq, to: engine.mainMixerNode, format: format)
       let initialGains = mmGainAtTime(windows: windows, timeSeconds: 0)
       for (index, band) in eq.bands.enumerated() {
         band.filterType = .parametric
@@ -3694,6 +3927,18 @@ private enum MvmtCompositorEngine {
         band.bypass = false
       }
       eq.globalGain = 0  // cuts only — no makeup boost, ever
+      // Master EQ (Stage 2): static gains, set once — the whole
+      // song's balance against the target curve. Same band setup
+      // as the corrective unit; a 0 dB band is inert, so the unit
+      // stays in the chain even when the stage is off.
+      for (index, band) in masterEq.bands.enumerated() {
+        band.filterType = .parametric
+        band.frequency = Float(min(eqBandCentersHz[index], format.sampleRate * 0.45))
+        band.bandwidth = 1.0
+        band.gain = Float(masterGainsDb[index])
+        band.bypass = false
+      }
+      masterEq.globalGain = 0
 
       let outputSettings: [String: Any] = [
         AVFormatIDKey: kAudioFormatLinearPCM,
@@ -7744,8 +7989,20 @@ public class MvmtCompositorModule: Module {
       await MvmtCompositorEngine.prepareEqSong(uri)
     }
 
-    AsyncFunction("prepareMixMasterSong") { (uri: String) -> String in
-      await MvmtCompositorEngine.prepareMixMasterSong(uri)
+    AsyncFunction("prepareMixMasterSong") { (
+      uri: String,
+      correctiveEnabled: Bool,
+      correctiveIntensity: Double,
+      masterEnabled: Bool,
+      masterIntensity: Double
+    ) -> String in
+      await MvmtCompositorEngine.prepareMixMasterSong(
+        uri,
+        correctiveEnabled: correctiveEnabled,
+        correctiveIntensity: correctiveIntensity,
+        masterEnabled: masterEnabled,
+        masterIntensity: masterIntensity
+      )
     }
 
     Function("isCaptureAvailable") { () -> Bool in

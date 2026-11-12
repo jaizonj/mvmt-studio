@@ -108,6 +108,7 @@ export default function ExportScreen() {
     autoEqEnabled,
     setAutoEqEnabled,
     mixMasterEnabled,
+    mixMasterStages,
     watermarkEnabled,
   } = studio;
 
@@ -135,7 +136,7 @@ export default function ExportScreen() {
   // as the Editor — the dynamic curve already contains Auto EQ's
   // static cut per window). Off by default; the toggle comes with
   // the Stage 3 screen.
-  const mmSongUri = useMixMasterSongUri(edl?.audio.uri, mixMasterEnabled);
+  const mmSongUri = useMixMasterSongUri(edl?.audio.uri, mixMasterEnabled, mixMasterStages);
   const songUri = mixMasterEnabled ? mmSongUri : eqSongUri;
 
   const engineAvailable = isCompositorAvailable();

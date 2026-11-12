@@ -736,7 +736,7 @@ function EditorWorkspace() {
   // curve already contains the per-window version of Auto EQ's
   // static cut, so running both would cut twice. Off by default;
   // the toggle comes with the Stage 3 screen.
-  const mmSongUri = useMixMasterSongUri(edl?.audio.uri, studio.mixMasterEnabled);
+  const mmSongUri = useMixMasterSongUri(edl?.audio.uri, studio.mixMasterEnabled, studio.mixMasterStages);
   const songUri = studio.mixMasterEnabled ? mmSongUri : eqSongUri;
 
   const previewRequest = useMemo(() => {

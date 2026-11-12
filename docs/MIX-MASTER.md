@@ -148,6 +148,18 @@ no nested scroll views, no desktop panels.
   usable via the existing Auto EQ path for verification.
 - **Stage 2 — Master EQ**: whole-song analysis, static gains,
   second unit in the chain, per-stage toggles + intensity.
+  SHIPPED (commit pending, 2026-11-12): whole-song band levels
+  measured in the same decode pass as the windows; master gains
+  from the CORRECTED levels (raw + mean applied corrective gain
+  per band) vs the target curve (low shelf +1.5/+1/+0.5, flat
+  mids, high shelf +0.5/+1/+1.5), clamped ±3 dB, peak-relative
+  active-band reference (dead bands stay flat and out of the
+  reference); second AVAudioUnitEQ after the corrective unit,
+  static gains; per-stage toggle + intensity in
+  `Project.mixMasterStages` (unset = both ON at 100%), in the
+  cache key; profile gains `masterGainsDb` + `stages`. No UI yet
+  (Stage 3) — defaults keep Stage 1 behaviour when the master
+  stage is off.
 - **Stage 3 — Mix & Master UI**: the screen in Section 3, driven
   entirely by the stored profile; A/B compare; findings list.
 - **Stage 4 — Export**: WAV/AAC export, share sheet, "use in

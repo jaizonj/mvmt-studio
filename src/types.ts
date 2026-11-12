@@ -1,5 +1,7 @@
 import type { CameraType } from 'expo-camera';
 
+import type { MixMasterStageSettings } from './lib/mixMasterCurve';
+
 /** An audio file the user picked to perform to. Kept in the app's documents folder. */
 export interface AudioTrack {
   /** file:// URI inside the app sandbox (copied there on pick). */
@@ -431,6 +433,17 @@ export interface Project {
    * measurement always use the original song regardless.
    */
   mixMasterEnabled?: boolean;
+  /**
+   * Mix & Master Stage 2: per-stage controls for the corrective
+   * and master EQ stages (each stage's toggle + intensity,
+   * 0–100%). Undefined = both stages ON at 100% (see
+   * resolveMixMasterStageSettings in src/lib/mixMasterCurve.ts).
+   * Only matters while `mixMasterEnabled` is on; the toggles and
+   * intensities come with the Stage 3 screen. The native cache
+   * key includes the resolved settings, so a settings change
+   * re-renders the processed song.
+   */
+  mixMasterStages?: MixMasterStageSettings;
   /** When the project's video was last successfully rendered (Export stamps it). */
   exportedAt?: number;
 }
