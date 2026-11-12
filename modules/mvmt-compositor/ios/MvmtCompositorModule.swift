@@ -27,6 +27,19 @@ struct CompositeClipRecord: Record {
   @Field
   var speed: Double = 1.0
 
+  /// Transition INTO this clip from the previous one (Edit Modes
+  /// Stage 3): 'dip' | 'crossfade'. Nil = hard cut. The first
+  /// clip's fields are ignored (no boundary there).
+  @Field
+  var transitionInKind: String? = nil
+
+  /// Effective half-width of the transition in seconds, computed
+  /// by transitionWindows in src/lib/edl.ts (clamped so windows
+  /// never overlap and never exceed the neighbouring cuts).
+  /// Nil/<=0 = hard cut.
+  @Field
+  var transitionInHalfSeconds: Double? = nil
+
   @Field
   var muted: Bool = false
 
@@ -1013,6 +1026,29 @@ private enum MvmtCompositorEngine {
     // master track gets its own track (it spans everything).
     var compositionClipAudioTrack: AVMutableCompositionTrack?
 
+    // Second video track (Edit Modes Stage 3), created lazily only
+    // when a cross-dissolve needs it: the incoming clip's head is
+    // inserted here, time-aligned with the main track, so the
+    // dissolve can blend the outgoing tail into the incoming head.
+    // A composition with no crossfade never creates it.
+    var compositionVideoTrack2: AVMutableCompositionTrack?
+
+    func overlayVideoTrack() throws -> AVMutableCompositionTrack {
+      if let existing = compositionVideoTrack2 {
+        return existing
+      }
+      guard
+        let track = composition.addMutableTrack(
+          withMediaType: .video,
+          preferredTrackID: kCMPersistentTrackID_Invalid
+        )
+      else {
+        throw compositorError("Could not create the composition overlay video track.")
+      }
+      compositionVideoTrack2 = track
+      return track
+    }
+
     func clipAudioTrack() throws -> AVMutableCompositionTrack {
       if let existing = compositionClipAudioTrack {
         return existing
@@ -1033,6 +1069,12 @@ private enum MvmtCompositorEngine {
     var segmentRanges: [CMTimeRange] = []
     var segmentTransforms: [CGAffineTransform] = []
     var clipAudioMixParameters: AVMutableAudioMixInputParameters?
+    /// Per clip, whether its cross-dissolve head was actually
+    /// inserted on track 2 (Edit Modes Stage 3). A boundary whose
+    /// head insert failed renders as a dip instead — the
+    /// instruction builder below reads this, never the request
+    /// alone.
+    var crossfadeActive = [Bool](repeating: false, count: clips.count)
 
     // ---- Video (and clip audio), sequentially at the cursor ----
     for (index, clip) in clips.enumerated() {
@@ -1092,6 +1134,66 @@ private enum MvmtCompositorEngine {
           toDuration: scaledDuration,
           "Clip \(index + 1)'s video could not be retimed"
         )
+      }
+
+      // Cross-dissolve head (Edit Modes Stage 3): the incoming
+      // clip's head on the second track, time-aligned with the
+      // main track — at composition time t it shows the source
+      // frame the main track shows at t, so the dissolve blends
+      // the outgoing tail into the incoming head and lands exactly
+      // on the incoming clip when it ends. Source range
+      // [start − h·speed, start + h·speed] over
+      // [boundary − h, boundary + h] (cursor is the boundary
+      // here), clamped to what the source actually holds: a take
+      // with no pre-roll footage starts its head later (the
+      // dissolve's early part is dip-like), and a head that cannot
+      // be inserted at all degrades this boundary to a dip
+      // instead (see crossfadeActive — the failure is caught, it
+      // never fails the build).
+      if index > 0, clip.transitionInKind == "crossfade",
+        let halfSeconds = clip.transitionInHalfSeconds, halfSeconds > 0
+      {
+        let headSourceStart = clampedStart - halfSeconds * speed
+        let headSourceEnd = min(clampedStart + halfSeconds * speed, sourceLimitSeconds)
+        let headStart = max(0, headSourceStart)
+        let headDurationSeconds = headSourceEnd - headStart
+        if headDurationSeconds > 0.01 {
+          // Where the clamped head begins on the composition
+          // timeline: the head is shifted later by exactly the
+          // source frames lost to the clamp, at the clip's rate.
+          let headCompStartSeconds =
+            CMTimeGetSeconds(cursor) - halfSeconds + (headStart - headSourceStart) / speed
+          let headCompEndSeconds = CMTimeGetSeconds(cursor) + halfSeconds
+          let headCompDurationSeconds = headCompEndSeconds - headCompStartSeconds
+          if headCompDurationSeconds > 0.01 {
+            do {
+              let track2 = try overlayVideoTrack()
+              let headRange = CMTimeRange(
+                start: CMTime(seconds: headStart, preferredTimescale: timescale),
+                duration: CMTime(seconds: headDurationSeconds, preferredTimescale: timescale)
+              )
+              try insertTimeRangeGuarded(
+                into: track2, headRange, of: sourceVideoTrack,
+                at: CMTime(seconds: headCompStartSeconds, preferredTimescale: timescale),
+                "Clip \(index + 1)'s dissolve head could not be added to the composition"
+              )
+              if abs(speed - 1.0) > 0.001 {
+                try scaleTimeRangeGuarded(
+                  track2,
+                  CMTimeRange(
+                    start: CMTime(seconds: headCompStartSeconds, preferredTimescale: timescale),
+                    duration: CMTime(seconds: headDurationSeconds, preferredTimescale: timescale)
+                  ),
+                  toDuration: CMTime(seconds: headCompDurationSeconds, preferredTimescale: timescale),
+                  "Clip \(index + 1)'s dissolve head could not be retimed"
+                )
+              }
+              crossfadeActive[index] = true
+            } catch {
+              crossfadeActive[index] = false
+            }
+          }
+        }
       }
 
       // Normalise this segment into the project canvas: apply the
@@ -1228,21 +1330,148 @@ private enum MvmtCompositorEngine {
     }
 
     // ---- Video composition: per-segment layer instructions carrying
-    // the normalised canvas transforms ----
+    // the normalised canvas transforms, plus Edit Modes Stage 3
+    // transitions (opacity ramps on the boundary instructions).
+    //
+    // A transition lives on the boundary INTO segment i, with
+    // effective half-width h (seconds, from the request — the JS
+    // side clamped it so windows never overlap):
+    //  • dip: the outgoing instruction fades 1→0 over [B−h, B]
+    //    and the incoming fades 0→1 over [B, B+h]. No time is
+    //    added — the cut's total length and the song sync are
+    //    untouched, and the background behind a faded layer is
+    //    black, so the dip reads as a fade through black.
+    //  • crossfade (head inserted on track 2): the boundary
+    //    splits into four spans — [B−h, B] blends track 1
+    //    (outgoing, 1→0.5) over track 2 (incoming head, 0→0.5),
+    //    [B, B+h] blends track 1 (incoming, 0.5→0) over track 2
+    //    (incoming head, 0.5→1). The track-2 head is time-aligned
+    //    with the main track, so the dissolve lands exactly on
+    //    the incoming clip. A crossfade whose head insert failed
+    //    degrades to a dip (crossfadeActive, above).
+    //  • a boundary with no transition is a hard cut, exactly as
+    //    before: one instruction per segment, one opaque layer.
+    //
+    // Halves are re-clamped here, symmetrically, against the
+    // built segment durations (the JS side already did this —
+    // belt-and-braces for a stale or hand-built request, so a
+    // bad half can never split a span out of existence).
     let videoComposition = AVMutableVideoComposition()
     videoComposition.renderSize = canvasSize
     // The render grid is exactly the request's frame rate (the EDL's
     // 30fps grid) — the verified composition shape. (Round 3 sampled
     // at max(frameRate, 60); reverted with the Edit-screen crash fix.)
     videoComposition.frameDuration = CMTime(seconds: 1.0 / frameRate, preferredTimescale: timescale)
-    videoComposition.instructions = segmentRanges.enumerated().map { index, range in
+    var effectiveHalf = clips.map { max(0, $0.transitionInHalfSeconds ?? 0) }
+    for i in 1..<clips.count where effectiveHalf[i] > 0 {
+      let prevDur = segmentRanges[i - 1].duration.seconds
+      let nextDur = segmentRanges[i].duration.seconds
+      effectiveHalf[i] = min(effectiveHalf[i], prevDur, nextDur)
+    }
+    if clips.count > 2 {
+      for i in 1..<(clips.count - 1) where effectiveHalf[i] > 0 && effectiveHalf[i + 1] > 0 {
+        let gap = segmentRanges[i].duration.seconds
+        if effectiveHalf[i] + effectiveHalf[i + 1] > gap {
+          let cap = gap / 2
+          effectiveHalf[i] = min(effectiveHalf[i], cap)
+          effectiveHalf[i + 1] = min(effectiveHalf[i + 1], cap)
+        }
+      }
+    }
+    /// One layer of one instruction: a track, its canvas
+    /// transform, and the opacity ramps over it (each a
+    /// (start, end, range) triple; empty = fully opaque).
+    struct LayerSpec {
+      var track: AVMutableCompositionTrack
+      var transform: CGAffineTransform
+      var opacityRamps: [(Float, Float, CMTimeRange)] = []
+    }
+    func makeInstruction(range: CMTimeRange, layers: [LayerSpec]) -> AVMutableVideoCompositionInstruction {
       let instruction = AVMutableVideoCompositionInstruction()
       instruction.timeRange = range
-      let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
-      layerInstruction.setTransform(segmentTransforms[index], at: range.start)
-      instruction.layerInstructions = [layerInstruction]
+      instruction.layerInstructions = layers.map { spec in
+        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: spec.track)
+        layerInstruction.setTransform(spec.transform, at: range.start)
+        for (startOpacity, endOpacity, rampRange) in spec.opacityRamps {
+          layerInstruction.setOpacityRamp(
+            fromStartOpacity: startOpacity, toEndOpacity: endOpacity, timeRange: rampRange)
+        }
+        return layerInstruction
+      }
       return instruction
     }
+    var instructions: [AVMutableVideoCompositionInstruction] = []
+    for (index, range) in segmentRanges.enumerated() {
+      let inCross =
+        index > 0 && clips[index].transitionInKind == "crossfade" && effectiveHalf[index] > 0
+        && crossfadeActive[index]
+      let inDip =
+        index > 0 && effectiveHalf[index] > 0
+        && (clips[index].transitionInKind == "dip"
+          || (clips[index].transitionInKind == "crossfade" && !crossfadeActive[index]))
+      let outCross =
+        index + 1 < clips.count && clips[index + 1].transitionInKind == "crossfade"
+        && effectiveHalf[index + 1] > 0 && crossfadeActive[index + 1]
+      let outDip =
+        index + 1 < clips.count && effectiveHalf[index + 1] > 0
+        && (clips[index + 1].transitionInKind == "dip"
+          || (clips[index + 1].transitionInKind == "crossfade" && !crossfadeActive[index + 1]))
+      let hIn = (inCross || inDip) ? effectiveHalf[index] : 0
+      let hOut = (outCross || outDip) ? effectiveHalf[index + 1] : 0
+      let start = range.start
+      let end = range.end
+      // Head span — second half of the incoming crossfade: the
+      // incoming clip fades in on track 2 while the main track's
+      // copy of it fades out (they show the same frame, so the
+      // sum stays constant).
+      if inCross, let track2 = compositionVideoTrack2 {
+        let headRange = CMTimeRange(start: start, duration: CMTime(seconds: hIn, preferredTimescale: timescale))
+        instructions.append(makeInstruction(range: headRange, layers: [
+          LayerSpec(
+            track: compositionVideoTrack, transform: segmentTransforms[index],
+            opacityRamps: [(0.5, 0, headRange)]),
+          LayerSpec(
+            track: track2, transform: segmentTransforms[index],
+            opacityRamps: [(0.5, 1, headRange)]),
+        ]))
+      }
+      // Body span — the segment minus any crossfade head/tail.
+      // Dip ramps attach here (they never split spans).
+      let bodyStart = inCross ? CMTimeAdd(start, CMTime(seconds: hIn, preferredTimescale: timescale)) : start
+      let bodyEnd = outCross ? CMTimeSubtract(end, CMTime(seconds: hOut, preferredTimescale: timescale)) : end
+      if bodyEnd > bodyStart {
+        var ramps: [(Float, Float, CMTimeRange)] = []
+        if inDip {
+          ramps.append((0, 1, CMTimeRange(start: start, duration: CMTime(seconds: hIn, preferredTimescale: timescale))))
+        }
+        if outDip {
+          ramps.append((1, 0, CMTimeRange(
+            start: CMTimeSubtract(end, CMTime(seconds: hOut, preferredTimescale: timescale)),
+            duration: CMTime(seconds: hOut, preferredTimescale: timescale))))
+        }
+        instructions.append(makeInstruction(
+          range: CMTimeRange(start: bodyStart, end: bodyEnd),
+          layers: [LayerSpec(
+            track: compositionVideoTrack, transform: segmentTransforms[index], opacityRamps: ramps)]
+        ))
+      }
+      // Tail span — first half of the outgoing crossfade: the
+      // outgoing clip fades out on track 1 while the next clip's
+      // head fades in on track 2.
+      if outCross, let track2 = compositionVideoTrack2 {
+        let tailRange = CMTimeRange(
+          start: CMTimeSubtract(end, CMTime(seconds: hOut, preferredTimescale: timescale)), end: end)
+        instructions.append(makeInstruction(range: tailRange, layers: [
+          LayerSpec(
+            track: compositionVideoTrack, transform: segmentTransforms[index],
+            opacityRamps: [(1, 0.5, tailRange)]),
+          LayerSpec(
+            track: track2, transform: segmentTransforms[index + 1],
+            opacityRamps: [(0, 0.5, tailRange)]),
+        ]))
+      }
+    }
+    videoComposition.instructions = instructions
 
     var audioMix: AVMutableAudioMix?
     if includeAudioMix, !audioMixParameters.isEmpty {

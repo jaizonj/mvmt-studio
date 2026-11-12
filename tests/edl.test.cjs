@@ -31,6 +31,9 @@ const {
   segmentTimelineDurationFrames,
   segmentAtFrame,
   edlToCompositeRequest,
+  sanitizeTransitionIn,
+  transitionWindows,
+  DEFAULT_TRANSITION_DURATION_FRAMES,
   DEFAULT_FPS,
 } = require('./.build-edl/src/lib/edl.js');
 
@@ -620,6 +623,116 @@ function makeCut() {
 }
 
 const TAKE_IDS = ['calm', 'mid', 'wild'];
+
+/** An EDL with segments of the given SOURCE durations (1x, so
+ *  timeline == source), one take; `transitionIns` maps a segment
+ *  index to its entry transition. */
+function makeEdl(durations, transitionIns = {}) {
+  return layoutSegments(
+    durations.map((d, i) => ({
+      id: `seg-${i + 1}`,
+      takeId: 'calm',
+      sourceStartFrame: i * 1000,
+      durationFrames: d,
+      ...(transitionIns[i] ? { transitionIn: transitionIns[i] } : {}),
+    })),
+    emptyEdl(FPS),
+  );
+}
+
+test('transitions: transitionIn round-trips through layout, validate and JSON', () => {
+  const edl = makeEdl(
+    [90, 90, 90],
+    { 1: { kind: 'dip', durationFrames: 12 }, 2: { kind: 'crossfade', durationFrames: 30 } },
+  );
+  assert.equal(edl.segments[1].transitionIn.kind, 'dip');
+  assert.equal(edl.segments[2].transitionIn.kind, 'crossfade');
+  assertGapless(edl, 270);
+  const validated = validateEdl(edl, [{ takeId: 'calm', durationFrames: 10000 }]);
+  assert.ok(validated.ok);
+  assert.equal(validated.edl.segments[1].transitionIn.kind, 'dip');
+  assert.equal(validated.edl.segments[2].transitionIn.durationFrames, 30);
+  const roundTripped = JSON.parse(JSON.stringify(validated.edl));
+  assert.equal(roundTripped.segments[1].transitionIn.kind, 'dip');
+  assert.equal(roundTripped.segments[2].transitionIn.kind, 'crossfade');
+});
+
+test('transitions: windows clamp halves to neighbours and never overlap', () => {
+  // Middle cut is only 10 frames: a 1 s (30f) transition into it
+  // and a 1 s transition out of it must both shrink to fit, and
+  // the two windows must not overlap each other.
+  const edl = makeEdl(
+    [90, 10, 90],
+    { 1: { kind: 'dip', durationFrames: 30 }, 2: { kind: 'dip', durationFrames: 30 } },
+  );
+  const windows = transitionWindows(edl);
+  assert.equal(windows.length, 2);
+  // Raw halves would be min(15, 90, 10) = 10 each; the gap
+  // between boundaries is 10 frames, so each half caps at 5.
+  assert.equal(windows[0].halfFrames, 5);
+  assert.equal(windows[1].halfFrames, 5);
+  assert.equal(windows[0].boundaryFrame, 90);
+  assert.equal(windows[1].boundaryFrame, 100);
+  assert.ok(windows[0].boundaryFrame + windows[0].halfFrames <= windows[1].boundaryFrame - windows[1].halfFrames);
+  // Total length unchanged — windows overlap the boundary, they
+  // never extend the cut.
+  assert.equal(edl.totalFrames, 190);
+});
+
+test('transitions: a transition on the first segment is ignored; a single cut has no windows', () => {
+  const edl = makeEdl([90, 90], { 0: { kind: 'dip', durationFrames: 12 } });
+  assert.deepEqual(transitionWindows(edl), []);
+  const single = makeEdl([90], { 0: { kind: 'crossfade', durationFrames: 30 } });
+  assert.deepEqual(transitionWindows(single), []);
+});
+
+test('transitions: sanitisation — unknown kinds drop, bad durations default/clamp', () => {
+  assert.equal(sanitizeTransitionIn({ kind: 'wipe', durationFrames: 12 }), undefined);
+  assert.equal(sanitizeTransitionIn(undefined), undefined);
+  assert.deepEqual(sanitizeTransitionIn({ kind: 'dip', durationFrames: 0 }), {
+    kind: 'dip',
+    durationFrames: 4,
+  });
+  assert.deepEqual(sanitizeTransitionIn({ kind: 'dip', durationFrames: NaN }), {
+    kind: 'dip',
+    durationFrames: DEFAULT_TRANSITION_DURATION_FRAMES,
+  });
+  assert.deepEqual(sanitizeTransitionIn({ kind: 'crossfade', durationFrames: 500 }), {
+    kind: 'crossfade',
+    durationFrames: 90,
+  });
+  assert.deepEqual(sanitizeTransitionIn({ kind: 'dip', durationFrames: 2 }), {
+    kind: 'dip',
+    durationFrames: 4,
+  });
+});
+
+test('transitions: export request carries kind + effective half-seconds', () => {
+  const edl = makeEdl(
+    [90, 90, 90],
+    { 1: { kind: 'dip', durationFrames: 12 }, 2: { kind: 'crossfade', durationFrames: 30 } },
+  );
+  const req = edlToCompositeRequest(edl, () => 'file:///take.mp4');
+  assert.equal(req.clips.length, 3);
+  assert.equal(req.clips[0].transitionInKind, undefined);
+  assert.equal(req.clips[0].transitionInHalfSeconds, undefined);
+  assert.equal(req.clips[1].transitionInKind, 'dip');
+  assert.equal(req.clips[1].transitionInHalfSeconds, 6 / FPS); // 12f / 2 = 6f
+  assert.equal(req.clips[2].transitionInKind, 'crossfade');
+  assert.equal(req.clips[2].transitionInHalfSeconds, 15 / FPS); // 30f / 2 = 15f
+  // Clip durations and the song are untouched by transitions.
+  assert.deepEqual(
+    req.clips.map((c) => c.durationSeconds),
+    [3, 3, 3],
+  );
+});
+
+test('transitions: rhythm modes strip transitions', () => {
+  const edl = makeEdl([90, 90], { 1: { kind: 'dip', durationFrames: 12 } });
+  const fast = applyFastCuts(edl, ['calm', 'mid']);
+  assert.ok(fast);
+  assert.ok(fast.segments.every((s) => s.transitionIn === undefined));
+});
 
 test('modes: fast cuts split into ~0.75 s pieces alternating takes, total length unchanged', () => {
   const result = applyFastCuts(makeCut(), TAKE_IDS);

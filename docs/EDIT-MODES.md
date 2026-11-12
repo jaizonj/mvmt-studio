@@ -72,7 +72,26 @@ the native preview.
 6. **Transitions** — between segments: quick fade-to-black dip
    (v1, opacity animation on the composition — cheap and safe);
    true cross-dissolve (v2, needs overlapping video tracks in the
-   composition — feasibility check in Stage 3).
+   composition — feasibility check in Stage 3). SHIPPED Stage 3:
+   BOTH. A transition lives on the boundary INTO a segment
+   (`EdlSegment.transitionIn`, duration = full width, half on each
+   side, default 12f / 0.4s, 0.25/0.5/1s choices in the UI);
+   `transitionWindows` resolves effective halves (clamped so
+   windows never overlap or exceed neighbours) and the native
+   builder renders what it is told. Dip = opacity ramps on the two
+   adjacent instructions (out 1→0, in 0→1, black behind). Crossfade
+   = a second video track carrying the incoming clip's head,
+   time-aligned with the main track, with the boundary split into
+   four spans blending 1→0.5/0→0.5 then 0.5→0/0.5→1 — it lands
+   exactly on the incoming clip. Feasibility note: the second
+   track + split instructions were a contained extension (the
+   no-transition path is unchanged — one instruction per segment,
+   one opaque layer), and both the default compositor and the
+   LookVideoCompositor already composite multi-layer instructions
+   with opacity ramps. If a dissolve head cannot be inserted (no
+   pre-roll footage in the take), that boundary degrades to a dip.
+   Rhythm modes strip transitions (they re-cut the timeline);
+   trims and take-swaps keep them.
 7. **Arrange modes** ("shuffle modes", Jaizon's words — one-tap
    actions in Edit mode): **Alternate** (cycle takes A-B-A-B
    across the timeline), **Randomize order** (shuffle the segment
@@ -98,6 +117,8 @@ the native preview.
   split/duplicate segment ops).
 - **Stage 3 — Transitions**: dip/fade v1; cross-dissolve
   feasibility + implementation if the composition supports it.
+  SHIPPED: both — dip via opacity ramps, crossfade via a second
+  video track + split instructions (see §3.6).
 - **Stage 4 — Arrange modes**: Alternate, Randomize order,
   Reverse (on-demand only).
 

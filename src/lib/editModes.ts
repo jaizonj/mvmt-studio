@@ -29,6 +29,13 @@ import {
  *   slice replays the SAME source range at a later song position, so
  *   its pieces (and the remainder after them) carry `fixedSource`
  *   and the anchor leaves them pinned — see `EdlSegment.fixedSource`.
+ * - Transitions (Edit Modes Stage 3) are STRIPPED by every mode: a
+ *   mode re-cuts the timeline, so the boundaries a transition was
+ *   set on may not exist afterwards — carrying one onto a rebuilt
+ *   boundary would put a dip/dissolve somewhere the user never
+ *   chose. Transitions are a finishing touch: set them after the
+ *   cut's shape is settled. (`partialOf` below copies only the
+ *   listed fields, so a mode's rebuild drops `transitionIn`.)
  */
 
 export type RhythmModeId = 'fast-cuts' | 'fast-slow-fast' | 'repeat' | 'stutter';
@@ -92,7 +99,10 @@ export interface RepeatOptions {
   repeatCount: number;
 }
 
-/** The layoutSegments input shape for one existing segment. */
+/** The layoutSegments input shape for one existing segment.
+ *  Deliberately no `transitionIn`: modes re-cut the timeline and
+ *  strip transitions (see the header) — a rebuilt boundary must
+ *  never inherit a dip/dissolve set on the old one. */
 type Partial = {
   id: string;
   takeId: string;

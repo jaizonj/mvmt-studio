@@ -33,6 +33,10 @@ export interface TimelineStripClip {
    *  only to map filmstrip frames into source time and to show the
    *  speed badge; the width above already carries the timeline. */
   speed?: number;
+  /** Transition INTO this clip from the previous one (Edit Modes
+   *  Stage 3) — shown as a small marker at the clip's left edge.
+   *  Absent = hard cut. */
+  transitionIn?: 'dip' | 'crossfade';
   /** Source video for filmstrip thumbnails. */
   sourceUri?: string;
   /** Where this clip starts inside its source video, seconds. */
@@ -442,7 +446,7 @@ export function TimelineStrip({
                       onPress={() => onSelectClip?.(clip.id)}
                       accessibilityRole="button"
                       accessibilityState={{ selected }}
-                      accessibilityLabel={`${clip.label}, cut ${i + 1} of ${clips.length}, ${formatTime(clip.lengthSeconds)}${clip.speed && clip.speed !== 1 ? `, ${clip.speed} times speed` : ''}. Tap to select this cut.`}>
+                      accessibilityLabel={`${clip.label}, cut ${i + 1} of ${clips.length}, ${formatTime(clip.lengthSeconds)}${clip.speed && clip.speed !== 1 ? `, ${clip.speed} times speed` : ''}${clip.transitionIn ? `, ${clip.transitionIn} transition into this cut` : ''}. Tap to select this cut.`}>
                       <View style={styles.filmstrip}>
                         {times.length > 0
                           ? times.map((t, ti) => {
@@ -471,6 +475,13 @@ export function TimelineStrip({
                         <View style={styles.speedBadge}>
                           <Text style={styles.speedBadgeText} numberOfLines={1}>
                             {clip.speed}×
+                          </Text>
+                        </View>
+                      ) : null}
+                      {clip.transitionIn ? (
+                        <View style={styles.transitionBadge}>
+                          <Text style={styles.transitionBadgeText} numberOfLines={1}>
+                            {clip.transitionIn === 'dip' ? '◐' : '⇄'}
                           </Text>
                         </View>
                       ) : null}
@@ -611,6 +622,16 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   speedBadgeText: { color: colors.onAccent, fontSize: 9, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  transitionBadge: {
+    position: 'absolute',
+    top: 3,
+    left: 3,
+    backgroundColor: colors.material,
+    borderRadius: 4,
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  transitionBadgeText: { color: colors.label, fontSize: 9, fontWeight: '800' },
   playhead: {
     position: 'absolute',
     top: 0,

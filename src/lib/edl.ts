@@ -63,7 +63,40 @@ export interface EdlSegment {
    * re-anchors to its performance at that song position).
    */
   fixedSource?: boolean;
+  /**
+   * Transition INTO this segment, across its entry boundary
+   * (Edit Modes Stage 3). Lives on the segment the transition
+   * leads into, so the first segment's entry (no boundary) is
+   * meaningless and ignored. A transition never changes the
+   * cut's total length or the song sync — it overlaps the
+   * boundary (half on each side) and is video-only.
+   */
+  transitionIn?: EdlSegmentTransition;
 }
+
+/** Transition kinds (Edit Modes Stage 3). */
+export type TransitionKind = 'dip' | 'crossfade';
+
+/**
+ * A transition into a segment. `durationFrames` is the FULL width
+ * of the transition — the dip / dissolve spans half of it on each
+ * side of the boundary (so a 12-frame dip fades out over the last
+ * 6 frames of the outgoing cut and in over the first 6 of the
+ * incoming one). The effective half-width is computed by
+ * `transitionWindows` (clamped so windows never overlap and never
+ * exceed the neighbouring cuts) and handed to the native builder.
+ */
+export interface EdlSegmentTransition {
+  kind: TransitionKind;
+  /** Full transition width in frames. */
+  durationFrames: number;
+}
+
+/** Default transition width: 12 frames (0.4 s at 30fps). */
+export const DEFAULT_TRANSITION_DURATION_FRAMES = 12;
+/** Stored transition widths are clamped to [4, 90] frames. */
+export const MIN_TRANSITION_DURATION_FRAMES = 4;
+export const MAX_TRANSITION_DURATION_FRAMES = 90;
 
 /**
  * Sanitised playback rate for a segment: finite, clamped to
@@ -87,6 +120,86 @@ export function segmentSpeed(segment: { speed?: number }): number {
  */
 export function segmentTimelineDurationFrames(segment: EdlSegment): number {
   return Math.max(1, Math.round(segment.durationFrames / segmentSpeed(segment)));
+}
+
+/**
+ * Sanitised transition: an unknown kind drops the transition
+ * entirely; a missing/invalid duration falls back to the default
+ * (12 frames); out-of-range durations clamp to [4, 90]. The
+ * single sanitisation point — every consumer (layout, validation,
+ * the composition request) reads transitions through here, so a
+ * stale stored value can never break the render.
+ */
+export function sanitizeTransitionIn(
+  t: EdlSegmentTransition | undefined,
+): EdlSegmentTransition | undefined {
+  if (!t || (t.kind !== 'dip' && t.kind !== 'crossfade')) return undefined;
+  const d =
+    typeof t.durationFrames === 'number' && Number.isFinite(t.durationFrames)
+      ? Math.round(t.durationFrames)
+      : DEFAULT_TRANSITION_DURATION_FRAMES;
+  return {
+    kind: t.kind,
+    durationFrames: Math.min(
+      MAX_TRANSITION_DURATION_FRAMES,
+      Math.max(MIN_TRANSITION_DURATION_FRAMES, d),
+    ),
+  };
+}
+
+export interface TransitionWindow {
+  /** Timeline frame of the boundary. */
+  boundaryFrame: number;
+  kind: TransitionKind;
+  /** Effective half-width in frames, after clamping. */
+  halfFrames: number;
+  /** Index of the segment the transition leaves. */
+  outIndex: number;
+  /** Index of the segment the transition enters. */
+  inIndex: number;
+}
+
+/**
+ * The effective transition windows of an EDL — the resolved form
+ * of every segment's `transitionIn`, ready for the native builder.
+ * A window spans [boundary − half, boundary + half]; the half is
+ * the requested duration / 2, clamped so a window never exceeds
+ * its neighbouring cuts and never overlaps the window next to it
+ * (each half is at most half the gap to the neighbouring
+ * boundary). A transition on the first segment (no boundary) or a
+ * window clamped below 1 frame produces nothing. Total timeline
+ * length is unchanged — windows overlap the boundary, they never
+ * extend the cut.
+ */
+export function transitionWindows(edl: Edl): TransitionWindow[] {
+  const raw: TransitionWindow[] = [];
+  for (let i = 1; i < edl.segments.length; i += 1) {
+    const t = sanitizeTransitionIn(edl.segments[i].transitionIn);
+    if (!t) continue;
+    const prevDur = segmentTimelineDurationFrames(edl.segments[i - 1]);
+    const nextDur = segmentTimelineDurationFrames(edl.segments[i]);
+    const half = Math.min(Math.floor(t.durationFrames / 2), prevDur, nextDur);
+    if (half < 1) continue;
+    raw.push({
+      boundaryFrame: edl.segments[i].timelineStartFrame,
+      kind: t.kind,
+      halfFrames: half,
+      outIndex: i - 1,
+      inIndex: i,
+    });
+  }
+  // Resolve overlaps between neighbouring windows: two windows
+  // [B1−h1, B1+h1] and [B2−h2, B2+h2] overlap exactly when
+  // h1 + h2 > B2 − B1, so cap each half at half the gap.
+  for (let i = 0; i + 1 < raw.length; i += 1) {
+    const gap = raw[i + 1].boundaryFrame - raw[i].boundaryFrame;
+    if (raw[i].halfFrames + raw[i + 1].halfFrames > gap) {
+      const cap = Math.floor(gap / 2);
+      raw[i].halfFrames = Math.min(raw[i].halfFrames, cap);
+      raw[i + 1].halfFrames = Math.min(raw[i + 1].halfFrames, cap);
+    }
+  }
+  return raw.filter((w) => w.halfFrames >= 1);
 }
 
 /**
@@ -206,7 +319,9 @@ export function takeSyncOffsetSeconds(
  * starts. The cursor advances by each segment's TIMELINE length
  * (`segmentTimelineDurationFrames`) — a slowed segment pushes the
  * cuts after it later, a sped-up one pulls them earlier. `speed`
- * rides along on the partials (undefined = 1x).
+ * rides along on the partials (undefined = 1x), and so does the
+ * entry transition (sanitised here, so a stored EDL is always
+ * clean after any layout).
  */
 export function layoutSegments(
   partials: {
@@ -216,6 +331,7 @@ export function layoutSegments(
     durationFrames: number;
     speed?: number;
     fixedSource?: boolean;
+    transitionIn?: EdlSegmentTransition;
   }[],
   base: Edl,
 ): Edl {
@@ -223,7 +339,13 @@ export function layoutSegments(
   const segments: EdlSegment[] = partials
     .filter((p) => p.durationFrames > 0)
     .map((p) => {
-      const segment: EdlSegment = { ...p, timelineStartFrame: cursor };
+      const { transitionIn: _raw, ...rest } = p;
+      const transitionIn = sanitizeTransitionIn(_raw);
+      const segment: EdlSegment = {
+        ...rest,
+        ...(transitionIn ? { transitionIn } : {}),
+        timelineStartFrame: cursor,
+      };
       cursor += segmentTimelineDurationFrames(segment);
       return segment;
     });
@@ -254,6 +376,7 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
     durationFrames: number;
     speed?: number;
     fixedSource?: boolean;
+    transitionIn?: EdlSegmentTransition;
   }[] = [];
 
   for (const segment of edl.segments) {
@@ -279,7 +402,10 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
     // only set when present, so a 1x edit stays byte-identical
     // through validation (the contract tests assert deepEqual).
     // fixedSource rides through the same way: validation clamps
-    // source ranges, it never re-anchors them.
+    // source ranges, it never re-anchors them. So does the entry
+    // transition — it is a property of the boundary, not of the
+    // source range, and it survives clamping (layoutSegments
+    // sanitises it on the way through).
     kept.push({
       id: segment.id,
       takeId: segment.takeId,
@@ -287,6 +413,7 @@ export function validateEdl(edl: Edl, assets: AssetMeasure[]): EdlValidation {
       durationFrames: end - start,
       ...(segment.speed !== undefined ? { speed: segment.speed } : {}),
       ...(segment.fixedSource ? { fixedSource: true } : {}),
+      ...(segment.transitionIn ? { transitionIn: segment.transitionIn } : {}),
     });
   }
 
@@ -380,9 +507,17 @@ export function edlToCompositeRequest(
     audioUri?: string | null;
   } = {},
 ): CompositeRequest {
-  const clips = edl.segments.map((segment) => {
+  // Effective transition windows (Edit Modes Stage 3), resolved
+  // once here: the native builder renders what it is told — it
+  // never re-derives edit decisions. A clip's transition fields
+  // are only set when a window exists, so a cut with no
+  // transitions sends exactly the request it always did.
+  const windows = transitionWindows(edl);
+  const windowByInIndex = new Map(windows.map((w) => [w.inIndex, w]));
+  const clips = edl.segments.map((segment, index) => {
     const uri = takeUri(segment.takeId);
     if (!uri) throw new Error(`EDL segment ${segment.id} references take ${segment.takeId}, which has no file URI.`);
+    const window = windowByInIndex.get(index);
     return {
       uri,
       startSeconds: framesToSeconds(segment.sourceStartFrame, edl.fps),
@@ -392,6 +527,12 @@ export function edlToCompositeRequest(
       // SAME request feeds preview and export, so the speed is
       // honoured identically in both. The master song is untouched.
       speed: segmentSpeed(segment),
+      ...(window
+        ? {
+            transitionInKind: window.kind,
+            transitionInHalfSeconds: framesToSeconds(window.halfFrames, edl.fps),
+          }
+        : {}),
       muted: !options.includeTakeAudio,
       volume: 1,
     };

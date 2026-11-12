@@ -38,6 +38,7 @@ import {
   DEFAULT_FPS,
   edlDurationSeconds,
   canvasForTakes,
+  DEFAULT_TRANSITION_DURATION_FRAMES,
   edlToCompositeRequest,
   edlWithTakeCanvas,
   framesToSeconds,
@@ -52,6 +53,8 @@ import {
   type AssetMeasure,
   type Edl,
   type EdlSegment,
+  type EdlSegmentTransition,
+  type TransitionKind,
 } from '../../lib/edl';
 import {
   REPEAT_MODE,
@@ -117,7 +120,10 @@ function randomSeed(): number {
 
 /** The layoutSegments input shape for one existing segment. Speed
  *  rides along (undefined = 1x) so re-layouts never drop it, and so
- *  does the pinned-source flag (loops keep their source). */
+ *  do the pinned-source flag (loops keep their source) and the
+ *  entry transition (a trim or take-swap keeps the boundary's
+ *  dip/dissolve — only rhythm modes strip transitions, because
+ *  they re-cut the timeline). */
 function partialOf(s: EdlSegment): {
   id: string;
   takeId: string;
@@ -125,6 +131,7 @@ function partialOf(s: EdlSegment): {
   durationFrames: number;
   speed?: number;
   fixedSource?: boolean;
+  transitionIn?: EdlSegmentTransition;
 } {
   return {
     id: s.id,
@@ -133,6 +140,7 @@ function partialOf(s: EdlSegment): {
     durationFrames: s.durationFrames,
     ...(s.speed !== undefined ? { speed: s.speed } : {}),
     ...(s.fixedSource ? { fixedSource: true } : {}),
+    ...(s.transitionIn ? { transitionIn: s.transitionIn } : {}),
   };
 }
 
@@ -548,6 +556,45 @@ function EditorWorkspace() {
     });
   };
 
+  // ---- Transitions (Edit Modes Stage 3) -----------------------------
+  /** Transition into the selected cut, across its entry boundary
+   *  (the first cut has no boundary in — its chips are hidden).
+   *  One tap, through the normal commit path (undoable, re-laid-
+   *  out, validated). Changing the kind keeps the current width;
+   *  a new transition starts at the 0.4 s default. The cut stays
+   *  the same length and the song never changes — a transition
+   *  only overlaps the boundary, it never extends the cut. */
+  const TRANSITION_KINDS: { id: TransitionKind | 'none'; name: string }[] = [
+    { id: 'none', name: 'None' },
+    { id: 'dip', name: 'Dip' },
+    { id: 'crossfade', name: 'Crossfade' },
+  ];
+  const TRANSITION_DURATION_OPTIONS = [0.25, 0.5, 1] as const;
+  const handleSetTransition = (
+    segment: EdlSegment,
+    kind: TransitionKind | 'none',
+    durationSeconds?: number,
+  ) => {
+    if (!edl) return;
+    const current = segment.transitionIn;
+    const durationFrames =
+      durationSeconds !== undefined
+        ? secondsToFrames(durationSeconds, edl.fps)
+        : (current?.durationFrames ?? DEFAULT_TRANSITION_DURATION_FRAMES);
+    commitEdl({
+      ...edl,
+      segments: edl.segments.map((s) => {
+        if (s.id !== segment.id) return s;
+        if (kind === 'none') {
+          const { transitionIn: _dropped, ...rest } = s;
+          return rest;
+        }
+        const transitionIn: EdlSegmentTransition = { kind, durationFrames };
+        return { ...s, transitionIn };
+      }),
+    });
+  };
+
   // ---- Rhythm modes (Edit Modes Stage 2) ---------------------------
   // Length of the used song region, in frames — modes that stretch
   // the cut (Fast–Slow–Fast, Repeat, Stutter) re-clip to it.
@@ -813,6 +860,7 @@ function EditorWorkspace() {
               // (the strip maps filmstrip frames through `speed`).
               lengthSeconds: framesToSeconds(segmentTimelineDurationFrames(seg), displayEdl.fps),
               speed: segmentSpeed(seg),
+              transitionIn: seg.transitionIn?.kind,
               sourceUri: take?.uri,
               sourceStartSeconds: framesToSeconds(seg.sourceStartFrame, displayEdl.fps),
             };
@@ -1280,6 +1328,70 @@ function EditorWorkspace() {
                       ? 'Slow motion — this cut stretches on the timeline, the song plays on.'
                       : 'Fast — this cut compresses on the timeline, the song plays on.'}
                 </Text>
+                {/* Transition into this cut — the first cut has no
+                    boundary in, so its chips stay hidden. */}
+                {selectedIndex > 0 ? (
+                  <>
+                    <Text style={styles.panelLabel}>Transition into this cut</Text>
+                    <View style={styles.speedRow}>
+                      {TRANSITION_KINDS.map((option) => {
+                        const active =
+                          option.id === 'none'
+                            ? !selected.transitionIn
+                            : selected.transitionIn?.kind === option.id;
+                        return (
+                          <Pressable
+                            key={option.id}
+                            onPress={() => handleSetTransition(selected, option.id)}
+                            accessibilityRole="button"
+                            accessibilityState={{ selected: active }}
+                            accessibilityLabel={
+                              option.id === 'none'
+                                ? 'No transition — hard cut'
+                                : option.id === 'dip'
+                                  ? 'Dip — fade through black into this cut'
+                                  : 'Crossfade — dissolve into this cut'
+                            }
+                            style={[styles.speedChip, active && styles.speedChipActive]}>
+                            <Text style={[styles.speedChipText, active && styles.speedChipTextActive]}>
+                              {option.name}
+                            </Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                    {selected.transitionIn ? (
+                      <View style={styles.speedRow}>
+                        {TRANSITION_DURATION_OPTIONS.map((seconds) => {
+                          const active =
+                            secondsToFrames(seconds, edl.fps) === selected.transitionIn?.durationFrames;
+                          return (
+                            <Pressable
+                              key={seconds}
+                              onPress={() =>
+                                handleSetTransition(selected, selected.transitionIn!.kind, seconds)
+                              }
+                              accessibilityRole="button"
+                              accessibilityState={{ selected: active }}
+                              accessibilityLabel={`Transition length ${seconds} seconds`}
+                              style={[styles.speedChip, active && styles.speedChipActive]}>
+                              <Text style={[styles.speedChipText, active && styles.speedChipTextActive]}>
+                                {seconds}s
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                    ) : null}
+                    <Text style={styles.caption}>
+                      {selected.transitionIn?.kind === 'dip'
+                        ? 'Dip — fades through black into this cut.'
+                        : selected.transitionIn?.kind === 'crossfade'
+                          ? 'Crossfade — dissolves from the previous cut into this one.'
+                          : 'Hard cut — the picture switches instantly.'}
+                    </Text>
+                  </>
+                ) : null}
                 <Text style={styles.caption}>Drag the ends of a cut to trim it.</Text>
               </View>
             </View>

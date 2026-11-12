@@ -34,6 +34,19 @@ export interface CompositeClipInput {
    * as in any slow-mo/fast-mo).
    */
   speed?: number;
+  /**
+   * Transition INTO this clip from the previous one (Edit Modes
+   * Stage 3): 'dip' fades the outgoing clip to black and this one
+   * in from black; 'crossfade' dissolves between them on a second
+   * video track. The half-width below is the EFFECTIVE one,
+   * computed by `transitionWindows` in src/lib/edl.ts (clamped so
+   * windows never overlap and never exceed the neighbouring cuts)
+   * — the native builder renders what it is told. Absent = hard
+   * cut. The first clip's fields are ignored (no boundary there).
+   */
+  transitionInKind?: 'dip' | 'crossfade';
+  /** Effective half-width of the transition, seconds. */
+  transitionInHalfSeconds?: number;
   /** When true, the clip's own audio is dropped entirely. */
   muted: boolean;
   /** Volume of the clip's own audio when not muted (0–1). */
