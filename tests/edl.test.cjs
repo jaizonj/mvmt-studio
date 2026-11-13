@@ -25,6 +25,7 @@ const {
   framesToSeconds,
   canvasForTakes,
   layoutSegments,
+  reanchorSegments,
   validateEdl,
   emptyEdl,
   segmentSpeed,
@@ -986,4 +987,88 @@ test('canvas: follows the largest RECORDED take; imports never vote', () => {
     width: 2160,
     height: 3840,
   });
+});
+
+test('slow-mo: slowing a non-final segment keeps every follower (regression, 2026-11-13)', () => {
+  const assets = [
+    { takeId: 'take1', durationFrames: REGION_FRAMES },
+    { takeId: 'take2', durationFrames: REGION_FRAMES },
+  ];
+  // Two 225f cuts over a 450f region; both takes recorded from the
+  // region start, so every sync offset is 0.
+  const cut = layoutSegments(
+    [
+      { id: 's1', takeId: 'take1', sourceStartFrame: 0, durationFrames: 225 },
+      { id: 's2', takeId: 'take2', sourceStartFrame: 225, durationFrames: 225 },
+    ],
+    { ...emptyEdl(FPS), audio: { uri: 'file:///track.mp3', regionStartFrame: 0, volume: 1 } },
+  );
+  assert.equal(cut.totalFrames, REGION_FRAMES);
+
+  // What handleSetSpeed does (0.5x on the first cut), then the
+  // commit path: layout → re-anchor → validate.
+  const slowed = {
+    ...cut,
+    segments: cut.segments.map((s) => (s.id === 's1' ? { ...s, speed: 0.5 } : s)),
+  };
+  const relaid = layoutSegments(slowed.segments, slowed);
+  const anchored = {
+    ...relaid,
+    segments: reanchorSegments(relaid.segments, () => 0, FPS),
+  };
+  const validated = validateEdl(anchored, assets);
+  // Before the fix the anchor moved s2's source to 450 — past the
+  // end of its take — and validation dropped it (total 450f, only
+  // the slowed cut left: half the video at 0.5x, exactly Jaizon's
+  // report). Followers now keep their footage; the cut runs long
+  // past the song by the stretch amount, by design.
+  assert.deepEqual(validated.errors, []);
+  assert.equal(validated.edl.segments.length, 2);
+  const [seg1, seg2] = validated.edl.segments;
+  assert.deepEqual(
+    [seg1.timelineStartFrame, segmentTimelineDurationFrames(seg1), seg1.sourceStartFrame, seg1.durationFrames, seg1.speed],
+    [0, 450, 0, 225, 0.5],
+  );
+  assert.deepEqual(
+    [seg2.timelineStartFrame, segmentTimelineDurationFrames(seg2), seg2.sourceStartFrame, seg2.durationFrames, seg2.speed],
+    [450, 225, 225, 225, undefined],
+  );
+  assert.equal(validated.edl.totalFrames, 675);
+  assertGapless(validated.edl, 675);
+
+  // The native request carries both clips at their speeds.
+  const request = edlToCompositeRequest(validated.edl, (id) => `file:///${id}.mp4`);
+  assert.deepEqual(
+    request.clips.map((c) => [c.startSeconds, c.durationSeconds, c.speed]),
+    [
+      [0, 7.5, 0.5],
+      [7.5, 7.5, 1],
+    ],
+  );
+});
+
+test('reanchor: the direct edit target is still re-anchored downstream of a slowed cut', () => {
+  // Same cut with seg1 slowed: seg2 sits at tl=[450, 675) with its
+  // footage kept at src 225.
+  const relaid = layoutSegments(
+    [
+      { id: 's1', takeId: 'take1', sourceStartFrame: 0, durationFrames: 225, speed: 0.5 },
+      { id: 's2', takeId: 'take2', sourceStartFrame: 225, durationFrames: 225 },
+    ],
+    emptyEdl(FPS),
+  );
+  // Incidental follower: the stretch guard preserves its source.
+  const kept = reanchorSegments(relaid.segments, () => 0, FPS);
+  assert.equal(kept[1].sourceStartFrame, 225);
+  // Direct edit target (trim / take-swap): the guard does not apply
+  // — its source still comes from the edit handler's anchor, so it
+  // is re-derived from its timeline start. (Validation may still
+  // drop an out-of-range target; the editor surfaces that in the
+  // notice instead of losing it silently.)
+  const retargeted = reanchorSegments(relaid.segments, () => 0, FPS, {
+    editTargetIds: new Set(['s2']),
+  });
+  assert.equal(retargeted[1].sourceStartFrame, 450);
+  // The slowed cut itself is still anchored normally.
+  assert.equal(retargeted[0].sourceStartFrame, 0);
 });

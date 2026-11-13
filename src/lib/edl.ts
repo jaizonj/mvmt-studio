@@ -314,6 +314,73 @@ export function takeSyncOffsetSeconds(
   );
 }
 
+export interface ReanchorOptions {
+  /**
+   * Segment IDs that are the DIRECT target of the edit (trim target /
+   * take-swap target). These are always re-anchored from their timeline
+   * start — their handler set their source explicitly. The stretch
+   * guard below applies only to incidental followers.
+   */
+  editTargetIds?: ReadonlySet<string>;
+}
+
+/**
+ * Pure core of the editor's sync anchor (src/app/project/editor.tsx):
+ * re-derive every segment's source start from its timeline position
+ * via the single shared mapping, so a cut always shows each take's
+ * performance AT that song position. Segments must already be laid
+ * out (see layoutSegments).
+ *
+ * Two exceptions keep their stored source start:
+ * - `fixedSource` loop pieces (Repeat / Stutter) replay the SAME
+ *   source range at a later song position — the anchor would undo
+ *   the loop.
+ * - Segments DOWNSTREAM of a segment running at speed !== 1: the
+ *   timeline no longer maps 1:1 to the song — a slowed cut stretches
+ *   the timeline, so re-deriving a follower's source from its
+ *   timeline start would push it past the end of its take and
+ *   validation would silently delete it (slow-mo bug, 2026-11-13:
+ *   slowing any non-final segment deleted every segment after it).
+ *   Followers keep their footage instead — the cut is desynced past
+ *   the stretch by design (the slowed cut itself already is), but
+ *   no footage is lost. The slowed segment itself is still anchored:
+ *   its own start is set by earlier segments only.
+ *
+ * Segments referencing a take the lookup doesn't know pass through
+ * untouched (validation drops them).
+ */
+export function reanchorSegments(
+  segments: EdlSegment[],
+  offsetSecondsByTakeId: (takeId: string) => number | undefined,
+  fps: number,
+  options: ReanchorOptions = {},
+): EdlSegment[] {
+  let stretched = false;
+  return segments.map((s) => {
+    const isTarget = options.editTargetIds?.has(s.id) ?? false;
+    let next = s;
+    // The guard applies only to incidental followers, never to the
+    // segment being directly edited and never to pinned loops.
+    if (!s.fixedSource && !(stretched && !isTarget)) {
+      const offset = offsetSecondsByTakeId(s.takeId);
+      if (offset !== undefined) {
+        next = {
+          ...s,
+          sourceStartFrame: Math.max(
+            0,
+            sourceFrameForTimelineFrame(s.timelineStartFrame, offset, fps),
+          ),
+        };
+      }
+    }
+    // A segment at any other speed stretches every timeline position
+    // after it — including when the segment itself is a pinned loop
+    // or passes through untouched above.
+    if (segmentSpeed(s) !== 1) stretched = true;
+    return next;
+  });
+}
+
 /**
  * Lay out segments back-to-back from frame 0, assigning timeline
  * starts. The cursor advances by each segment's TIMELINE length

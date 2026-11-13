@@ -45,6 +45,7 @@ import {
   edlWithTakeCanvas,
   framesToSeconds,
   layoutSegments,
+  reanchorSegments as reanchorSegmentsPure,
   secondsToFrames,
   segmentAtFrame,
   segmentSpeed,
@@ -56,6 +57,7 @@ import {
   type Edl,
   type EdlSegment,
   type EdlSegmentTransition,
+  type EdlValidation,
   type TransitionKind,
 } from '../../lib/edl';
 import {
@@ -274,15 +276,15 @@ function EditorWorkspace() {
   }, [takes, measureMap]);
 
   const validate = useCallback(
-    (candidate: Edl): Edl =>
+    (candidate: Edl): EdlValidation =>
       nativeMeasures
-        ? validateEdl(candidate, nativeMeasures).edl
-        : validateAgainstAssets(candidate, takes, candidate.fps).edl,
+        ? validateEdl(candidate, nativeMeasures)
+        : validateAgainstAssets(candidate, takes, candidate.fps),
     [nativeMeasures, takes],
   );
 
   /** The EDL as shown and edited: the stored edit, validated. */
-  const edl = useMemo(() => (storedEdl ? validate(storedEdl) : null), [storedEdl, validate]);
+  const edl = useMemo(() => (storedEdl ? validate(storedEdl).edl : null), [storedEdl, validate]);
   const hasCut = !!edl && edl.segments.length > 0;
   const totalSeconds = edl ? edlDurationSeconds(edl) : 0;
 
@@ -325,25 +327,26 @@ function EditorWorkspace() {
    * sync, and there is deliberately NO per-clip slip/offset control:
    * auto-sync always wins. Segments referencing a missing take pass
    * through untouched (validation drops them).
+   *
+   * The pure core lives in src/lib/edl.ts (reanchorSegments) so the
+   * contract is testable: it keeps followers' footage downstream of
+   * a slowed cut instead of re-anchoring them past the end of their
+   * take, where validation would delete them (slow-mo bug,
+   * 2026-11-13). `editTargetIds` names the segment being directly
+   * edited (trim / take-swap target) — the stretch guard never
+   * applies to it.
    */
   const reanchorSegments = useCallback(
-    (segments: EdlSegment[], fps: number): EdlSegment[] =>
-      segments.map((s) => {
-        // Pinned loop pieces (Repeat / Stutter) replay the SAME
-        // source range at a later song position — the anchor would
-        // undo the loop by re-deriving the source from the timeline
-        // position, so it leaves them alone.
-        if (s.fixedSource) return s;
-        const take = takes.find((t) => t.id === s.takeId);
-        if (!take) return s;
-        return {
-          ...s,
-          sourceStartFrame: Math.max(
-            0,
-            sourceFrameForTimelineFrame(s.timelineStartFrame, offsetForTake(take), fps),
-          ),
-        };
-      }),
+    (segments: EdlSegment[], fps: number, editTargetIds?: ReadonlySet<string>): EdlSegment[] =>
+      reanchorSegmentsPure(
+        segments,
+        (takeId) => {
+          const take = takes.find((t) => t.id === takeId);
+          return take ? offsetForTake(take) : undefined;
+        },
+        fps,
+        { editTargetIds },
+      ),
     [takes, offsetForTake],
   );
 
@@ -357,15 +360,37 @@ function EditorWorkspace() {
    * anchored. Validation may clamp/drop a segment whose anchored
    * source start falls outside its take's measured length — correct
    * and honest: that take has no footage for that song moment.
+   *
+   * Options: `skipReanchor` for speed-only changes, which move no
+   * source start — re-anchoring after a stretch would push every
+   * follower past the end of its take and validation would delete
+   * them (slow-mo bug, 2026-11-13). `editTargetIds` names the segment
+   * being directly edited, so the anchor's stretch guard never
+   * applies to it. A drop is reported in the notice instead of
+   * losing the cut silently; callers clear the notice on their next
+   * successful action.
    */
-  const commitEdl = (next: Edl) => {
+  const commitEdl = (
+    next: Edl,
+    options?: { skipReanchor?: boolean; editTargetIds?: ReadonlySet<string> },
+  ) => {
     setUndoStack((stack) => [...stack.slice(-(HISTORY_CAP - 1)), edl]);
     setRedoStack([]);
     setDraftEdl(null);
     const relaid = layoutSegments(next.segments.map(partialOf), next);
-    const anchored: Edl = { ...relaid, segments: reanchorSegments(relaid.segments, relaid.fps) };
+    const anchored: Edl = options?.skipReanchor
+      ? relaid
+      : { ...relaid, segments: reanchorSegments(relaid.segments, relaid.fps, options?.editTargetIds) };
     const validated = validate(anchored);
-    studio.applyEdl(validated, validated.segments.map((s) => s.takeId));
+    const dropped = anchored.segments.length - validated.edl.segments.length;
+    if (dropped > 0) {
+      setShuffleNote(
+        dropped === 1
+          ? 'One cut was removed — its take has no footage for that part of the song.'
+          : `${dropped} cuts were removed — their takes have no footage for those parts of the song.`,
+      );
+    }
+    studio.applyEdl(validated.edl, validated.edl.segments.map((s) => s.takeId));
   };
 
   const applyHistoryEdl = (target: Edl | null) => {
@@ -548,22 +573,32 @@ function EditorWorkspace() {
         }),
         edl,
       ),
+      // The swapped cut is the direct edit target: the anchor's
+      // stretch guard never applies to it, so its explicit source
+      // above always lands.
+      { editTargetIds: new Set([segment.id]) },
     );
   };
 
   // ---- Clip speed (Edit Modes Stage 1) ------------------------------
   /** Speed chips for the selected cut — one tap, through the normal
-   *  commit path (undoable, re-laid-out, re-anchored, validated).
+   *  commit path (undoable, re-laid-out, validated). The anchor is
+   *  SKIPPED: a speed-only change moves no source start, and
+   *  re-anchoring after the stretch would push every follower past
+   *  the end of its take and delete it (slow-mo bug, 2026-11-13).
    *  The song never changes: speed is video-only. */
   const SPEED_OPTIONS = [0.25, 0.5, 1, 1.5, 2] as const;
   const handleSetSpeed = (segment: EdlSegment, speed: number) => {
     if (!edl || segmentSpeed(segment) === speed) return;
-    commitEdl({
-      ...edl,
-      segments: edl.segments.map((s) =>
-        s.id === segment.id ? { ...s, speed: speed === 1 ? undefined : speed } : s,
-      ),
-    });
+    commitEdl(
+      {
+        ...edl,
+        segments: edl.segments.map((s) =>
+          s.id === segment.id ? { ...s, speed: speed === 1 ? undefined : speed } : s,
+        ),
+      },
+      { skipReanchor: true },
+    );
   };
 
   // ---- Transitions (Edit Modes Stage 3) -----------------------------
@@ -683,7 +718,7 @@ function EditorWorkspace() {
   const handleTrimDrag = (event: TimelineTrimDragEvent) => {
     if (!edl) return;
     if (event.phase === 'end') {
-      if (draftEdl) commitEdl(draftEdl);
+      if (draftEdl) commitEdl(draftEdl, { editTargetIds: new Set([event.clipId]) });
       setDraftEdl(null);
       return;
     }
@@ -735,7 +770,13 @@ function EditorWorkspace() {
       };
     }
     const laid = layoutSegments(partials, edl);
-    setDraftEdl({ ...laid, segments: reanchorSegments(laid.segments, laid.fps) });
+    // The trimmed cut is the direct edit target: the anchor's stretch
+    // guard never applies to it, so its source follows the boundary
+    // even downstream of a slowed cut.
+    setDraftEdl({
+      ...laid,
+      segments: reanchorSegments(laid.segments, laid.fps, new Set([event.clipId])),
+    });
   };
 
   // ---- Preview ---------------------------------------------------------
