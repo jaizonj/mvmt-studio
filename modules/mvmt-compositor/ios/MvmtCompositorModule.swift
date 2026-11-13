@@ -3224,7 +3224,7 @@ private enum MvmtCompositorEngine {
         // Same align-aware row origin as the live words above.
         let contentOriginX = (containerSize.width - contentSize.width) / 2
         let rowOriginX: CGFloat
-        switch decor?.align ?? "center" {
+        switch decor.align {
         case "left": rowOriginX = contentOriginX
         case "right": rowOriginX = contentOriginX + contentSize.width - rowWidths[entry.row]
         default: rowOriginX = contentOriginX + (contentSize.width - rowWidths[entry.row]) / 2
@@ -3284,7 +3284,7 @@ private enum MvmtCompositorEngine {
       let lastWord = wordEntries.filter { $0.row == lastRow }.max(by: { $0.centerX < $1.centerX })
       let contentOriginX = (containerSize.width - contentSize.width) / 2
       let lastRowOriginX: CGFloat
-      switch decor?.align ?? "center" {
+      switch decor.align {
       case "left": lastRowOriginX = contentOriginX
       case "right": lastRowOriginX = contentOriginX + contentSize.width - rowWidths[lastRow]
       default: lastRowOriginX = contentOriginX + (contentSize.width - rowWidths[lastRow]) / 2
