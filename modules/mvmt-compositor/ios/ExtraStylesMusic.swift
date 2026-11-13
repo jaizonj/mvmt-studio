@@ -874,10 +874,10 @@ final class RhythmTypographyExtraStyle: ExtraStyleDefinition {
         id: "phrase-bar-\(lineIndex)",
         shape: extraStyleRectShape(width: canvas.width * 0.5, height: 6),
         fill: accent,
-        fillColorParamId: "accent",
         position: CGPoint(x: canvas.width / 2, y: centerY + sizePoints),
         zIndex: 9,
         visibleRange: lineStartFrame...lineEndFrame,
+        fillColorParamId: "accent",
         tracks: [
           ExtraStyleTrack(
             property: .opacity,

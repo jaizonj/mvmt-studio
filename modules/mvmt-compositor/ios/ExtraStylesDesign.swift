@@ -390,8 +390,8 @@ final class BrutalistTypographyExtraStyle: ExtraStyleDefinition {
     builder.add(extraStyleBackgroundGradientNode(
       id: "br-background", canvas: canvas,
       colors: [paper, paper],
-      colorParamIds: ["paper", "paper"],
-      locations: [0, 1], zIndex: 0
+      locations: [0, 1],
+      colorParamIds: ["paper", "paper"], zIndex: 0
     ))
 
     // Onset flash bar: a full-width accent bar whose opacity IS
@@ -517,7 +517,7 @@ final class BrutalistTypographyExtraStyle: ExtraStyleDefinition {
       // Index strip: the line's words in small mono caps along
       // the foot, each word hard-cutting in at its sung start.
       let wordNodes = extraStyleWordNodes(
-        line: line, lineIndex: lineIndex,
+        line: line, lineIndex: lineIndex, fps: fps,
         lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
         y: canvas.height * 0.84, sizePoints: canvas.width * 0.032,
         color: ink, font: ExtraStyleFonts.mono, zIndex: 10,
@@ -1157,7 +1157,7 @@ final class NeonSignWorldExtraStyle: ExtraStyleDefinition {
       // so glow is two larger copies of the text at low opacity
       // in .screen blend, flickering with seeded noise while the
       // flicker toggle is on.
-      for (glowIndex, glowScale) in [(0, 1.1), (1, 1.22)].enumerated() {
+      for (glowIndex, glowScale) in [(0, 1.1), (1, 1.22)] {
         let glowAlpha: CGFloat = glowIndex == 0 ? 0.3 : 0.13
         builder.add(ExtraStyleNode(
           id: "ne-glow-\(lineIndex)-\(glowIndex)", kind: .text,

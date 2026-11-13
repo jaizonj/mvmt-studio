@@ -470,7 +470,7 @@ final class SurveillanceSystemExtraStyle: ExtraStyleDefinition {
     let boxWidth = canvas.width * 0.34
     let boxHeight = canvas.height * 0.19
     let faceTracks = extraStyleFaceBoxTracks(
-      input.maskIndex, fps: fps, canvas: canvas,
+      maskIndex: input.maskIndex, fps: fps, canvas: canvas,
       startFrame: 0, endFrame: input.durationFrames)
     var boxTracks: [ExtraStyleTrack]
     if !faceTracks.isEmpty {

@@ -1320,7 +1320,7 @@ extension ExtraStylesPhase3 {
   static func registerCinematicRest(into registry: ExtraStyleRegistry) {
     registry.register(MemoryFragmentsExtraStyle())
     registry.register(FloatingUniverseExtraStyle())
-    registry.register(FilmCreditsExtraStyle())
+    registry.register(FilmCreditsReimaginedExtraStyle())
     registry.register(ParallelWorldsExtraStyle())
   }
 }

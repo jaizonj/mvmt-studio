@@ -269,7 +269,7 @@ func extraStyleTextWidth(_ text: String, fontPostScriptName: String, sizePoints:
 func extraStyleTextNode(
   id: String, text: String, font: String, sizePoints: CGFloat,
   color: ExtraStyleRGBA, position: CGPoint, zIndex: Int,
-  visibleRange: ClosedRange<Int>?,
+  visibleRange: ClosedRange<Int>? = nil,
   maxWidthPoints: CGFloat? = nil,
   strokeColor: ExtraStyleRGBA? = nil, strokeWidthPoints: CGFloat = 0,
   alignment: NSTextAlignment = .center,
