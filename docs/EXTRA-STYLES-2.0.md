@@ -1033,8 +1033,12 @@ does not travel with a song — it belongs to the video it was designed for.
 
 ## 15. v1 templates — migration proposal
 
-**Proposed: keep the 30 v1 templates working as legacy styles. Do not delete them, do not rebuild
-them in Phase 2/3, and do not auto-migrate existing projects.**
+**DECIDED by Jaizon (2026-11-13 ~01:25 MST): RETIRE all 30 v1 templates when 2.0 ships.** This supersedes the keep-as-legacy proposal below, which is retained here only as the record of what was considered.
+
+Retirement means: when 2.0 ships, the Lyrics panel's Extra tab (the 30 v1 templates) is removed; a project that stores a `templateId` opens with classic lyrics (no template) and a notice, never a crash — the §14.2 migration maps each v1 `templateId` to its 2.0 successor where one exists, otherwise to classic. The v1 rendering path (JS overlay + Swift CALayer burn-in) may be deleted once the migration is in place; the 2.0 demos already cover two v1 concepts (Emoji Storytelling, Comic Book) as rebuilds.
+
+**Original proposal (superseded — keep-as-legacy, NOT adopted):** keep the 30 v1 templates working as legacy styles. Do not delete them, do not rebuild
+them in Phase 2/3, and do not auto-migrate existing projects.
 
 Reasons:
 
@@ -1061,9 +1065,7 @@ Concretely:
   2.0 demos already cover two of them), and v1 templates can be retired individually once their
   2.0 successors exist. Retirement is a per-template decision, never a bulk deletion.
 
-**DECISION for Jaizon:** confirm "keep v1 as legacy" (recommended) vs "retire v1 when 2.0 ships".
-The plan is written for "keep"; retiring changes §14.2 (a migration that maps each v1 templateId
-to its 2.0 successor or to classic) and the Lyrics panel (the Extra tab is removed).
+**DECISION — MADE by Jaizon (2026-11-13 ~01:25 MST): "retire v1 when 2.0 ships".** The plan is now written for retiring: §14.2 carries the migration (each v1 templateId maps to its 2.0 successor or to classic) and the Lyrics panel loses the Extra tab at ship time.
 
 ---
 
