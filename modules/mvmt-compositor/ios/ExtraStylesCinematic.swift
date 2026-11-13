@@ -536,9 +536,9 @@ final class FilmCreditsReimaginedExtraStyle: ExtraStyleDefinition {
           position: CGPoint(x: charCentreX - canvas.width / 2, y: 0),
           zIndex: 1,
           visibleRange: charStart...lineEndFrame,
-          colorParamId: "textColor",
           strokeColor: ExtraStyleRGBA(r: 0, g: 0, b: 0, a: 0.6),
           strokeWidthPoints: max(1, sizePoints * 0.03),
+          colorParamId: "textColor",
           tracks: [
             ExtraStyleTrack(
               property: .positionX,

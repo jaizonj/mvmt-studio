@@ -904,15 +904,21 @@ final class OpticalIllusionExtraStyle: ExtraStyleDefinition {
             x += 24
           }
           let waveId = "opt-wave-\(lineIndex)-\(wave)"
-          builder.addChild(ExtraStyleNode(
+          let waveStroke: ExtraStyleRGBA = wave % 2 == 0 ? accent.withAlpha(0.8) : warmWhite.withAlpha(0.5)
+          let waveContent = ExtraStylePathContent(
+            path: wavePath,
+            strokeColor: waveStroke,
+            strokeWidth: 2, dash: nil)
+          let wavePosition = CGPoint(
+            x: -blockWidth / 2,
+            y: (CGFloat(wave) - 0.5) * blockHeight * 0.3)
+          let waveNode = ExtraStyleNode(
             id: waveId, kind: .path,
-            position: CGPoint(x: -blockWidth / 2, y: CGFloat(wave - 0.5) * blockHeight * 0.3),
+            position: wavePosition,
             anchor: .zero, zIndex: 0,
-            path: ExtraStylePathContent(
-              path: wavePath,
-              strokeColor: wave % 2 == 0 ? accent.withAlpha(0.8) : warmWhite.withAlpha(0.5),
-              strokeWidth: 2, dash: nil)
-          ))
+            path: waveContent
+          )
+          builder.addChild(waveNode)
           patternMembers.append(waveId)
         }
       default: // "rings"
