@@ -107,6 +107,23 @@ struct CompositeRequestRecord: Record {
   @Field
   var look: LookParamsRecord? = nil
 
+  /// Extra Styles 2.0 (docs/EXTRA-STYLES-2.0.md §6.6): the handle
+  /// of a prepared scene (from `prepareExtraStyleScene`). Preview
+  /// builds attach ExtraStylesCompositor to the composition
+  /// (grade folded in); export builds carry the handle through to
+  /// the post-render transcode instead — the transcode's
+  /// single-instruction composition is where a custom compositor
+  /// and the animation tool already combine freely, while direct
+  /// attachment to the export composition is unproven alongside
+  /// the animation tool in one AVAssetExportSession pass. The
+  /// compositor class is the same either way, so switching to
+  /// direct export attachment later is a one-line change in
+  /// buildComposition + removing the transcode forcing in render.
+  /// Nil = no scene; a stale/unknown handle renders without a
+  /// scene, never a failure.
+  @Field
+  var extraStyleSceneHandle: String? = nil
+
   /// Export size control — RENDER-ONLY fields (read by `render`,
   /// never by the builder): the export session can't take a bitrate,
   /// so when either is set the finished file is transcoded at an
@@ -851,6 +868,12 @@ private struct BuiltComposition {
   /// composition grades at display time through
   /// LookVideoCompositor instead.
   let pendingGrade: LookParamsRecord?
+  /// EXPORT builds only: the Extra Styles 2.0 scene handle the
+  /// render path must still apply to the finished file (in the
+  /// same post-render transcode as the grade). Always nil for
+  /// preview builds: their video composition carries the scene
+  /// through ExtraStylesCompositor instead.
+  let pendingExtraStyleSceneHandle: String?
 }
 
 // MARK: - Loudness measurement support (auto volume)
@@ -987,6 +1010,25 @@ private final class KWeightingFilter {
 // animation tool to a preview player item throws on device
 // (crash log MVMTStudio-2026-11-09-220942); the app overlays the logo
 // in previews at the JS layer instead.
+
+// MARK: - Extra Styles 2.0 support
+//
+// Narrow internal surface for the Extra Styles engine
+// (ExtraStyles*.swift). MvmtCompositorEngine is file-private, so
+// the two calls the scene compositor needs — URL resolution and
+// the Look grade — are forwarded here rather than widening the
+// whole engine's visibility. Nothing else in the engine is
+// exposed; the scene compositor never touches compositions,
+// export sessions, or capture.
+enum ExtraStyleEngineSupport {
+  static func resolveURL(_ raw: String) -> URL {
+    MvmtCompositorEngine.resolveURL(raw)
+  }
+
+  static func gradedImage(_ source: CIImage, look: LookParamsRecord) -> CIImage {
+    MvmtCompositorEngine.gradedImage(source, look: look)
+  }
+}
 
 private enum MvmtCompositorEngine {
   /// File paths may arrive as `file://` URIs or plain paths.
@@ -1557,13 +1599,39 @@ private enum MvmtCompositorEngine {
       }
     }
 
+    // ---- Optional Extra Style scene (2.0) ----
+    // Same two-home rule as the grade. PREVIEW builds attach
+    // ExtraStylesCompositor (the grade folded in via the shared
+    // slot, §6.2: grade first, then the scene) — it replaces
+    // LookVideoCompositor when both are present, so the look block
+    // above installs the Look class and this overrides it. EXPORT
+    // builds carry the handle out as
+    // BuiltComposition.pendingExtraStyleSceneHandle and render()
+    // applies it in the post-render transcode. A stale/unknown
+    // handle renders without a scene: the store lookup is the only
+    // gate, and a miss is not an error.
+    var pendingExtraStyleSceneHandle: String?
+    if let handle = request.extraStyleSceneHandle,
+      let scene = ExtraStyleSceneStore.shared.get(handle)
+    {
+      if forExport {
+        pendingExtraStyleSceneHandle = handle
+      } else {
+        let slotLook = request.look.flatMap { lookIsIdentity($0) ? nil : $0 }
+        ExtraStyleCompositorStore.current = ExtraStyleCompositorSlot(
+          scene: scene, look: slotLook)
+        videoComposition.customVideoCompositorClass = ExtraStylesCompositor.self
+      }
+    }
+
     return BuiltComposition(
       composition: composition,
       videoComposition: videoComposition,
       audioMix: audioMix,
       duration: totalDuration,
       appliedGainDb: appliedGainDb,
-      pendingGrade: pendingGrade
+      pendingGrade: pendingGrade,
+      pendingExtraStyleSceneHandle: pendingExtraStyleSceneHandle
     )
   }
 
@@ -5049,8 +5117,10 @@ private enum MvmtCompositorEngine {
     // only the first 80% of the progress bar — the transcode
     // reports the rest, so the bar never sits at 100% mid-work.
     let pendingGrade = built.pendingGrade
+    let pendingExtraStyleSceneHandle = built.pendingExtraStyleSceneHandle
     let transcodePlanned =
       request.exportVideoBitrate != nil || request.exportTargetSizeMB != nil || pendingGrade != nil
+      || pendingExtraStyleSceneHandle != nil
     let progressCeiling = transcodePlanned ? 0.8 : 1.0
 
     let progressTask: Task<Void, Never>? = (exportId != nil && onProgress != nil)
@@ -5199,11 +5269,12 @@ private enum MvmtCompositorEngine {
       targetBitrate = videoBitrate(forTargetSizeMB: targetMB, durationSeconds: renderSeconds)
     } else if let fixed = request.exportVideoBitrate, fixed > 0 {
       targetBitrate = Int(fixed)
-    } else if pendingGrade != nil {
-      // Grade-only pass: no size fields were set, so the rate is
-      // chosen for transparency — 0.22 bits per pixel-frame clamped
-      // to 16–50 Mbps, one generation down from a HighestQuality
-      // master, at the render's own canvas/frame rate, H.264.
+    } else if pendingGrade != nil || pendingExtraStyleSceneHandle != nil {
+      // Grade/scene-only pass: no size fields were set, so the rate
+      // is chosen for transparency — 0.22 bits per pixel-frame
+      // clamped to 16–50 Mbps, one generation down from a
+      // HighestQuality master, at the render's own canvas/frame
+      // rate, H.264.
       let pixels = Double(transcodeCanvasSize.width) * Double(transcodeCanvasSize.height)
       targetBitrate = min(50_000_000, max(16_000_000, Int(pixels * transcodeFrameRate * 0.22)))
       transcodeCodec = "h264"
@@ -5254,6 +5325,7 @@ private enum MvmtCompositorEngine {
         frameRate: transcodeFrameRate,
         grade: pendingGrade,
         animationTool: burnTool,
+        sceneHandle: pendingExtraStyleSceneHandle,
         onProgress: transcodeProgress
       )
       var usedBitrate = targetBitrate
@@ -5278,6 +5350,7 @@ private enum MvmtCompositorEngine {
               frameRate: transcodeFrameRate,
               grade: pendingGrade,
               animationTool: burnTool,
+              sceneHandle: pendingExtraStyleSceneHandle,
               onProgress: transcodeProgress
             )
           {
@@ -5559,7 +5632,10 @@ private enum MvmtCompositorEngine {
   /// the canvas (the render's own dimensions). When `grade` is set,
   /// the reader side uses a plain single-instruction composition
   /// whose custom compositor is LookVideoCompositor — the
-  /// export-side home of the look. Audio is re-encoded to AAC
+  /// export-side home of the look. When `sceneHandle` resolves to
+  /// a prepared Extra Styles scene, the same composition carries
+  /// ExtraStylesCompositor instead (the grade folded in, §6.2) —
+  /// the export-side home of the scene. Audio is re-encoded to AAC
   /// 192k stereo first (a format this code fully controls), with
   /// stored-format passthrough as the fallback attempt. Returns
   /// nil on ANY failure — the caller delivers the original render.
@@ -5571,6 +5647,7 @@ private enum MvmtCompositorEngine {
     frameRate: Double,
     grade: LookParamsRecord? = nil,
     animationTool: AVVideoCompositionCoreAnimationTool? = nil,
+    sceneHandle: String? = nil,
     onProgress: ((Double) -> Void)? = nil
   ) async -> URL? {
     let asset = AVURLAsset(url: sourceURL)
@@ -5608,6 +5685,7 @@ private enum MvmtCompositorEngine {
         frameRate: frameRate,
         grade: grade,
         animationTool: animationTool,
+        sceneHandle: sceneHandle,
         passthroughAudio: passthroughAudio,
         onProgress: onProgress
       ) {
@@ -5635,6 +5713,7 @@ private enum MvmtCompositorEngine {
     frameRate: Double,
     grade: LookParamsRecord?,
     animationTool: AVVideoCompositionCoreAnimationTool?,
+    sceneHandle: String? = nil,
     passthroughAudio: Bool,
     onProgress: ((Double) -> Void)?
   ) async -> URL? {
@@ -5643,14 +5722,25 @@ private enum MvmtCompositorEngine {
     // attempt exits by ANY path (setup failure, pump failure, or
     // success). The defer is registered first and only acts for a
     // graded attempt, so an ungraded attempt never disturbs a
-    // preview's slot.
+    // preview's slot. A scene attempt installs the scene slot the
+    // same way (grade folded in — the scene compositor is the one
+    // reading it).
     defer {
       if grade != nil {
         LookCompositorStore.current = nil
       }
+      if sceneHandle != nil {
+        ExtraStyleCompositorStore.current = nil
+      }
     }
     if let grade {
       LookCompositorStore.current = grade
+    }
+    var scene: PreparedExtraStyleScene? = nil
+    if let sceneHandle, let found = ExtraStyleSceneStore.shared.get(sceneHandle) {
+      scene = found
+      ExtraStyleCompositorStore.current = ExtraStyleCompositorSlot(
+        scene: found, look: grade)
     }
 
     guard
@@ -5678,10 +5768,10 @@ private enum MvmtCompositorEngine {
         // Reader-side video path. The ungraded path is deliberately
         // boring: a plain track output with NO video composition,
         // so the master file's own frames and timestamps flow
-        // straight to the writer's encoder. Only a graded attempt
-        // uses a composition output, and then only a plain
-        // single-instruction composition graded by the same custom
-        // compositor the preview uses.
+        // straight to the writer's encoder. Only a graded attempt,
+        // a scene attempt, or an animation-tool attempt uses a
+        // composition output, and then only a plain
+        // single-instruction composition.
         let targetFrameDuration = CMTime(
           value: 1,
           timescale: CMTimeScale(max(1.0, frameRate).rounded())
@@ -5691,20 +5781,25 @@ private enum MvmtCompositorEngine {
             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         ]
         let createdVideoOutput: AVAssetReaderOutput
-        if grade != nil || animationTool != nil {
+        if grade != nil || animationTool != nil || scene != nil {
           // COMPOSITION pass: one instruction over the full
           // duration, one layer carrying the aspect-fill
           // normalisation. A grade installs LookVideoCompositor
           // as the custom compositor (its params were installed
           // in LookCompositorStore at the start of this attempt);
-          // an animation tool (a repaired master's overlay
-          // burn-in — see render()) rides the same composition.
-          // The two combine freely: grade the frames, then the
-          // tool composites its layers over them.
+          // a scene installs ExtraStylesCompositor instead — it
+          // folds the grade in (§6.2), reading scene + grade from
+          // ExtraStyleCompositorStore; an animation tool (a
+          // repaired master's overlay burn-in — see render())
+          // rides the same composition. The three combine freely:
+          // grade the frames, composite the scene over them, then
+          // the tool composites its layers over that.
           let composition = AVMutableVideoComposition()
           composition.renderSize = canvasSize
           composition.frameDuration = targetFrameDuration
-          if grade != nil {
+          if scene != nil {
+            composition.customVideoCompositorClass = ExtraStylesCompositor.self
+          } else if grade != nil {
             composition.customVideoCompositorClass = LookVideoCompositor.self
           }
           if let animationTool {
@@ -8917,6 +9012,47 @@ public class MvmtCompositorModule: Module {
       await MainActor.run {
         PreviewStore.shared.release(previewId: previewId)
       }
+    }
+
+    // ---- Extra Styles 2.0 (docs/EXTRA-STYLES-2.0.md §6.6) ----
+    // The scene engine's bridge surface. Scene data crosses once
+    // at preparation; per-frame evaluation is native-only. The
+    // throwing functions reject on failure (the TS wrappers turn
+    // that into null/false); the nullable ones return null instead.
+    AsyncFunction("getExtraStyleCatalog") { () -> String in
+      ExtraStylesEngine.catalogJSON()
+    }
+
+    AsyncFunction("prepareExtraStyleScene") { (input: ExtraStyleSceneBuildInputRecord) -> String in
+      try ExtraStylesEngine.prepareScene(input)
+    }
+
+    AsyncFunction("updateExtraStyleParams") { (handle: String, paramsJson: String) in
+      try ExtraStylesEngine.updateParams(handle: handle, paramsJson: paramsJson)
+    }
+
+    AsyncFunction("prepareAudioAutomation") { (uri: String) -> String? in
+      await ExtraStylesAudio.prepareAutomation(uri: uri)
+    }
+
+    AsyncFunction("prepareSubjectMasks") { (takeUri: String) -> String? in
+      await ExtraStylesMasks.prepareMasks(takeUri: takeUri)
+    }
+
+    AsyncFunction("renderExtraStylePreviewFrame") { (handle: String, frame: Int, width: Double, height: Double) -> String? in
+      ExtraStylesEngine.renderPreviewFrame(handle: handle, frame: frame, width: width, height: height)
+    }
+
+    AsyncFunction("releaseExtraStyleScene") { (handle: String) in
+      ExtraStylesEngine.releaseScene(handle: handle)
+    }
+
+    AsyncFunction("getExtraStyleProfile") { () -> String in
+      ExtraStyleProfiler.shared.snapshotJSON()
+    }
+
+    AsyncFunction("benchmarkExtraStyleNodes") { () -> String in
+      ExtraStylesMetalSpike.benchmarkJSON()
     }
 
     View(MvmtPreviewView.self) {

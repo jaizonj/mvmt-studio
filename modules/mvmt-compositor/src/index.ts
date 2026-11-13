@@ -260,6 +260,19 @@ export interface CompositeRequest {
    * never affected — only the built composition.
    */
   normalizeVolume?: boolean;
+  /**
+   * Extra Styles 2.0 scene handle (docs/EXTRA-STYLES-2.0.md §6):
+   * the handle returned by `prepareExtraStyleScene`. When set, the
+   * preview composition renders the scene through
+   * ExtraStylesCompositor (grade folded in); the export render
+   * applies the scene in its post-render transcode instead — the
+   * proven transcode slot, not a direct export-composition
+   * attachment (the direct path is unproven alongside the
+   * animation tool; the transcode slot already combines a custom
+   * compositor with the tool). Absent = no 2.0 scene, exactly as
+   * before.
+   */
+  extraStyleSceneHandle?: string | null;
 }
 
 /**
@@ -481,6 +494,47 @@ export interface PreviewStatusEvent {
   message?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Extra Styles 2.0 — scene-build input (docs/EXTRA-STYLES-2.0.md
+// §3.2). The ONE structured record the scene engine takes: lyric
+// lines + words in COMPOSITION seconds, stored intelligence copied
+// through unconditionally (no activation gate — the v1 Emoji Story
+// failure), params as one JSON string. The native side builds the
+// scene graph from this; per-frame evaluation never crosses the
+// bridge.
+// ---------------------------------------------------------------------------
+
+export interface ExtraStyleSceneWordInput {
+  text: string;
+  startSeconds: number;
+  endSeconds: number;
+}
+
+export interface ExtraStyleSceneLineInput {
+  text: string;
+  startSeconds: number;
+  endSeconds: number;
+  words?: ExtraStyleSceneWordInput[];
+  emoji?: string;
+  tone?: string;
+  emphasisWordIndices?: number[];
+  semanticTags?: string[];
+}
+
+export interface ExtraStyleSceneBuildInput {
+  styleId: string;
+  paramsJson: string;
+  layersJson?: string | null;
+  lines: ExtraStyleSceneLineInput[];
+  seed: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  durationFrames: number;
+  fps?: number;
+  automationJson?: string | null;
+  maskRefJson?: string | null;
+}
+
 type Listener<T> = (event: T) => void;
 interface Subscription {
   remove(): void;
@@ -524,6 +578,18 @@ interface NativeMvmtCompositorModule {
   setPreviewPaused(previewId: string, paused: boolean): Promise<void>;
   seekPreview(previewId: string, seconds: number): Promise<void>;
   releasePreview(previewId: string): Promise<void>;
+  // Extra Styles 2.0 (docs/EXTRA-STYLES-2.0.md §6.6) — the scene
+  // engine's bridge surface. All payloads are JSON strings; the
+  // scene-build input is the one structured record.
+  getExtraStyleCatalog(): Promise<string>;
+  prepareExtraStyleScene(input: ExtraStyleSceneBuildInput): Promise<string>;
+  updateExtraStyleParams(handle: string, paramsJson: string): Promise<void>;
+  prepareAudioAutomation(uri: string): Promise<string | null>;
+  prepareSubjectMasks(takeUri: string): Promise<string | null>;
+  renderExtraStylePreviewFrame(handle: string, frame: number, width: number, height: number): Promise<string | null>;
+  releaseExtraStyleScene(handle: string): Promise<void>;
+  getExtraStyleProfile(): Promise<string>;
+  benchmarkExtraStyleNodes(): Promise<string>;
   addListener(eventName: 'onExportProgress', listener: Listener<ExportProgressEvent>): Subscription;
   addListener(eventName: 'onPreviewProgress', listener: Listener<PreviewProgressEvent>): Subscription;
   addListener(eventName: 'onPreviewStatus', listener: Listener<PreviewStatusEvent>): Subscription;
@@ -966,6 +1032,142 @@ export async function seekPreview(previewId: string, seconds: number): Promise<v
 export async function releasePreview(previewId: string): Promise<void> {
   if (!nativeModule) return;
   return nativeModule.releasePreview(previewId);
+}
+
+// ---------------------------------------------------------------------------
+// Extra Styles 2.0 (docs/EXTRA-STYLES-2.0.md §6.6)
+//
+// The scene engine's bridge surface. Conventions follow the rest
+// of this module: the functions exist only in a linked build
+// (Expo Go → null / no-op / false), long work reports progress
+// and is cancellable by id where it applies, and nothing here
+// ever rejects where a fallback exists — a failed scene build
+// renders without a scene, never a failed preview or export.
+// ---------------------------------------------------------------------------
+
+/** The style catalog, as a JSON string (metadata only — §3.1). */
+export async function getExtraStyleCatalogJson(): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.getExtraStyleCatalog !== 'function') return null;
+  try {
+    const result = await nativeModule.getExtraStyleCatalog();
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a scene ahead of time: style id + params + lyric payload
+ * + automation/mask references in, a scene handle out. Resolves
+ * to the handle, or null when the build failed. This is where
+ * load time lives — the caller shows honest progress.
+ */
+export async function prepareExtraStyleSceneNative(
+  input: ExtraStyleSceneBuildInput,
+): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.prepareExtraStyleScene !== 'function') return null;
+  try {
+    const result = await nativeModule.prepareExtraStyleScene(input);
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Swap params in the compositor store without a rebuild (§6.3):
+ * the composition is NOT rebuilt, playback does not restart.
+ * Rejects only when the engine is missing or the handle is
+ * unknown — callers treat that as "params unchanged".
+ */
+export async function updateExtraStyleParamsNative(handle: string, paramsJson: string): Promise<void> {
+  const mod = requireModule();
+  if (typeof mod.updateExtraStyleParams !== 'function') {
+    throw new Error('Extra Styles are not available in this build.');
+  }
+  return mod.updateExtraStyleParams(handle, paramsJson);
+}
+
+/**
+ * Audio automation for a song (§9.2): one decode + FFT pass,
+ * cached per song. Resolves to the automation JSON, or null when
+ * the analysis could not run. Never rejects.
+ */
+export async function prepareAudioAutomationNative(uri: string): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.prepareAudioAutomation !== 'function') return null;
+  try {
+    const result = await nativeModule.prepareAudioAutomation(uri);
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Subject masks for a take (§10.2): person segmentation + face
+ * detection precomputed at 2 fps, cached per take. Resolves to
+ * the mask-index JSON, or null when unavailable. Never rejects.
+ */
+export async function prepareSubjectMasksNative(takeUri: string): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.prepareSubjectMasks !== 'function') return null;
+  try {
+    const result = await nativeModule.prepareSubjectMasks(takeUri);
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Render one frame of a prepared scene for a card preview
+ * (§12.2): the scene over a black frame at the requested size.
+ * Resolves to the PNG file URI, or null. Never rejects.
+ */
+export async function renderExtraStylePreviewFrameNative(
+  handle: string,
+  frame: number,
+  width: number,
+  height: number,
+): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.renderExtraStylePreviewFrame !== 'function') return null;
+  try {
+    const result = await nativeModule.renderExtraStylePreviewFrame(handle, frame, width, height);
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Free a prepared scene + its caches. Best-effort, never rejects. */
+export async function releaseExtraStyleSceneNative(handle: string): Promise<void> {
+  if (!nativeModule || typeof nativeModule.releaseExtraStyleScene !== 'function') return;
+  try {
+    await nativeModule.releaseExtraStyleScene(handle);
+  } catch {
+    // A stale handle is not an error worth surfacing.
+  }
+}
+
+/** Render-time profiler log (§13.1): ms/frame per style, as JSON. */
+export async function getExtraStyleProfileJson(): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.getExtraStyleProfile !== 'function') return null;
+  try {
+    const result = await nativeModule.getExtraStyleProfile();
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The Metal spike benchmark (§6.5): CI vs Metal frame times, as JSON. */
+export async function benchmarkExtraStyleNodesJson(): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.benchmarkExtraStyleNodes !== 'function') return null;
+  try {
+    const result = await nativeModule.benchmarkExtraStyleNodes();
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
 }
 
 export function addExportProgressListener(listener: Listener<ExportProgressEvent>): Subscription {
