@@ -121,6 +121,11 @@ export interface ExtraStyleMetadata {
   inputs: ExtraStyleInputKind[];
   needsAudioAutomation: boolean;
   needsSubjectMasks: boolean;
+  /** Param ids that rebuild the scene in place on change (docs
+   *  §8.2) — the native updateParams reads the definition's list;
+   *  the TS side uses this copy for the same decision. Absent =
+   *  none beyond `affects: 'layout'`. */
+  rebuildParamIds?: string[];
   /** Internal / harness styles — never shown in the UI. */
   internal?: boolean;
 }

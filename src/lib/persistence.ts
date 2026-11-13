@@ -24,6 +24,9 @@ export interface PersistedProjects {
   /** Song library (songs + their fixed lyrics). Optional: files
    * written before the library existed simply omit it. */
   songLibrary?: SongLibraryEntry[];
+  /** Extra Styles 2.0 recently used style ids, per device, most
+   *  recent first (max 5). Optional: older files omit it. */
+  recentExtraStyleIds?: string[];
 }
 
 const DIR_NAME = 'mvmt';

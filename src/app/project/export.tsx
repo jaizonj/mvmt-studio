@@ -34,6 +34,7 @@ import {
   TIER_DEFAULT_VIDEO_BITRATE_BPS,
 } from '../../lib/exportSize';
 import { useEqSongUri } from '../../lib/autoEq';
+import { useExtraStyleScene } from '../../lib/extra-styles/useExtraStyleScene';
 import { useMixMasterSongUri } from '../../lib/mixMaster';
 import { resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
@@ -192,6 +193,20 @@ export default function ExportScreen() {
   const cut: ValidatedCut | null =
     nativeCut && nativeCut.sig === edlSig ? nativeCut : fallbackCut;
 
+  // Extra Styles 2.0: the same scene the Editor preview carries
+  // (same hook, same preparation — here over the VALIDATED cut,
+  // so the scene's duration matches the render). The request
+  // below rides the handle; handleRender awaits an in-flight
+  // preparation before rendering, so a tap during preparation
+  // waits for the scene instead of racing it — and a failed
+  // preparation exports without the scene, with the state shown
+  // below, never a stall.
+  const extraStyleScene = useExtraStyleScene({
+    project: activeProject,
+    edl: cut?.edl ?? null,
+    takeUriById: takeUri,
+  });
+
   // Lyrics: the project's song-frame lines mapped to composition
   // seconds against the cut's own region start — the payload rides
   // on the ONE request below, so the render burns exactly what the
@@ -276,6 +291,10 @@ export default function ExportScreen() {
         canvasWidth: canvas.width,
         canvasHeight: canvas.height,
         lyrics: lyricsPayload,
+        // Extra Styles 2.0: the scene handle rides as a spread
+        // field (edlToCompositeRequest is owned by another
+        // workstream; CompositeRequest already carries it).
+        extraStyleSceneHandle: extraStyleScene.handle ?? null,
         ...sizeControl,
       };
     } catch {
@@ -294,6 +313,7 @@ export default function ExportScreen() {
     songUri,
     controlledBitrate,
     exportTargetSizeMB,
+    extraStyleScene.handle,
   ]);
 
   const requestKey = useMemo(() => (request ? JSON.stringify(request) : ''), [request]);
@@ -355,9 +375,22 @@ export default function ExportScreen() {
     setSaveNote(null);
     setPhase('rendering');
     try {
-      const rendered = await renderVideo({ ...request, exportId: exportIdRef.current });
+      // Extra Styles 2.0: a tap during scene preparation waits for
+      // it (usually under a second) and renders WITH the scene when
+      // it lands. A failed preparation exports without the scene —
+      // the state row below already says so, so this is not silent.
+      let renderRequest = request;
+      if (extraStyleScene.status === 'preparing') {
+        const handle = await extraStyleScene.awaitReady();
+        if (handle) renderRequest = { ...request, extraStyleSceneHandle: handle };
+      }
+      const rendered = await renderVideo({ ...renderRequest, exportId: exportIdRef.current });
       setResult(rendered);
-      setRenderedKey(requestKey);
+      // Keyed by the request that actually rendered (which may
+      // carry a scene handle that landed after the tap) — the live
+      // requestKey converges to the same value once the hook's
+      // state lands, so the completion stays valid.
+      setRenderedKey(JSON.stringify(renderRequest));
       setPhase('done');
       // Stamp the project Exported (Studio Continue card + Projects state line).
       studio.markProjectExported();
@@ -718,6 +751,27 @@ export default function ExportScreen() {
                           {mixMasterEnabled
                             ? 'On — tap to tune the stages and A/B the result.'
                             : 'Dynamic EQ + Master EQ, tuned per moment of the song.'}
+                        </Text>
+                      </View>
+                      <Ionicons name="chevron-forward" size={20} color={colors.labelSecondary} />
+                    </Pressable>
+                  </View>
+                  <View style={styles.optionBlock}>
+                    <Pressable
+                      style={styles.switchRow}
+                      onPress={() => router.push('/project/extra-styles')}
+                      accessibilityRole="button"
+                      accessibilityLabel="Extra Styles">
+                      <View style={styles.switchText}>
+                        <Text style={styles.optionLabel}>Extra Style</Text>
+                        <Text style={styles.blockHint}>
+                          {extraStyleScene.status === 'preparing'
+                            ? `${extraStyleScene.styleName ?? 'Style'} — preparing…`
+                            : extraStyleScene.status === 'failed'
+                              ? 'Couldn’t be prepared on this device — exporting without it.'
+                              : extraStyleScene.styleName
+                                ? `${extraStyleScene.styleName} — tap to change it.`
+                                : 'None — tap to browse animated scenes for this video.'}
                         </Text>
                       </View>
                       <Ionicons name="chevron-forward" size={20} color={colors.labelSecondary} />

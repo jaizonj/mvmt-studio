@@ -30,6 +30,7 @@ export default function RootLayout() {
             <Stack.Screen name="project/editor" options={{ animation: 'slide_from_bottom' }} />
             <Stack.Screen name="project/export" options={{ animation: 'slide_from_bottom' }} />
             <Stack.Screen name="project/mix-master" options={{ animation: 'slide_from_bottom' }} />
+            <Stack.Screen name="project/extra-styles" options={{ animation: 'slide_from_bottom' }} />
           </Stack>
         </StudioProvider>
       </SafeAreaProvider>

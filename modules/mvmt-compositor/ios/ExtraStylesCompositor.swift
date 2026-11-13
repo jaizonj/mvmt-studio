@@ -1052,6 +1052,7 @@ final class ExtraStyleRegistry {
 
   private init() {
     register(HarnessExtraStyle())
+    ExtraStylesPhase3.registerAll(into: self)
   }
 
   func register(_ definition: any ExtraStyleDefinition) {
@@ -1084,6 +1085,7 @@ final class ExtraStyleRegistry {
         "needsSubjectMasks": def.needsSubjectMasks,
       ]
       if !def.presets.isEmpty { entry["presets"] = def.presets }
+      if !def.rebuildParamIds.isEmpty { entry["rebuildParamIds"] = def.rebuildParamIds }
       if def.internalStyle { entry["internal"] = true }
       return entry
     }
@@ -3174,6 +3176,124 @@ enum ExtraStylesEngine {
     else { return nil }
     CGImageDestinationAddImage(destination, cgImage, nil)
     guard CGImageDestinationFinalize(destination) else { return nil }
+    return url.absoluteString
+  }
+
+  // -- Preview clip (Phase 3, §12.2) --
+  //
+  // Render a short looping preview VIDEO of a prepared scene over a
+  // background clip (the bundled sample clip for catalog cards):
+  // one AVAssetImageGenerator frame per output frame as the base,
+  // the scene rendered over it by the same renderer preview/export
+  // use, written out with AVAssetWriter (H.264). The card UI plays
+  // the mp4 looping with expo-video — no JS-side frame assembly,
+  // no per-frame PNGs on disk.
+  //
+  // Nil on any failure (unknown handle, unreadable clip, writer
+  // error) — the caller shows the card without a preview, never a
+  // stall. Frame count is capped (150) so a bad duration cannot
+  // turn a card render into a long job.
+  static func renderPreviewClip(
+    handle: String, width: Double, height: Double,
+    videoUri: String, durationSeconds: Double, fps: Double
+  ) async -> String? {
+    guard let prepared = ExtraStyleSceneStore.shared.get(handle),
+      width > 0, height > 0, durationSeconds > 0, fps > 0
+    else { return nil }
+    let size = CGSize(width: width, height: height)
+    let frameCount = min(150, max(1, Int((durationSeconds * fps).rounded())))
+    guard let videoURL = URL(string: videoUri) else { return nil }
+    let asset = AVAsset(url: videoURL)
+    guard (try? await asset.loadTracks(withMediaType: .video))?.isEmpty == false else { return nil }
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.requestedTimeToleranceBefore = .zero
+    generator.requestedTimeToleranceAfter = .zero
+    generator.maximumSize = size
+
+    guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
+    let url = caches.appendingPathComponent("mvmt-extra-style-clip-\(UUID().uuidString).mp4")
+    let videoSettings: [String: Any] = [
+      AVVideoCodecKey: AVVideoCodecType.h264,
+      AVVideoWidthKey: Int(size.width),
+      AVVideoHeightKey: Int(size.height),
+      AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 4_000_000],
+    ]
+    guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mp4) else { return nil }
+    let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+    input.expectsMediaDataInRealTime = false
+    guard writer.canAdd(input) else { return nil }
+    writer.add(input)
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+      assetWriterInput: input,
+      sourcePixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey as String: Int(size.width),
+        kCVPixelBufferHeightKey as String: Int(size.height),
+      ]
+    )
+    let renderer = ExtraStyleSceneRenderer(canvas: size)
+    let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    let black = CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: size))
+    writer.startWriting()
+    writer.startSession(atSourceTime: .zero)
+    for i in 0..<frameCount {
+      let seconds = Double(i) / fps
+      let presentationTime = CMTime(seconds: seconds, preferredTimescale: 600)
+      // Video frame at the output time; the scene frame on the
+      // 30fps grid (a 15fps card samples every other scene frame).
+      let videoTime = CMTime(seconds: seconds, preferredTimescale: 600)
+      let sceneFrame = Int((seconds * 30).rounded())
+      var base = black
+      if let cgImage = try? generator.copyCGImage(at: videoTime, actualTime: nil) {
+        var frameImage = CIImage(cgImage: cgImage)
+        if frameImage.extent.size != size {
+          let scaleX = size.width / max(1, frameImage.extent.width)
+          let scaleY = size.height / max(1, frameImage.extent.height)
+          frameImage = frameImage
+            .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            .cropped(to: CGRect(origin: .zero, size: size))
+        }
+        base = frameImage
+      }
+      let rendered = renderer.render(prepared: prepared, frame: sceneFrame, base: base)
+      // Wait for the writer (bounded — a stuck writer fails the
+      // clip instead of hanging the card render).
+      var waited = 0
+      while !input.isReadyForMoreMediaData && waited < 200 {
+        try? await Task.sleep(nanoseconds: 5_000_000)
+        waited += 1
+      }
+      guard input.isReadyForMoreMediaData,
+        let pool = adaptor.pixelBufferPool
+      else {
+        writer.cancelWriting()
+        try? FileManager.default.removeItem(at: url)
+        return nil
+      }
+      var pixelBuffer: CVPixelBuffer?
+      guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer) == kCVReturnSuccess,
+        let buffer = pixelBuffer
+      else {
+        writer.cancelWriting()
+        try? FileManager.default.removeItem(at: url)
+        return nil
+      }
+      ciContext.render(rendered.image.cropped(to: CGRect(origin: .zero, size: size)), to: buffer)
+      guard adaptor.append(buffer, withPresentationTime: presentationTime) else {
+        writer.cancelWriting()
+        try? FileManager.default.removeItem(at: url)
+        return nil
+      }
+    }
+    input.markAsFinished()
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      writer.finishWriting { continuation.resume() }
+    }
+    guard writer.status == .completed else {
+      try? FileManager.default.removeItem(at: url)
+      return nil
+    }
     return url.absoluteString
   }
 

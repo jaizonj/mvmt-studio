@@ -124,6 +124,10 @@ export function validateExtraStyleState(
   catalog: ExtraStyleCatalog,
 ): ValidatedExtraStyle {
   if (!stored) return { state: null };
+  // Favorites-only shell: the project has hearted styles but none
+  // selected (empty styleId — see toggleFavoriteExtraStyle in
+  // StudioContext). Not an error, not a notice — keep it as-is.
+  if (stored.styleId === '') return { state: stored };
   const definition: ExtraStyleMetadata | undefined = catalog.styles.find(
     (s) => s.id === stored.styleId,
   );

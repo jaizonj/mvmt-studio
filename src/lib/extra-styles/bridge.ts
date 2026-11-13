@@ -16,6 +16,7 @@ import {
   updateExtraStyleParamsNative,
   prepareAudioAutomationNative,
   prepareSubjectMasksNative,
+  renderExtraStylePreviewClipNative,
   renderExtraStylePreviewFrameNative,
   releaseExtraStyleSceneNative,
   getExtraStyleProfileJson,
@@ -128,6 +129,25 @@ export async function renderExtraStylePreviewFrame(
 ): Promise<string | null> {
   if (!isCompositorAvailable()) return null;
   return renderExtraStylePreviewFrameNative(handle, frame, width, height);
+}
+
+/**
+ * Render a short looping preview VIDEO of a prepared scene over a
+ * background clip (Phase 3, §12.2): the scene over the clip's
+ * frames at the requested size, written as an H.264 mp4. Resolves
+ * to the file URI, or null. The caller caches the clip on disk
+ * (cardPreviews.ts); the card UI loops it with expo-video.
+ */
+export async function renderExtraStylePreviewClip(
+  handle: string,
+  videoUri: string,
+  width: number,
+  height: number,
+  durationSeconds: number,
+  fps: number,
+): Promise<string | null> {
+  if (!isCompositorAvailable()) return null;
+  return renderExtraStylePreviewClipNative(handle, width, height, videoUri, durationSeconds, fps);
 }
 
 /** Free a prepared scene + its caches (docs §6.6). */

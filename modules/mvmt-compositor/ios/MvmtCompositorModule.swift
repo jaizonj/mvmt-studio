@@ -9043,6 +9043,13 @@ public class MvmtCompositorModule: Module {
       ExtraStylesEngine.renderPreviewFrame(handle: handle, frame: frame, width: width, height: height)
     }
 
+    AsyncFunction("renderExtraStylePreviewClip") { (handle: String, width: Double, height: Double, videoUri: String, durationSeconds: Double, fps: Double) -> String? in
+      await ExtraStylesEngine.renderPreviewClip(
+        handle: handle, width: width, height: height,
+        videoUri: videoUri, durationSeconds: durationSeconds, fps: fps
+      )
+    }
+
     AsyncFunction("releaseExtraStyleScene") { (handle: String) in
       ExtraStylesEngine.releaseScene(handle: handle)
     }

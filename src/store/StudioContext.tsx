@@ -3,6 +3,9 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import { warmUpEqSong } from '../lib/autoEq';
 import type { Edl } from '../lib/edl';
+import { migrateV1Template, validateExtraStyleState } from '../lib/extra-styles/persistence';
+import { getCachedExtraStyleCatalog } from '../lib/extra-styles/prepare';
+import type { ExtraStyleParamValue, ExtraStyleState } from '../lib/extra-styles/types';
 import { effectiveLook } from '../lib/looks';
 import { cleanDetectedLyrics, lyricLinesHaveRealWords, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { lyricTemplateById } from '../lib/lyricTemplates';
@@ -258,6 +261,29 @@ interface StudioState {
   /** Store a look on the active project (preset pick, intensity, slider overrides). */
   setProjectLook: (look: ProjectLook) => void;
 
+  /**
+   * The active project's Extra Style 2.0 state — null when the
+   * project has none (classic lyrics render). A state with an
+   * empty `styleId` is the favorites-only shell: the project has
+   * hearted styles but none selected (see
+   * toggleFavoriteExtraStyle). A creative choice, so a track
+   * change does NOT clear it.
+   */
+  extraStyle: ExtraStyleState | null;
+  /** Select a style (with its parameters), or clear it — clearing
+   *  keeps the project's favorites (collapses to the shell). */
+  setExtraStyle: (state: ExtraStyleState | null) => void;
+  /** Patch the selected style's parameter values. No-op when none selected. */
+  updateExtraStyleParams: (patch: Partial<Record<string, ExtraStyleParamValue>>) => void;
+  /** Heart/unheart a 2.0 style (per-project favorite, on the state's favoriteStyleIds). */
+  toggleFavoriteExtraStyle: (styleId: string) => void;
+  /** Notices from load-time v1 retirement migration / 2.0 state validation. */
+  extraStyleNotices: string[];
+  clearExtraStyleNotices: () => void;
+  /** Recently used 2.0 styles, per device, most recent first (max 5). */
+  recentExtraStyleIds: string[];
+  recordRecentExtraStyle: (styleId: string) => void;
+
   // ---- Global camera + settings preferences ----
   facing: CameraType;
   setFacing: (f: CameraType | ((current: CameraType) => CameraType)) => void;
@@ -346,6 +372,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [exportQuality, setExportQuality] = useState<ExportQualityPref>('balanced');
   const [exportTargetSizeMB, setExportTargetSizeMB] = useState(0);
   const [autoVolume, setAutoVolume] = useState(true);
+  // Extra Styles 2.0: load-time migration/validation notices, and
+  // the device's recently used styles (persisted with the project list).
+  const [extraStyleNotices, setExtraStyleNotices] = useState<string[]>([]);
+  const [recentExtraStyleIds, setRecentExtraStyleIds] = useState<string[]>([]);
 
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
@@ -366,8 +396,46 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       const loaded = await loadProjects();
       if (!alive) return;
       if (loaded && loaded.projects.length > 0) {
-        setProjects(cleanStoredLyrics(loaded.projects));
+        const cleaned = cleanStoredLyrics(loaded.projects);
+        // Extra Styles 2.0 load pass (catalog available only on a
+        // native build — in Expo Go the catalog is null and stored
+        // v1 templates / 2.0 state are left exactly as they are, so
+        // nothing migrates until a build that can verify it):
+        //  - a stored v1 templateId retires one-shot into its 2.0
+        //    successor (or classic lyrics), with a notice;
+        //  - stored 2.0 state is validated against the registry
+        //    (unknown / newer-version styles drop with a notice).
+        // The templateId is cleared either way so the migration
+        // never re-runs; lyrics are untouched by both.
+        let migrated = cleaned;
+        const catalog = await getCachedExtraStyleCatalog();
+        if (catalog) {
+          const notices: string[] = [];
+          migrated = cleaned.map((p) => {
+            let next = p;
+            const templateId = p.lyrics?.templateId;
+            if (templateId && p.lyrics) {
+              const lyrics = p.lyrics;
+              const result = migrateV1Template(templateId, catalog);
+              if (result.notice) notices.push(result.notice);
+              next = {
+                ...next,
+                lyrics: { ...lyrics, templateId: undefined },
+                ...(result.state ? { extraStyle: result.state } : {}),
+              };
+            }
+            if (next.extraStyle) {
+              const validated = validateExtraStyleState(next.extraStyle, catalog);
+              if (validated.notice) notices.push(validated.notice);
+              next = { ...next, extraStyle: validated.state ?? undefined };
+            }
+            return next;
+          });
+          if (notices.length > 0) setExtraStyleNotices(notices);
+        }
+        setProjects(migrated);
         setSongLibrary(cleanStoredLibrary(loaded.songLibrary));
+        setRecentExtraStyleIds(loaded.recentExtraStyleIds ?? []);
         setActiveProjectId(
           loaded.activeProjectId && loaded.projects.some((p) => p.id === loaded.activeProjectId)
             ? loaded.activeProjectId
@@ -391,12 +459,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     if (!hydrated) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      void saveProjects({ version: 1, projects, activeProjectId, songLibrary });
+      void saveProjects({ version: 1, projects, activeProjectId, songLibrary, recentExtraStyleIds });
     }, 400);
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-  }, [projects, activeProjectId, songLibrary, hydrated]);
+  }, [projects, activeProjectId, songLibrary, recentExtraStyleIds, hydrated]);
 
   /** Patch the active project immutably + stamp updatedAt. */
   const patchActiveProject = useCallback((patch: Partial<Project>) => {
@@ -848,6 +916,77 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [patchActiveProject],
   );
 
+  // ---- Extra Styles 2.0 (Phase 3) ----
+  const extraStyle = activeProject?.extraStyle ?? null;
+
+  const setExtraStyle = useCallback(
+    (next: ExtraStyleState | null) => {
+      const current = activeProjectRef.current?.extraStyle;
+      if (!next) {
+        // Clearing keeps favorites: collapse to the shell when the
+        // project has hearted styles, otherwise drop the field.
+        const favs = current?.favoriteStyleIds;
+        if (favs && favs.length > 0) {
+          patchActiveProject({
+            extraStyle: { styleId: '', styleVersion: 1, params: {}, favoriteStyleIds: favs },
+          });
+        } else {
+          patchActiveProject({ extraStyle: undefined });
+        }
+        return;
+      }
+      // A new selection keeps the project's existing favorites
+      // unless it brings its own.
+      const favs = next.favoriteStyleIds ?? current?.favoriteStyleIds;
+      patchActiveProject({ extraStyle: favs ? { ...next, favoriteStyleIds: favs } : next });
+    },
+    [patchActiveProject],
+  );
+
+  const updateExtraStyleParams = useCallback(
+    (patch: Partial<Record<string, ExtraStyleParamValue>>) => {
+      const current = activeProjectRef.current?.extraStyle;
+      if (!current?.styleId) return;
+      // Strip undefined entries: the params record carries no
+      // undefined values, and a param edit never deletes a key.
+      const params: Record<string, ExtraStyleParamValue> = { ...current.params };
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === undefined) delete params[key];
+        else params[key] = value;
+      }
+      patchActiveProject({ extraStyle: { ...current, params } });
+    },
+    [patchActiveProject],
+  );
+
+  const toggleFavoriteExtraStyle = useCallback(
+    (styleId: string) => {
+      const current = activeProjectRef.current?.extraStyle;
+      const favs = current?.favoriteStyleIds ?? [];
+      const nextFavs = favs.includes(styleId)
+        ? favs.filter((id) => id !== styleId)
+        : [...favs, styleId];
+      if (current) {
+        patchActiveProject({ extraStyle: { ...current, favoriteStyleIds: nextFavs } });
+      } else {
+        patchActiveProject({
+          extraStyle: { styleId: '', styleVersion: 1, params: {}, favoriteStyleIds: nextFavs },
+        });
+      }
+    },
+    [patchActiveProject],
+  );
+
+  const clearExtraStyleNotices = useCallback(() => {
+    setExtraStyleNotices([]);
+  }, []);
+
+  const recordRecentExtraStyle = useCallback((styleId: string) => {
+    setRecentExtraStyleIds((current) =>
+      [styleId, ...current.filter((id) => id !== styleId)].slice(0, 5),
+    );
+  }, []);
+
   const addTake = useCallback(
     (take: Take) => {
       const current = activeProjectRef.current;
@@ -944,6 +1083,14 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       deleteSongLibraryEntry,
       look,
       setProjectLook,
+      extraStyle,
+      setExtraStyle,
+      updateExtraStyleParams,
+      toggleFavoriteExtraStyle,
+      extraStyleNotices,
+      clearExtraStyleNotices,
+      recentExtraStyleIds,
+      recordRecentExtraStyle,
       resolution,
       setResolution,
       frameRate,
@@ -1039,6 +1186,14 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       deleteSongLibraryEntry,
       look,
       setProjectLook,
+      extraStyle,
+      setExtraStyle,
+      updateExtraStyleParams,
+      toggleFavoriteExtraStyle,
+      extraStyleNotices,
+      clearExtraStyleNotices,
+      recentExtraStyleIds,
+      recordRecentExtraStyle,
       resolution,
       frameRate,
       captureQuality,

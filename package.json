@@ -58,7 +58,7 @@
     "test:library": "tsc --ignoreConfig src/lib/songLibrary.ts --outDir tests/.build-library --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/library.test.cjs",
     "test:looks": "tsc --ignoreConfig src/lib/looks.ts src/lib/exportSize.ts src/lib/loudness.ts --outDir tests/.build-looks --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/looks.test.cjs",
     "test:mixmaster": "tsc --ignoreConfig src/lib/mixMasterCurve.ts src/lib/mixMasterExport.ts --outDir tests/.build-mixmaster --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/mixmaster.test.cjs",
-    "test:extra-styles": "tsc --ignoreConfig src/lib/extra-styles/types.ts src/lib/extra-styles/animation.ts src/lib/extra-styles/params.ts src/lib/extra-styles/interpretation.ts src/lib/extra-styles/catalog.ts src/lib/extra-styles/automation.ts src/lib/extra-styles/persistence.ts src/lib/extra-styles/scene.ts --outDir tests/.build-extra-styles --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/extra-styles.test.cjs"
+    "test:extra-styles": "tsc --ignoreConfig src/lib/extra-styles/types.ts src/lib/extra-styles/animation.ts src/lib/extra-styles/params.ts src/lib/extra-styles/interpretation.ts src/lib/extra-styles/catalog.ts src/lib/extra-styles/automation.ts src/lib/extra-styles/persistence.ts src/lib/extra-styles/scene.ts src/lib/extra-styles/sample.ts --outDir tests/.build-extra-styles --rootDir . --module commonjs --target ES2022 --skipLibCheck && node --test tests/extra-styles.test.cjs"
   },
   "private": true
 }

@@ -13,4 +13,5 @@ export * from './catalog';
 export * from './automation';
 export * from './persistence';
 export * from './scene';
+export * from './sample';
 export * from './bridge';

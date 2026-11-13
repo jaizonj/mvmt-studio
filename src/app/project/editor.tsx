@@ -34,6 +34,7 @@ import {
 } from '../../components/TimelineStrip';
 import { effectiveRegion, estimateTakeEnergies } from '../../lib/analysis';
 import { useEqSongUri } from '../../lib/autoEq';
+import { useExtraStyleScene } from '../../lib/extra-styles/useExtraStyleScene';
 import { useMixMasterSongUri } from '../../lib/mixMaster';
 import { inspectAsset, isCompositorAvailable, type PreviewStatus } from '../../lib/compositor';
 import {
@@ -214,10 +215,10 @@ function EditorWorkspace() {
   // Edit consolidation (2026-11-13): the controls below the timeline
   // live in collapsible sections — one open at a time, all closed by
   // default, so the preview + timeline stay the hero.
-  const [openSection, setOpenSection] = useState<'modes' | 'shuffle' | 'look' | 'lyrics' | 'project' | null>(
+  const [openSection, setOpenSection] = useState<'modes' | 'shuffle' | 'look' | 'lyrics' | 'project' | 'extra-styles' | null>(
     null,
   );
-  const toggleSection = (section: 'modes' | 'shuffle' | 'look' | 'lyrics' | 'project') =>
+  const toggleSection = (section: 'modes' | 'shuffle' | 'look' | 'lyrics' | 'project' | 'extra-styles') =>
     setOpenSection((current) => (current === section ? null : section));
   /** Uncommitted trim-drag result, shown in the timeline only (no
    *  history push, no preview rebuild) until the drag ends. */
@@ -846,18 +847,31 @@ function EditorWorkspace() {
   const mmSongUri = useMixMasterSongUri(edl?.audio.uri, studio.mixMasterEnabled, studio.mixMasterStages);
   const songUri = studio.mixMasterEnabled ? mmSongUri : eqSongUri;
 
+  // Extra Styles 2.0: the project's scene, prepared once and kept
+  // live — the handle rides the preview request below. A param
+  // edit never restarts playback (the native update keeps the
+  // handle); a style switch rebuilds the request key and the
+  // preview restarts, correctly. While 'preparing' the preview
+  // plays without the scene; 'failed' means the same, with a note
+  // in the Extra Styles section — never a stall.
+  const extraStyleScene = useExtraStyleScene({ project: activeProject, edl, takeUriById });
+
   const previewRequest = useMemo(() => {
     if (!edl || edl.segments.length === 0) return null;
     try {
-      return edlToCompositeRequest(edlWithTakeCanvas(edl, takes), takeUriById, {
+      const base = edlToCompositeRequest(edlWithTakeCanvas(edl, takes), takeUriById, {
         look: resolvedLook,
         normalizeVolume: studio.autoVolume,
         audioUri: songUri,
       });
+      // edlToCompositeRequest is owned by another workstream and
+      // takes no scene handle — the handle rides as a spread field
+      // on the built request (CompositeRequest already carries it).
+      return { ...base, extraStyleSceneHandle: extraStyleScene.handle ?? null };
     } catch {
       return null;
     }
-  }, [edl, takeUriById, takes, resolvedLook, studio.autoVolume, songUri]);
+  }, [edl, takeUriById, takes, resolvedLook, studio.autoVolume, songUri, extraStyleScene.handle]);
   const previewKey = previewRequest ? `${JSON.stringify(previewRequest)}#${previewNonce}` : '';
 
   const handleProgress = useCallback((pos: number, playing: boolean) => {
@@ -1540,6 +1554,44 @@ function EditorWorkspace() {
               onPlay={() => setPaused(false)}
               onPause={() => setPaused(true)}
             />
+          </CollapsibleSection>
+
+          {/* Extra Styles — the 2.0 scene engine: motion-graphics
+              compositions over the cut, separate from Traditional
+              Lyrics (the Lyrics section above is untouched). Tapping
+              through opens the dedicated catalog screen; the
+              preview above already shows the chosen style. */}
+          <CollapsibleSection
+            title="Extra Styles"
+            summary={
+              extraStyleScene.styleName
+                ? `${extraStyleScene.styleName}${extraStyleScene.status === 'preparing' ? ' · Preparing…' : ''}`
+                : 'None — classic lyrics'
+            }
+            open={openSection === 'extra-styles'}
+            onToggle={() => toggleSection('extra-styles')}
+            accessibilityLabel="Extra Styles section">
+            <Pressable
+              style={styles.shuffleButton}
+              onPress={() => router.push('/project/extra-styles')}
+              accessibilityRole="button"
+              accessibilityLabel="Browse Extra Styles">
+              <Ionicons name="sparkles" size={20} color={colors.onAccent} />
+              <Text style={styles.shuffleButtonText}>
+                {extraStyleScene.styleName ? 'Change Extra Style' : 'Browse Extra Styles'}
+              </Text>
+            </Pressable>
+            {extraStyleScene.status === 'failed' ? (
+              <Text style={styles.caption}>
+                That style couldn&apos;t be prepared on this device — the preview is showing the cut
+                without it. Try another style.
+              </Text>
+            ) : (
+              <Text style={styles.caption}>
+                Animated scenes over your video — physics type, comic panels, holograms, emoji
+                storytelling, and 35 more. Your lyrics stay exactly as they are.
+              </Text>
+            )}
           </CollapsibleSection>
         </ScrollView>
       )}

@@ -587,6 +587,14 @@ interface NativeMvmtCompositorModule {
   prepareAudioAutomation(uri: string): Promise<string | null>;
   prepareSubjectMasks(takeUri: string): Promise<string | null>;
   renderExtraStylePreviewFrame(handle: string, frame: number, width: number, height: number): Promise<string | null>;
+  renderExtraStylePreviewClip(
+    handle: string,
+    width: number,
+    height: number,
+    videoUri: string,
+    durationSeconds: number,
+    fps: number,
+  ): Promise<string | null>;
   releaseExtraStyleScene(handle: string): Promise<void>;
   getExtraStyleProfile(): Promise<string>;
   benchmarkExtraStyleNodes(): Promise<string>;
@@ -1132,6 +1140,37 @@ export async function renderExtraStylePreviewFrameNative(
   if (!nativeModule || typeof nativeModule.renderExtraStylePreviewFrame !== 'function') return null;
   try {
     const result = await nativeModule.renderExtraStylePreviewFrame(handle, frame, width, height);
+    return typeof result === 'string' && result.length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Render a short looping preview VIDEO of a prepared scene over a
+ * background clip (Phase 3, §12.2): the scene over the clip's
+ * frames, written as an H.264 mp4 the card UI loops with
+ * expo-video. Resolves to the file URI, or null. Best-effort,
+ * never rejects.
+ */
+export async function renderExtraStylePreviewClipNative(
+  handle: string,
+  width: number,
+  height: number,
+  videoUri: string,
+  durationSeconds: number,
+  fps: number,
+): Promise<string | null> {
+  if (!nativeModule || typeof nativeModule.renderExtraStylePreviewClip !== 'function') return null;
+  try {
+    const result = await nativeModule.renderExtraStylePreviewClip(
+      handle,
+      width,
+      height,
+      videoUri,
+      durationSeconds,
+      fps,
+    );
     return typeof result === 'string' && result.length > 0 ? result : null;
   } catch {
     return null;

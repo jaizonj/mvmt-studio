@@ -2,7 +2,6 @@ import {
   layoutSegments,
   segmentSpeed,
   segmentTimelineDurationFrames,
-  secondsToFrames,
   type Edl,
   type EdlSegment,
 } from './edl';

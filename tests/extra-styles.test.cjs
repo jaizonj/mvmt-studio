@@ -643,3 +643,146 @@ test('scene: seed is stable per (style, project) and differs across them', () =>
   });
   assert.equal(a.seed, b.seed);
 });
+
+// ---- Phase 3: card-preview sample data ---------------------------------------
+
+const {
+  SAMPLE_CARD_LINES,
+  CARD_PREVIEW_WIDTH,
+  CARD_PREVIEW_HEIGHT,
+  CARD_PREVIEW_FPS,
+  CARD_PREVIEW_DURATION_SECONDS,
+  CARD_PREVIEW_DURATION_FRAMES,
+  buildSyntheticAutomation,
+  buildSyntheticMaskIndex,
+  cardPreviewCacheKey,
+} = require('./.build-extra-styles/src/lib/extra-styles/sample.js');
+
+test('phase3 sample: card lines cover the 3s card, each with stored intelligence', () => {
+  assert.equal(CARD_PREVIEW_WIDTH, 540);
+  assert.equal(CARD_PREVIEW_HEIGHT, 960);
+  assert.equal(CARD_PREVIEW_FPS, 15);
+  assert.equal(CARD_PREVIEW_DURATION_SECONDS, 3);
+  assert.equal(CARD_PREVIEW_DURATION_FRAMES, 90);
+  assert.equal(SAMPLE_CARD_LINES.length, 3);
+  assert.deepEqual(SAMPLE_CARD_LINES.map((l) => [l.startFrame, l.endFrame]), [[0, 30], [30, 60], [60, 90]]);
+  for (const line of SAMPLE_CARD_LINES) {
+    // Every card line carries an emoji — emoji-driven styles must
+    // show one on the card, and the card must never render blank.
+    assert.ok(line.decor && line.decor.emoji, `card line "${line.text}" has an emoji`);
+    assert.ok(line.decor.tone, `card line "${line.text}" has a tone`);
+  }
+});
+
+test('phase3 sample: synthetic automation is a 120 BPM grid with confident beats', () => {
+  const auto = buildSyntheticAutomation();
+  assert.equal(auto.tempoBpm, 120);
+  assert.equal(auto.beatConfidence, 1);
+  assert.equal(auto.beats.length, 6, '3s at 120 BPM = 6 beats (0–2.5s)');
+  approx(auto.beats[0].timeSeconds, 0);
+  approx(auto.beats[5].timeSeconds, 2.5);
+  assert.equal(auto.beats[0].isDownbeat, true);
+  assert.equal(auto.beats[1].isDownbeat, false);
+  assert.equal(auto.beats[4].isDownbeat, true, 'downbeat every 4th beat');
+  assert.ok(auto.beats.every((b) => b.strength > 0 && b.strength <= 1));
+  assert.equal(auto.onsetEnvelope.values.length, 30, '3s at the 0.1s automation hop');
+  // Onset pulses on the beat and decays between beats.
+  assert.ok(auto.onsetEnvelope.values[5] > auto.onsetEnvelope.values[7], 'onset at beat 0.5s > 0.2s after it');
+  assert.equal(auto.bandEnergies.values.length, 30);
+  assert.ok(auto.bandEnergies.values.every((row) => row.length === 10));
+  assert.ok(auto.bandEnergies.values.every((row) => row.every((v) => v >= 0 && v <= 1)));
+  assert.equal(auto.loudnessCurve.values.length, 30);
+  assert.ok(auto.loudnessCurve.values.every((v) => v >= -18 && v <= -12));
+});
+
+test('phase3 sample: synthetic mask index has a drifting face box, no files', () => {
+  const index = buildSyntheticMaskIndex();
+  assert.equal(index.takeKey, 'extra-styles-sample-clip');
+  assert.deepEqual(index.maskUris, [], 'the Swift parser accepts empty maskUris');
+  assert.ok(index.faces.length > 0);
+  for (const entry of index.faces) {
+    assert.equal(entry.boxes.length, 1);
+    const [x, y, w, h] = entry.boxes[0];
+    assert.ok(x >= 0 && x + w <= 1 && y >= 0 && y + h <= 1, 'face box in 0..1 canvas fractions');
+  }
+  const xs = index.faces.map((entry) => entry.boxes[0][0]);
+  assert.notEqual(xs[1], xs[0], 'the face moves between samples');
+  // The drift is a full sine period over the card, so first and last
+  // agree — the swing is what matters.
+  assert.ok(Math.max(...xs) - Math.min(...xs) > 0.05, 'the face swings ±4% across the card');
+});
+
+test('phase3 sample: card preview cache key is stable and param-sensitive', () => {
+  const a = cardPreviewCacheKey('emoji-storytelling', 1, { pop: 0.5 });
+  const b = cardPreviewCacheKey('emoji-storytelling', 1, { pop: 0.5 });
+  const c = cardPreviewCacheKey('emoji-storytelling', 1, { pop: 0.8 });
+  const d = cardPreviewCacheKey('comic-book', 1, { pop: 0.5 });
+  assert.equal(a, b);
+  assert.notEqual(a, c, 'a param change re-renders the card');
+  assert.notEqual(a, d, 'a style change re-renders the card');
+});
+
+test('phase3 sample: card lines survive the scene-input passthrough with emoji', () => {
+  const input = buildExtraStyleSceneInput({
+    styleId: 'emoji-storytelling',
+    projectId: 'card',
+    paramsJson: '{}',
+    lines: SAMPLE_CARD_LINES,
+    regionStartFrame: 0,
+    canvasWidth: 540,
+    canvasHeight: 960,
+    durationFrames: CARD_PREVIEW_DURATION_FRAMES,
+  });
+  assert.equal(input.lines.length, 3);
+  for (const line of input.lines) {
+    assert.ok(line.emoji, `card line "${line.text}" keeps its emoji into the scene`);
+  }
+});
+
+// ---- Phase 3: v1 retirement against the full 40-style catalog ---------------
+
+test('phase3 v1: all 15 successors resolve against the full 40-style catalog', () => {
+  const fullCatalog = {
+    bridgeVersion: 1,
+    registryVersion: 1,
+    styles: Object.values(STYLE_CAPABILITY_MAP).map((m) => ({
+      id: m.id,
+      version: 1,
+      name: m.name,
+      tagline: '',
+      category: m.category,
+      parameters: [],
+      inputs: m.inputs ?? [],
+      needsAudioAutomation: m.needsAudioAutomation,
+      needsSubjectMasks: m.needsSubjectMasks,
+    })),
+  };
+  assert.equal(fullCatalog.styles.length, 40, 'the map is the 40-style catalog');
+  for (const [v1Id, successorId] of Object.entries(V1_TEMPLATE_SUCCESSORS)) {
+    const result = migrateV1Template(v1Id, fullCatalog);
+    assert.ok(result.state, `v1 ${v1Id} resolves to its successor`);
+    assert.equal(result.state.styleId, successorId);
+    assert.match(result.notice, /retired/);
+  }
+  // And a v1 template with no successor still goes classic, never a crash.
+  const karaoke = migrateV1Template('karaoke-pop', fullCatalog);
+  assert.equal(karaoke.state, null);
+  assert.match(karaoke.notice, /classic lyrics/);
+});
+
+test('phase3 persistence: favorites-only shell validates as-is, no notice', () => {
+  const catalog = {
+    bridgeVersion: 1,
+    registryVersion: 1,
+    styles: [{ id: 'dream-sequence', version: 1, name: 'Dream Sequence', tagline: '', category: 'cinematic', parameters: [], inputs: [], needsAudioAutomation: false, needsSubjectMasks: false }],
+  };
+  const shell = {
+    styleId: '',
+    styleVersion: 1,
+    params: {},
+    favoriteStyleIds: ['dream-sequence'],
+  };
+  const result = validateExtraStyleState(shell, catalog);
+  assert.deepEqual(result.state, shell);
+  assert.equal(result.notice, undefined);
+});

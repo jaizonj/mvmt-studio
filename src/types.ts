@@ -1,5 +1,6 @@
 import type { CameraType } from 'expo-camera';
 
+import type { ExtraStyleState } from './lib/extra-styles/types';
 import type { MixMasterStageSettings } from './lib/mixMasterCurve';
 
 /** An audio file the user picked to perform to. Kept in the app's documents folder. */
@@ -407,6 +408,18 @@ export interface Project {
    * cleared when the track changes.
    */
   look?: ProjectLook;
+  /**
+   * Extra Styles 2.0: the project's chosen scene style + parameter
+   * values (src/lib/extra-styles/types.ts — ExtraStyleState).
+   * Undefined = no 2.0 style (classic lyrics render, as before);
+   * a state with an empty `styleId` is the favorites-only shell —
+   * the project has hearted styles but none selected (see
+   * toggleFavoriteExtraStyle in StudioContext). A creative choice,
+   * so it is NOT cleared when the track changes. The lyric
+   * interpretation, audio automation, subject masks, and card
+   * previews are derived caches, NOT project fields.
+   */
+  extraStyle?: ExtraStyleState;
   /**
    * Auto EQ: the engine analyzes this project's song and renders a
    * copy with the harsh frequencies pulled down (cuts only), which
