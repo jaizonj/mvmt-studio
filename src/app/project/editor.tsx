@@ -18,6 +18,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { CollapsibleSection } from '../../components/CollapsibleSection';
+import { DropdownPicker } from '../../components/DropdownPicker';
 import { LookPanel } from '../../components/LookPanel';
 import { LyricsOverlay } from '../../components/LyricsOverlay';
 import { LyricsPanel } from '../../components/LyricsPanel';
@@ -65,7 +67,7 @@ import {
   applyRepeat,
   type RhythmModeId,
 } from '../../lib/editModes';
-import { resolveLookParams } from '../../lib/looks';
+import { lookPresetById, resolveLookParams } from '../../lib/looks';
 import { buildCompositeLyrics } from '../../lib/lyrics';
 import { getCachedThumbnail, loadThumbnails } from '../../lib/thumbnails';
 import { buildEdlFromShuffle, buildEdlFromSingleTake, validateAgainstAssets } from '../../lib/shuffleEdl';
@@ -207,6 +209,14 @@ function EditorWorkspace() {
   const [redoStack, setRedoStack] = useState<(Edl | null)[]>([]);
   const [, setChipThumbTick] = useState(0);
   const [scrubbing, setScrubbing] = useState(false);
+  // Edit consolidation (2026-11-13): the controls below the timeline
+  // live in collapsible sections — one open at a time, all closed by
+  // default, so the preview + timeline stay the hero.
+  const [openSection, setOpenSection] = useState<'modes' | 'shuffle' | 'look' | 'lyrics' | 'project' | null>(
+    null,
+  );
+  const toggleSection = (section: 'modes' | 'shuffle' | 'look' | 'lyrics' | 'project') =>
+    setOpenSection((current) => (current === section ? null : section));
   /** Uncommitted trim-drag result, shown in the timeline only (no
    *  history push, no preview rebuild) until the drag ends. */
   const [draftEdl, setDraftEdl] = useState<Edl | null>(null);
@@ -768,6 +778,15 @@ function EditorWorkspace() {
   // what the export will ship. The Export screen resolves the same
   // store values into its own request, so the two never drift.
   const resolvedLook = useMemo(() => resolveLookParams(studio.look), [studio.look]);
+  // Section-header summaries (Edit consolidation, 2026-11-13): what a
+  // collapsed section holds, so the state stays legible at a glance.
+  const lookPreset = lookPresetById(studio.look.presetId);
+  const lookHasOverrides = !!studio.look.overrides && Object.keys(studio.look.overrides).length > 0;
+  const lyricsLineCount = studio.lyrics?.lines.length ?? 0;
+  const lyricsSummary =
+    lyricsLineCount > 0
+      ? `${lyricsLineCount} line${lyricsLineCount === 1 ? '' : 's'}${studio.lyricsEnabled ? '' : ' · Hidden'}`
+      : 'No lyrics yet';
 
   // Auto EQ is part of the composition too — but where the look and
   // the gain ride as parameters, EQ rides as the song FILE itself:
@@ -885,6 +904,14 @@ function EditorWorkspace() {
         : studio.shuffleFrequency === 'fast'
           ? 'Changes about every second.'
           : 'A new clip almost every beat.';
+  const shuffleFrequencyLabel =
+    studio.shuffleFrequency === 'chill'
+      ? 'Chill'
+      : studio.shuffleFrequency === 'normal'
+        ? 'Normal'
+        : studio.shuffleFrequency === 'fast'
+          ? 'Fast'
+          : 'Rapid';
 
   const headerSubtitle = hasCut
     ? `${edl!.segments.length} cut${edl!.segments.length === 1 ? '' : 's'} · ${formatTime(totalSeconds)}`
@@ -1123,26 +1150,13 @@ function EditorWorkspace() {
           <Text style={styles.largeTitle} numberOfLines={1}>
             Edit
           </Text>
+          {/* The project name is plain text here now (Edit
+              consolidation, 2026-11-13) — Rename lives in the
+              Project section below, with the same prompt. */}
           {activeProject ? (
-            <Pressable
-              onPress={() =>
-                Alert.prompt(
-                  'Rename project',
-                  undefined,
-                  (name) => studio.renameProject(activeProject.id, name ?? ''),
-                  'plain-text',
-                  activeProject.name,
-                )
-              }
-              hitSlop={8}
-              accessibilityRole="button"
-              accessibilityLabel={`Rename project ${activeProject.name}`}
-              style={styles.renameChip}>
-              <Text style={styles.renameText} numberOfLines={1}>
-                {activeProject.name}
-              </Text>
-              <Ionicons name="pencil-outline" size={14} color={colors.labelSecondary} />
-            </Pressable>
+            <Text style={styles.renameText} numberOfLines={1}>
+              {activeProject.name}
+            </Text>
           ) : null}
         </View>
         <Text style={styles.headerSubtitle} numberOfLines={1}>
@@ -1207,37 +1221,28 @@ function EditorWorkspace() {
               takes; Repeat and Stutter loop the selected cut (or the
               one under the playhead). Nothing here runs on its own. */}
           {hasCut ? (
-            <View style={styles.section}>
-              <View style={styles.panel}>
-                <Text style={styles.panelLabel}>Edit modes</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
-                  <View style={styles.chipRow}>
-                    {RHYTHM_MODES.map((mode) => {
-                      const disabled =
-                        (mode.needsTwoTakes && takes.length < 2) || (mode.needsTarget && !modeTarget);
-                      return (
-                        <Pressable
-                          key={mode.id}
-                          onPress={() => handleApplyMode(mode.id)}
-                          disabled={disabled}
-                          accessibilityRole="button"
-                          accessibilityState={{ disabled }}
-                          accessibilityLabel={`${mode.name} — ${mode.description}`}
-                          style={[styles.modeCard, disabled && styles.modeCardDisabled]}>
-                          <Text style={[styles.modeCardName, disabled && styles.modeCardNameDisabled]}>
-                            {mode.name}
-                          </Text>
-                          <Text style={styles.modeCardDesc}>{mode.description}</Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </ScrollView>
-                <Text style={styles.caption}>
-                  One tap re-cuts the timeline — undo takes it straight back. The song never changes.
-                </Text>
-              </View>
-            </View>
+            <CollapsibleSection
+              title="Edit modes"
+              summary="One-tap rhythm patterns"
+              open={openSection === 'modes'}
+              onToggle={() => toggleSection('modes')}
+              accessibilityLabel="Edit modes section">
+              <DropdownPicker<RhythmModeId>
+                value={null}
+                placeholder="Choose a pattern…"
+                options={RHYTHM_MODES.map((mode) => ({
+                  value: mode.id,
+                  label: mode.name,
+                  description: mode.description,
+                  disabled: (mode.needsTwoTakes && takes.length < 2) || (mode.needsTarget && !modeTarget),
+                }))}
+                onChange={(modeId) => handleApplyMode(modeId)}
+                accessibilityLabel="Edit mode pattern"
+              />
+              <Text style={styles.caption}>
+                One tap re-cuts the timeline — undo takes it straight back. The song never changes.
+              </Text>
+            </CollapsibleSection>
           ) : null}
 
           {/* Selected-cut panel — appears when a cut is tapped: swap
@@ -1297,30 +1302,22 @@ function EditorWorkspace() {
                   </View>
                 </ScrollView>
                 <Text style={styles.panelLabel}>Speed</Text>
-                <View style={styles.speedRow}>
-                  {SPEED_OPTIONS.map((speed) => {
-                    const active = segmentSpeed(selected) === speed;
-                    return (
-                      <Pressable
-                        key={speed}
-                        onPress={() => handleSetSpeed(selected, speed)}
-                        accessibilityRole="button"
-                        accessibilityState={{ selected: active }}
-                        accessibilityLabel={
-                          speed === 1
-                            ? 'Normal speed'
-                            : speed < 1
-                              ? `Slow motion, ${speed} times speed`
-                              : `Fast, ${speed} times speed`
-                        }
-                        style={[styles.speedChip, active && styles.speedChipActive]}>
-                        <Text style={[styles.speedChipText, active && styles.speedChipTextActive]}>
-                          {speed === 1 ? '1×' : `${speed}×`}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
+                <DropdownPicker<number>
+                  value={segmentSpeed(selected)}
+                  placeholder="Normal speed"
+                  options={SPEED_OPTIONS.map((speed) => ({
+                    value: speed,
+                    label: speed === 1 ? '1×' : `${speed}×`,
+                    description:
+                      speed === 1
+                        ? 'Normal speed'
+                        : speed < 1
+                          ? 'Slow motion — this cut stretches'
+                          : 'Fast — this cut compresses',
+                  }))}
+                  onChange={(speed) => handleSetSpeed(selected, speed)}
+                  accessibilityLabel="Clip speed"
+                />
                 <Text style={styles.caption}>
                   {segmentSpeed(selected) === 1
                     ? 'The song never changes speed — only this cut’s video does.'
@@ -1333,55 +1330,40 @@ function EditorWorkspace() {
                 {selectedIndex > 0 ? (
                   <>
                     <Text style={styles.panelLabel}>Transition into this cut</Text>
-                    <View style={styles.speedRow}>
-                      {TRANSITION_KINDS.map((option) => {
-                        const active =
+                    <DropdownPicker<TransitionKind | 'none'>
+                      value={selected.transitionIn?.kind ?? 'none'}
+                      placeholder="None"
+                      options={TRANSITION_KINDS.map((option) => ({
+                        value: option.id,
+                        label: option.name,
+                        description:
                           option.id === 'none'
-                            ? !selected.transitionIn
-                            : selected.transitionIn?.kind === option.id;
-                        return (
-                          <Pressable
-                            key={option.id}
-                            onPress={() => handleSetTransition(selected, option.id)}
-                            accessibilityRole="button"
-                            accessibilityState={{ selected: active }}
-                            accessibilityLabel={
-                              option.id === 'none'
-                                ? 'No transition — hard cut'
-                                : option.id === 'dip'
-                                  ? 'Dip — fade through black into this cut'
-                                  : 'Crossfade — dissolve into this cut'
-                            }
-                            style={[styles.speedChip, active && styles.speedChipActive]}>
-                            <Text style={[styles.speedChipText, active && styles.speedChipTextActive]}>
-                              {option.name}
-                            </Text>
-                          </Pressable>
-                        );
-                      })}
-                    </View>
+                            ? 'Hard cut — the picture switches instantly'
+                            : option.id === 'dip'
+                              ? 'Dip — fade through black into this cut'
+                              : 'Crossfade — dissolve into this cut',
+                      }))}
+                      onChange={(kind) => handleSetTransition(selected, kind)}
+                      accessibilityLabel="Transition into this cut"
+                    />
                     {selected.transitionIn ? (
-                      <View style={styles.speedRow}>
-                        {TRANSITION_DURATION_OPTIONS.map((seconds) => {
-                          const active =
-                            secondsToFrames(seconds, edl.fps) === selected.transitionIn?.durationFrames;
-                          return (
-                            <Pressable
-                              key={seconds}
-                              onPress={() =>
-                                handleSetTransition(selected, selected.transitionIn!.kind, seconds)
-                              }
-                              accessibilityRole="button"
-                              accessibilityState={{ selected: active }}
-                              accessibilityLabel={`Transition length ${seconds} seconds`}
-                              style={[styles.speedChip, active && styles.speedChipActive]}>
-                              <Text style={[styles.speedChipText, active && styles.speedChipTextActive]}>
-                                {seconds}s
-                              </Text>
-                            </Pressable>
-                          );
-                        })}
-                      </View>
+                      <DropdownPicker<number>
+                        value={
+                          TRANSITION_DURATION_OPTIONS.find(
+                            (seconds) =>
+                              secondsToFrames(seconds, edl.fps) === selected.transitionIn?.durationFrames,
+                          ) ?? null
+                        }
+                        placeholder="Transition length"
+                        options={TRANSITION_DURATION_OPTIONS.map((seconds) => ({
+                          value: seconds,
+                          label: `${seconds}s`,
+                        }))}
+                        onChange={(seconds) =>
+                          handleSetTransition(selected, selected.transitionIn!.kind, seconds)
+                        }
+                        accessibilityLabel="Transition length"
+                      />
                     ) : null}
                     <Text style={styles.caption}>
                       {selected.transitionIn?.kind === 'dip'
@@ -1398,85 +1380,126 @@ function EditorWorkspace() {
           ) : null}
 
           {/* Shuffle — always available below the editing surface. */}
-          <View style={styles.section}>
-            <View style={styles.panel}>
-              <Pressable
-                style={[styles.shuffleButton, !canShuffle && styles.shuffleButtonDisabled]}
-                onPress={handleShuffle}
-                disabled={!canShuffle}
-                accessibilityRole="button"
-                accessibilityLabel={hasCut ? 'Shuffle again for a different arrangement' : 'Shuffle takes into a cut'}>
-                <Ionicons name="shuffle" size={20} color={canShuffle ? colors.onAccent : colors.labelTertiary} />
-                <Text style={[styles.shuffleButtonText, !canShuffle && styles.shuffleButtonTextDisabled]}>
-                  {hasCut ? 'Try another shuffle' : 'Shuffle my cut'}
-                </Text>
-              </Pressable>
-              {!canShuffle ? (
-                <Text style={styles.caption}>
-                  Your single take is the cut — record one more take to shuffle between takes.
-                </Text>
-              ) : shuffleNote ? (
-                <Text style={styles.caption}>{shuffleNote}</Text>
-              ) : justShuffled && hasCut ? (
-                <Text style={styles.caption}>Your cut, remixed.</Text>
-              ) : null}
-              <Text style={styles.panelLabel}>Cut pace</Text>
-              <SegmentedControl
-                options={[
-                  { value: 'chill' as ShuffleFrequency, label: 'Chill' },
-                  { value: 'normal' as ShuffleFrequency, label: 'Normal' },
-                  { value: 'fast' as ShuffleFrequency, label: 'Fast' },
-                  { value: 'rapid' as ShuffleFrequency, label: 'Rapid' },
-                ]}
-                value={studio.shuffleFrequency}
-                onChange={studio.setShuffleFrequency}
-                accessibilityLabel="Cut pace — how often the cut changes"
-              />
-              <Text style={styles.caption}>{frequencyCaption} Applies to the next shuffle.</Text>
-            </View>
-          </View>
+          <CollapsibleSection
+            title="Shuffle"
+            summary={`Cut pace: ${shuffleFrequencyLabel}`}
+            open={openSection === 'shuffle'}
+            onToggle={() => toggleSection('shuffle')}
+            accessibilityLabel="Shuffle section">
+            <Pressable
+              style={[styles.shuffleButton, !canShuffle && styles.shuffleButtonDisabled]}
+              onPress={handleShuffle}
+              disabled={!canShuffle}
+              accessibilityRole="button"
+              accessibilityLabel={hasCut ? 'Shuffle again for a different arrangement' : 'Shuffle takes into a cut'}>
+              <Ionicons name="shuffle" size={20} color={canShuffle ? colors.onAccent : colors.labelTertiary} />
+              <Text style={[styles.shuffleButtonText, !canShuffle && styles.shuffleButtonTextDisabled]}>
+                {hasCut ? 'Try another shuffle' : 'Shuffle my cut'}
+              </Text>
+            </Pressable>
+            {!canShuffle ? (
+              <Text style={styles.caption}>
+                Your single take is the cut — record one more take to shuffle between takes.
+              </Text>
+            ) : shuffleNote ? (
+              <Text style={styles.caption}>{shuffleNote}</Text>
+            ) : justShuffled && hasCut ? (
+              <Text style={styles.caption}>Your cut, remixed.</Text>
+            ) : null}
+            <Text style={styles.panelLabel}>Cut pace</Text>
+            <SegmentedControl
+              options={[
+                { value: 'chill' as ShuffleFrequency, label: 'Chill' },
+                { value: 'normal' as ShuffleFrequency, label: 'Normal' },
+                { value: 'fast' as ShuffleFrequency, label: 'Fast' },
+                { value: 'rapid' as ShuffleFrequency, label: 'Rapid' },
+              ]}
+              value={studio.shuffleFrequency}
+              onChange={studio.setShuffleFrequency}
+              accessibilityLabel="Cut pace — how often the cut changes"
+            />
+            <Text style={styles.caption}>{frequencyCaption} Applies to the next shuffle.</Text>
+          </CollapsibleSection>
 
-          {/* Watermark — the MVMT studio logo stamped on the video
-              (preview and export alike). A project-level output
-              choice, so it lives here in Edit, not in Settings. */}
-          <View style={styles.section}>
-            <View style={styles.panel}>
-              <View style={styles.watermarkRow}>
-                <View style={styles.watermarkText}>
-                  <Text style={styles.cutTitle}>Watermark</Text>
-                  <Text style={styles.caption}>MVMT studio logo on the video</Text>
-                </View>
-                <Switch
-                  value={watermarkOn}
-                  onValueChange={studio.setWatermarkEnabled}
-                  trackColor={{ true: colors.accent, false: colors.elevated }}
-                  thumbColor={watermarkOn ? colors.onAccent : colors.label}
-                  accessibilityLabel="Watermark"
-                />
+          {/* Project — output choices that belong to the project:
+              the watermark stamped on the video (preview and export
+              alike) and the project name. */}
+          <CollapsibleSection
+            title="Project"
+            summary={watermarkOn ? 'Watermark on' : 'Watermark off'}
+            open={openSection === 'project'}
+            onToggle={() => toggleSection('project')}
+            accessibilityLabel="Project section">
+            <View style={styles.watermarkRow}>
+              <View style={styles.watermarkText}>
+                <Text style={styles.cutTitle}>Watermark</Text>
+                <Text style={styles.caption}>MVMT studio logo on the video</Text>
               </View>
+              <Switch
+                value={watermarkOn}
+                onValueChange={studio.setWatermarkEnabled}
+                trackColor={{ true: colors.accent, false: colors.elevated }}
+                thumbColor={watermarkOn ? colors.onAccent : colors.label}
+                accessibilityLabel="Watermark"
+              />
             </View>
-          </View>
+            {activeProject ? (
+              <Pressable
+                style={styles.renameRow}
+                onPress={() =>
+                  Alert.prompt(
+                    'Rename project',
+                    undefined,
+                    (name) => studio.renameProject(activeProject.id, name ?? ''),
+                    'plain-text',
+                    activeProject.name,
+                  )
+                }
+                accessibilityRole="button"
+                accessibilityLabel={`Rename project ${activeProject.name}`}>
+                <Text style={styles.renameRowText} numberOfLines={1}>
+                  {activeProject.name}
+                </Text>
+                <Ionicons name="pencil-outline" size={16} color={colors.labelSecondary} />
+              </Pressable>
+            ) : null}
+          </CollapsibleSection>
 
           {/* Look — the project's grade (preset + intensity +
               slider overrides). Creative, so Edit — and because the
               grade lives in the composition, the preview above is
               already showing it. */}
-          <LookPanel />
+          <CollapsibleSection
+            title="Look"
+            summary={`${lookPreset.name}${lookHasOverrides ? ' · Custom' : ''}`}
+            open={openSection === 'look'}
+            onToggle={() => toggleSection('look')}
+            accessibilityLabel="Look section">
+            <LookPanel bare />
+          </CollapsibleSection>
 
           {/* Lyrics — Whisper-detected lines on the song timeline,
               edited line by line, styled CapCut-style. A creative
               tool, so it lives here in Edit (not Settings). */}
-          <LyricsPanel
-            regionStartFrame={regionStartFrame}
-            positionSeconds={positionSeconds}
-            isPlaying={!paused}
-            onSeek={(seconds) => {
-              previewRef.current?.seek(seconds);
-              setPositionSeconds(seconds);
-            }}
-            onPlay={() => setPaused(false)}
-            onPause={() => setPaused(true)}
-          />
+          <CollapsibleSection
+            title="Lyrics"
+            summary={lyricsSummary}
+            open={openSection === 'lyrics'}
+            onToggle={() => toggleSection('lyrics')}
+            accessibilityLabel="Lyrics section">
+            <LyricsPanel
+              bare
+              regionStartFrame={regionStartFrame}
+              positionSeconds={positionSeconds}
+              isPlaying={!paused}
+              onSeek={(seconds) => {
+                previewRef.current?.seek(seconds);
+                setPositionSeconds(seconds);
+              }}
+              onPlay={() => setPaused(false)}
+              onPause={() => setPaused(true)}
+            />
+          </CollapsibleSection>
         </ScrollView>
       )}
     </View>
@@ -1515,7 +1538,6 @@ const styles = StyleSheet.create({
   exportButtonTextDisabled: { color: colors.labelTertiary },
   largeTitle: { ...typeScale.largeTitle, color: colors.label, marginTop: spacing.xs },
   titleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md },
-  renameChip: { flexDirection: 'row', alignItems: 'center', gap: 5, flexShrink: 1, paddingVertical: 4 },
   renameText: { ...typeScale.subhead, color: colors.labelSecondary, flexShrink: 1 },
   headerSubtitle: { ...typeScale.subhead, color: colors.labelSecondary, marginTop: 2 },
   section: { paddingHorizontal: spacing.xl, marginTop: spacing.md },
@@ -1645,32 +1667,19 @@ const styles = StyleSheet.create({
   takeChipThumb: { width: 40, height: 40, borderRadius: radius.sm },
   takeChipThumbPlaceholder: { backgroundColor: colors.elevated },
   takeChipText: { color: colors.label, fontSize: 14, fontWeight: '600' },
-  speedRow: { flexDirection: 'row', gap: spacing.sm },
-  speedChip: {
-    flex: 1,
+  // Rename row in the Project section (Edit consolidation,
+  // 2026-11-13): the same Alert.prompt the header chip used to own.
+  renameRow: {
+    flexDirection: 'row',
     alignItems: 'center',
+    gap: spacing.sm,
     backgroundColor: colors.card,
-    borderWidth: 1,
-    borderColor: colors.separator,
-    borderRadius: radius.pill,
-    paddingVertical: 9,
-  },
-  modeCard: {
-    width: 168,
-    backgroundColor: colors.card,
-    borderWidth: 1,
-    borderColor: colors.separator,
     borderRadius: radius.md,
-    padding: spacing.md,
-    gap: 4,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    minHeight: 52,
   },
-  modeCardDisabled: { opacity: 0.4 },
-  modeCardName: { ...typeScale.headline, color: colors.label },
-  modeCardNameDisabled: { color: colors.labelTertiary },
-  modeCardDesc: { ...typeScale.footnote, color: colors.labelSecondary, lineHeight: 17 },
-  speedChipActive: { borderColor: colors.accent, borderWidth: 2, backgroundColor: colors.accentDim },
-  speedChipText: { color: colors.label, fontSize: 15, fontWeight: '600', fontVariant: ['tabular-nums'] },
-  speedChipTextActive: { color: colors.accent },
+  renameRowText: { ...typeScale.subhead, color: colors.label, fontWeight: '600', flex: 1 },
   emptyCard: {
     alignItems: 'center',
     gap: spacing.sm,

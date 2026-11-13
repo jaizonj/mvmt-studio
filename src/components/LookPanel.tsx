@@ -44,7 +44,7 @@ const ADJUST_SLIDERS: {
   { key: 'vignette', label: 'Vignette', format: percent },
 ];
 
-export function LookPanel() {
+export function LookPanel({ bare }: { bare?: boolean }) {
   const studio = useStudio();
   const look = studio.look;
   const preset = lookPresetById(look.presetId);
@@ -71,9 +71,12 @@ export function LookPanel() {
     studio.setProjectLook({ ...look, overrides: { ...look.overrides, [key]: value } });
   };
 
-  return (
-    <View style={styles.section}>
-      <View style={styles.panel}>
+  const body = (
+    <View style={styles.panel}>
+      {/* When embedded in a CollapsibleSection (Edit consolidation,
+          2026-11-13) the section header already carries the title
+          and current preset — the panel's own title row is skipped. */}
+      {!bare ? (
         <View style={styles.headerRow}>
           <Text style={styles.title}>Look</Text>
           <View style={styles.headerSpacer} />
@@ -82,6 +85,7 @@ export function LookPanel() {
             {hasOverrides ? ' · Custom' : ''}
           </Text>
         </View>
+      ) : null}
         <Text style={styles.caption}>
           A grade for the whole cut — it&apos;s in the preview above and renders into the export.
         </Text>
@@ -179,9 +183,9 @@ export function LookPanel() {
             ) : null}
           </>
         ) : null}
-      </View>
     </View>
   );
+  return bare ? body : <View style={styles.section}>{body}</View>;
 }
 
 function LookSlider({

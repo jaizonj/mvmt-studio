@@ -250,9 +250,9 @@ interface StudioState {
 
   /**
    * The active project's EFFECTIVE video look — the stored look when
-   * one was chosen, otherwise the auto-applied default (Auto Enhance
-   * at full intensity). Resolve it with resolveLookParams
-   * (src/lib/looks.ts) wherever a request is built.
+   * one was chosen, otherwise Original (no grade — the Auto Enhance
+   * auto-apply was removed 2026-11-13). Resolve it with
+   * resolveLookParams (src/lib/looks.ts) wherever a request is built.
    */
   look: ProjectLook;
   /** Store a look on the active project (preset pick, intensity, slider overrides). */
@@ -832,8 +832,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [hydrated, activeProject, songLibrary, patchActiveProject]);
 
   // ---- Video look (per-project grade; see src/lib/looks.ts) ----
-  // The EFFECTIVE look is exposed (stored value wins, otherwise the
-  // Auto Enhance default) so the Editor and Export always agree;
+  // The EFFECTIVE look is exposed (stored value wins, otherwise
+  // Original — no grade) so the Editor and Export always agree;
   // writes go through patchActiveProject like every creative field,
   // and — unlike lyrics — a track change does NOT clear it.
   const look = useMemo(() => effectiveLook(activeProject), [activeProject]);

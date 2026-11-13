@@ -71,7 +71,7 @@ export const LOOK_PRESETS: LookPreset[] = [
   {
     id: 'auto-enhance',
     name: 'Auto Enhance',
-    blurb: 'A gentle all-round lift — the subtle default.',
+    blurb: 'A gentle all-round lift.',
     params: params({ exposureEV: 0.12, contrast: 1.06, saturation: 1.08, vibrance: 0.25, sharpen: 0.35 }),
   },
   {
@@ -190,8 +190,12 @@ export const LOOK_PRESETS: LookPreset[] = [
   },
 ];
 
-/** The preset new/untouched projects grade with (auto-applied). */
-export const DEFAULT_LOOK_PRESET_ID = 'auto-enhance';
+/** The preset new/untouched projects grade with: Original — no
+ *  grade at all (Jaizon, 2026-11-13: the Auto Enhance auto-apply is
+ *  removed; a grade is a manual choice only). resolveLookParams
+ *  returns null for it, so the request carries no look and the
+ *  engine renders unfiltered. */
+export const DEFAULT_LOOK_PRESET_ID = 'original';
 
 export function lookPresetById(id: string): LookPreset {
   return LOOK_PRESETS.find((p) => p.id === id) ?? LOOK_PRESETS[0];
@@ -204,8 +208,9 @@ function clampParam(key: keyof LookParams, value: number): number {
 
 /**
  * The look a project effectively has: its stored look when one was
- * chosen, otherwise the auto-applied default (Auto Enhance at full
- * intensity). Pure — the store exposes this so every screen agrees.
+ * chosen, otherwise Original (no grade — the Auto Enhance
+ * auto-apply was removed 2026-11-13). Pure — the store exposes this
+ * so every screen agrees.
  */
 export function effectiveLook(project: { look?: ProjectLook } | null | undefined): ProjectLook {
   if (project?.look && typeof project.look.presetId === 'string') {

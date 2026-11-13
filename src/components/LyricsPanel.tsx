@@ -232,6 +232,47 @@ function StyleSection({ title, children }: { title: string; children: ReactNode 
   );
 }
 
+/** A collapsible group inside the Style tab (Edit consolidation,
+ *  2026-11-13 — the Style tab was the worst of the clutter): the
+ *  tab's three concerns — Font, Text, Animation — each fold behind
+ *  a header showing the current choice, so the tab stops sprawling.
+ *  One group open at a time (accordion); while the search box has
+ *  text, Font and Animation both stay open so matches are visible.
+ *  Everything inside is props-driven, so folding loses no state. */
+function StyleGroup({
+  title,
+  summary,
+  open,
+  onToggle,
+  children,
+}: {
+  title: string;
+  summary?: string;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <View style={styles.styleGroup}>
+      <Pressable
+        style={styles.styleGroupHeader}
+        onPress={onToggle}
+        accessibilityRole="button"
+        accessibilityLabel={`${title} style group`}
+        accessibilityState={{ expanded: open }}>
+        <Text style={styles.styleGroupTitle}>{title}</Text>
+        {summary ? (
+          <Text style={styles.styleGroupSummary} numberOfLines={1}>
+            {summary}
+          </Text>
+        ) : null}
+        <Ionicons name={open ? 'chevron-up' : 'chevron-down'} size={18} color={colors.labelSecondary} />
+      </Pressable>
+      {open ? <View style={styles.styleGroupBody}>{children}</View> : null}
+    </View>
+  );
+}
+
 function FontChips({
   fonts,
   currentId,
@@ -390,7 +431,15 @@ function TemplateCard({
   );
 }
 
-export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSeek, onPlay, onPause }: LyricsPanelProps) {
+export function LyricsPanel({
+  regionStartFrame,
+  positionSeconds,
+  isPlaying,
+  onSeek,
+  onPlay,
+  onPause,
+  bare,
+}: LyricsPanelProps & { bare?: boolean }) {
   const studio = useStudio();
   const { track, lyrics } = studio;
   const lines = lyrics?.lines ?? [];
@@ -412,6 +461,11 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   const [styleSearch, setStyleSearch] = useState('');
   const [fontCategory, setFontCategory] = useState<'All' | LyricFontCategory>('All');
   const [animationCategory, setAnimationCategory] = useState<'All' | LyricAnimationCategory>('All');
+  // Style tab groups (Edit consolidation, 2026-11-13): Font / Text /
+  // Animation fold behind headers showing the current choice.
+  const [openStyleGroup, setOpenStyleGroup] = useState<'font' | 'text' | 'animation' | null>('font');
+  const toggleStyleGroup = (group: 'font' | 'text' | 'animation') =>
+    setOpenStyleGroup((current) => (current === group ? null : group));
   // Extra tab: search + category filters (Styles Redesign Stage 2).
   const [templateSearch, setTemplateSearch] = useState('');
   const [templateCategory, setTemplateCategory] = useState<'All' | ExtraStyleCategory>('All');
@@ -443,6 +497,16 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   // Grouped sections only when browsing everything unfiltered.
   const showFontGroups = fontCategory === 'All' && styleQuery === '';
   const showAnimationGroups = animationCategory === 'All' && styleQuery === '';
+  // While searching, Font and Animation both stay open so matches
+  // are visible; otherwise one group at a time (accordion).
+  const fontOpen = styleQuery !== '' || openStyleGroup === 'font';
+  const animationOpen = styleQuery !== '' || openStyleGroup === 'animation';
+  const textOpen = openStyleGroup === 'text';
+  const textGroupSummary = style
+    ? `Size ${Math.round(style.sizeRatio * 100)}% · ${
+        style.position.charAt(0).toUpperCase() + style.position.slice(1)
+      }`
+    : '';
   const favoriteFonts = LYRIC_FONTS.filter((f) => favoriteFontIds.includes(f.id));
   const favoriteAnimations = PICKER_ANIMATIONS.filter((a) => favoriteAnimationIds.includes(a.id));
 
@@ -613,14 +677,20 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
   };
 
   // ---- Render ----------------------------------------------------------
-  return (
-    <View style={styles.section}>
-      <View style={styles.panel}>
+  // `bare` (Edit consolidation, 2026-11-13): embedded in a
+  // CollapsibleSection, the section supplies the outer spacing and
+  // header — the panel renders without its section wrapper.
+  const body = (
+    <View style={styles.panel}>
         {/* Slim header: title + count, Detect (or live progress) on
             the right, show/hide switch under it. Always visible,
             whichever tab is open. */}
         <View style={styles.headerRow}>
-          <Text style={styles.title}>Lyrics</Text>
+          {/* When embedded in a CollapsibleSection (Edit
+              consolidation, 2026-11-13) the section header already
+              carries the title — the panel's own title is skipped,
+              but the line count and Detect stay. */}
+          {!bare ? <Text style={styles.title}>Lyrics</Text> : null}
           {lines.length > 0 ? (
             <Text style={styles.countLabel}>
               {lines.length} line{lines.length === 1 ? '' : 's'}
@@ -849,7 +919,11 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                       />
                     </View>
 
-                    <Text style={styles.fieldLabel}>Font</Text>
+                    <StyleGroup
+                      title="Font"
+                      summary={lyricFontById(effectiveFontId).displayName}
+                      open={fontOpen}
+                      onToggle={() => toggleStyleGroup('font')}>
                     <CategoryChips
                       categories={LYRIC_FONT_CATEGORIES}
                       value={fontCategory}
@@ -898,8 +972,13 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                         onToggleFavorite={(id) => studio.toggleFavoriteLyricFont(id)}
                       />
                     )}
+                    </StyleGroup>
 
-                    <Text style={styles.fieldLabel}>Text</Text>
+                    <StyleGroup
+                      title="Text"
+                      summary={textGroupSummary}
+                      open={textOpen}
+                      onToggle={() => toggleStyleGroup('text')}>
                     <View style={styles.sliderLabelRow}>
                       <Text style={styles.sliderLabel}>Size</Text>
                       <Text style={styles.sliderValue}>{Math.round(style.sizeRatio * 100)}%</Text>
@@ -1095,8 +1174,13 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                     <Text style={styles.caption}>
                       Slides every line up or down a little from its Top, Center or Bottom spot.
                     </Text>
+                    </StyleGroup>
 
-                    <Text style={styles.fieldLabel}>Animation</Text>
+                    <StyleGroup
+                      title="Animation"
+                      summary={lyricAnimationById(effectiveAnimationId).name}
+                      open={animationOpen}
+                      onToggle={() => toggleStyleGroup('animation')}>
                     <CategoryChips
                       categories={LYRIC_ANIMATION_CATEGORIES}
                       value={animationCategory}
@@ -1145,6 +1229,7 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
                     <Text style={styles.caption}>
                       Tap an animation to preview it on the current line in the player above.
                     </Text>
+                    </StyleGroup>
                   </View>
                 )}
               </>
@@ -1245,9 +1330,9 @@ export function LyricsPanel({ regionStartFrame, positionSeconds, isPlaying, onSe
             )}
           </>
         )}
-      </View>
     </View>
   );
+  return bare ? body : <View style={styles.section}>{body}</View>;
 }
 
 function truncate(text: string, max: number): string {
@@ -1524,13 +1609,6 @@ const styles = StyleSheet.create({
   tapButtonText: { color: colors.onAccent, ...typeScale.headline, textAlign: 'center', paddingHorizontal: spacing.sm },
   styleBox: { gap: spacing.sm },
   groupHeader: { ...typeScale.headline, color: colors.label },
-  fieldLabel: {
-    ...typeScale.caption,
-    color: colors.labelSecondary,
-    textTransform: 'uppercase',
-    letterSpacing: 0.6,
-    marginTop: spacing.sm,
-  },
   sliderLabelRow: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
   sliderLabel: { ...typeScale.subhead, color: colors.label },
   sliderValue: { ...typeScale.caption, color: colors.labelSecondary, fontVariant: ['tabular-nums'] },
@@ -1572,6 +1650,22 @@ const styles = StyleSheet.create({
   categoryChipTextCurrent: { color: colors.accent },
   styleSection: { gap: spacing.xs },
   sectionHeader: { ...typeScale.subhead, color: colors.label, fontWeight: '600', marginTop: spacing.xs },
+  // Collapsible Style tab groups (Edit consolidation, 2026-11-13):
+  // a card header carrying the group name + current choice.
+  styleGroup: { gap: spacing.xs },
+  styleGroupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    minHeight: 48,
+  },
+  styleGroupTitle: { ...typeScale.subhead, color: colors.label, fontWeight: '600' },
+  styleGroupSummary: { ...typeScale.footnote, color: colors.labelSecondary, flex: 1, textAlign: 'right' },
+  styleGroupBody: { gap: spacing.sm, marginTop: spacing.sm },
   pickRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
   // One picker chip: label button + heart button side by side in a
   // pill, so a heart tap never also picks the style.

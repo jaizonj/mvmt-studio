@@ -89,13 +89,27 @@ test('looks: Original is exactly the identity set', () => {
 
 // ---- Looks: resolution -------------------------------------------------
 
-test('looks: the effective default is Auto Enhance at full intensity', () => {
+test('looks: the effective default is Original (no grade)', () => {
   assert.deepEqual(effectiveLook(null), { presetId: DEFAULT_LOOK_PRESET_ID, intensity: 1 });
-  assert.deepEqual(effectiveLook({}), { presetId: 'auto-enhance', intensity: 1 });
+  assert.deepEqual(effectiveLook({}), { presetId: 'original', intensity: 1 });
+  assert.equal(DEFAULT_LOOK_PRESET_ID, 'original');
   assert.deepEqual(effectiveLook({ look: { presetId: 'noir', intensity: 0.5 } }), {
     presetId: 'noir',
     intensity: 0.5,
   });
+});
+
+test('looks: an unset look grades nothing in the shared preview/export path', () => {
+  // The Editor preview and the Export request both resolve the
+  // store's effective look through resolveLookParams — an untouched
+  // project must resolve to null (no look rides the request) in both.
+  assert.equal(resolveLookParams(effectiveLook(null)), null);
+  assert.equal(resolveLookParams(effectiveLook({})), null);
+  assert.equal(resolveLookParams(effectiveLook({ look: undefined })), null);
+  // A stored choice still grades: Auto Enhance is a manual pick now,
+  // not a default — and a stored Original is still identity.
+  assert.notEqual(resolveLookParams(effectiveLook({ look: { presetId: 'auto-enhance', intensity: 1 } })), null);
+  assert.equal(resolveLookParams(effectiveLook({ look: { presetId: 'original', intensity: 1 } })), null);
 });
 
 test('looks: identity results resolve to null (no filter rides the request)', () => {

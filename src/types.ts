@@ -197,9 +197,9 @@ export interface LookParams {
  * (0..1, scales the preset from identity toward its full values at
  * resolve time), and optional per-param overrides forked by the Edit
  * screen's Adjust sliders (absolute values that win over the lerped
- * preset). Absent on a project = the effective default (Auto Enhance
- * at full intensity — looks are auto-applied); picking the Original
- * preset stores explicitly and means "no grade".
+ * preset). Absent on a project = the effective default (Original —
+ * no grade; the Auto Enhance auto-apply was removed 2026-11-13);
+ * picking the Original preset stores explicitly and means "no grade".
  */
 export interface ProjectLook {
   presetId: string;
@@ -402,9 +402,9 @@ export interface Project {
   /**
    * The project's video look (an edit/export-stage grade — see
    * LookParams / src/lib/looks.ts). Undefined = the effective default
-   * (Auto Enhance); the store exposes the effective value (`look` in
-   * StudioContext). A creative choice, so it is NOT cleared when the
-   * track changes.
+   * (Original — no grade); the store exposes the effective value
+   * (`look` in StudioContext). A creative choice, so it is NOT
+   * cleared when the track changes.
    */
   look?: ProjectLook;
   /**
