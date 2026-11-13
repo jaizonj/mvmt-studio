@@ -1067,6 +1067,8 @@ Concretely:
 
 **DECISION — MADE by Jaizon (2026-11-13 ~01:25 MST): "retire v1 when 2.0 ships".** The plan is now written for retiring: §14.2 carries the migration (each v1 templateId maps to its 2.0 successor or to classic) and the Lyrics panel loses the Extra tab at ship time.
 
+**DONE in Phase 4 (2026-11-13):** the registry (`src/lib/lyricTemplates.ts`, 712 lines), the Extra tab in `LyricsPanel.tsx`, and the selection paths (`setLyricTemplate`, `toggleFavoriteLyricTemplate` in `StudioContext.tsx`) are deleted; `buildCompositeLyrics` is classic-only. The migration (`migrateV1Template` + `V1_TEMPLATE_SUCCESSORS` in `src/lib/extra-styles/persistence.ts`) and the load-time migration stay untouched, so old projects still open (15 successors → 2.0 styles, rest → classic + notice, never crash). The lyrics test suite's v1 contract tests were removed/rewritten as classic-only (73 → 65 tests); the migration tests in `tests/extra-styles.test.cjs` are unaffected. The dead decor branches in `LyricsOverlay.tsx` and the Swift burn-in remain as unreachable code (removing them would mean touching the Swift burn-in — out of scope).
+
 ---
 
 ## 16. Dependencies
@@ -1185,17 +1187,16 @@ after 5 for a device test. Load time is acceptable.**
   has its parameters; the catalog, search, favorites, and card previews work; projects save and
   reopen with any of the 40.
 
-### Phase 4 — Polish
+### Phase 4 — Polish (REDEFINED 2026-11-13 by Jaizon's device verdict)
 
-- Animation quality pass (easing, timing, and feel per style, against device recordings).
-- Visual composition pass (spacing, hierarchy, legibility at 540×960 and 4K).
-- Customization pass (parameter ranges, presets, layer editing where declared).
-- Performance pass (profiler numbers per style; Metal adoption per node where the spike justified
-  it; cache tuning).
-- Export-consistency pass (preview-vs-export comparison per style — the Stage 4 parity discipline
-  applied to the new engine; pixel-level proof is still only settleable by Jaizon's device test).
-- Style previews pass (card-preview budget, cache behaviour).
-- Mobile editing experience pass (control layout, sheet behaviour, reachability).
+Jaizon's verdict on the 2.0 build (2026-11-13 ~10:28 MST, screenshot): the lyric words were mirrored in the Edit preview, and "the styles aren't high quality enough... no styles that take up the whole screen just lyrics with cool animations and stuff." Phase 4 is redefined by that verdict — see the full record in `docs/EXTRA-STYLES-2.0-PHASE4.md`:
+
+- **THE LYRIC-ONLY RULE (binding): the video is the star.** No full-screen backgrounds, washes, tunnels, portals, or decor layers that cover the frame. Every style = lyrics with cool animations: word-by-word entrances tied to lyric timing, emphasis pops on key words, karaoke-style current-word highlighting, kinetic typography with proper easing, and legibility (outline/shadow) over any footage. Emoji/decor stay only when small and attached to the words.
+- **Mirror-bug fix (done in Phase 4):** the lyric text was rendered upside-down (a vertical flip, not horizontal) in the shared renderer — `drawText` drew Core Text glyphs with the identity textMatrix inside a y-flipped context. Fixed with `textMatrix = CGAffineTransform(scaleX: 1, y: -1)` in `ExtraStylesCompositor.drawText`, so preview AND export (same renderer) are correct. No testable seam exists (no XCTest target; the bug is Swift-only) — device proof only.
+- **Look auto-apply (done in Phase 4):** the greenish tint in the verdict screenshot was Emoji Storytelling's acid-lime wash, not a Look — but three real Look holes were fixed alongside: Original + overrides could still grade (Original now short-circuits in `resolveLookParams`), the preview builder never cleared a stale grade/scene slot (now cleared), and the wash-stripping removes the tint at its source. Legacy stored `auto-enhance` looks are NOT blanket-cleared (indistinguishable from an explicit manual pick).
+- **v1 templates removed (done in Phase 4):** the 30 OG templates + picker are gone from the UI; the migration (`migrateV1Template`) stays, so old projects still open.
+- **Re-scope (done in Phase 4):** all 40 styles converted to lyric-only; 4 retired+replaced under the same IDs (parallel-worlds, comic-book, virtual-reality, surveillance-system). Per-style table: `docs/EXTRA-STYLES-2.0-PHASE4.md`.
+- Remaining polish passes (unchanged in kind): animation quality, visual composition, customization, performance (profiler numbers per style; Metal adoption per node where justified), export-consistency (preview-vs-export per style), style previews, mobile editing experience.
 - **Exit criterion:** the brief's §20 acceptance criteria, verified on device by Jaizon.
 
 ### Build and verification rhythm (all phases)

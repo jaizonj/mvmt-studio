@@ -1,29 +1,41 @@
 import CoreGraphics
 import Foundation
 
-// MARK: - Extra Styles 2.0 — Phase 3 demos
+// MARK: - Extra Styles 2.0 — Phase 4 re-scope, demos
 //
-// The five demos (docs/EXTRA-STYLES-2.0.md §17, ★), built first in
-// Phase 3 — they are the start of the run, not a gate. Each demo
-// proves a different engine capability, and together they are the
-// reference implementations the other 35 styles are built from:
-//   - Typography Physics — deterministic physics, baked at build
-//     time (§5.2) + per-character nodes + onset reactions.
-//   - Dream Sequence — particle field, light-trail paths, ghost
-//     text layers, loudness-driven glow.
-//   - Comic Book — nested panel groups, bursts, impact words,
-//     motion lines, onset reactions.
-//   - Holographic Interface — HUD panels, scanlines, flicker,
-//     floating labels.
-//   - Emoji Storytelling — the stored emoji, unconditionally
-//     (the v1 failure must not recur — see the helper).
+// LYRIC-ONLY (Jaizon, 2026-11-13 ~10:28 MST): "no styles that take
+// up the whole screen — just lyrics with cool animations and
+// stuff." The video is the star. The five demos are now words on
+// the footage: no full-screen background, particle field,
+// light-trail, glow wash, panel, HUD, scanline field, or backdrop
+// wash. Decor survives only as small accents attached to the
+// words. Dream Sequence is registered here (its category is
+// cinematic) and nowhere else — do not duplicate it in
+// ExtraStylesCinematic.swift.
+//
+//   - Typography Physics — letters fall, bounce, and settle.
+//   - Dream Sequence — soft-fading dreamy words, gentle drift.
+//   - Comic Book — bold words that slam in, bursts on emphasis.
+//   - Holographic Interface — scanline shimmer + a small chip.
+//   - Emoji Storytelling — words + the line's emoji, attached.
 //
 // API verdict (audit open question #9): the Phase 2 builder API
 // survived all five without a change — the only addition is the
 // shared helpers in ExtraStyleBuilders.swift, which the demos
-// themselves motivated. No engine change was needed.
+// themselves motivated. No engine change was needed. The re-scope
+// adds three file-local helpers in ExtraStylesCinematic.swift
+// (stroke stamping, word layout, untimed-line fallback) shared by
+// both files.
 
 // MARK: - Demo 1: Typography Physics (typography)
+//
+// LYRIC-ONLY, mostly already there: the letters were always the
+// scene. The only change is quality: the char cascade is now
+// spread across the line's sung duration (starting at the first
+// word's start) instead of a fixed 2-frame stagger from the line
+// start, emphasis-word letters pop harder on the beat, and every
+// glyph gets a dark legibility outline. The floor line stays — a
+// thin accent the letters land on, attached to the words.
 
 final class TypographyPhysicsExtraStyle: ExtraStyleDefinition {
   let id = "typography-physics"
@@ -102,6 +114,19 @@ final class TypographyPhysicsExtraStyle: ExtraStyleDefinition {
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
+      // Which word each character belongs to (spaces attach to
+      // the following word): emphasis words' letters pop harder.
+      var charWordIndex: [Int] = []
+      for (wordIndex, word) in line.words.enumerated() {
+        if wordIndex > 0 { charWordIndex.append(wordIndex) }
+        for _ in word.text { charWordIndex.append(wordIndex) }
+      }
+      let emphasis = Set(line.emphasisWordIndices)
+      // The cascade is tied to the sung line: it starts at the
+      // first word's start and spreads across the line's duration
+      // instead of a fixed stagger from the line start.
+      let firstWordStart = line.words.first.map { max(lineStartFrame, Int(($0.startSeconds * fps).rounded())) } ?? lineStartFrame
+      let charDelay = max(1, (lineEndFrame - firstWordStart) / max(1, line.text.count))
       // Per-character fall: each char starts above the canvas at
       // its staggered start, falls under gravity, bounces on the
       // floor, and settles at its reading position. The simulation
@@ -113,9 +138,12 @@ final class TypographyPhysicsExtraStyle: ExtraStyleDefinition {
         y: floorY, sizePoints: sizePoints,
         color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
         font: ExtraStyleFonts.black, zIndex: 10, canvasWidth: canvas.width,
-        charDelayFrames: 2,
+        firstCharStartFrame: firstWordStart, charDelayFrames: charDelay,
         colorParamId: "accent"
       ) { index, charStartFrame, lineEnd in
+        let wordIndex = index < charWordIndex.count
+          ? charWordIndex[index]
+          : max(0, line.words.count - 1)
         let fallKeys = extraStyleFallKeyframes(
           startFrame: charStartFrame,
           startYOffset: -(floorY + sizePoints),
@@ -131,45 +159,46 @@ final class TypographyPhysicsExtraStyle: ExtraStyleDefinition {
           ]), startFrame: charStartFrame),
           ExtraStyleTrack(
             property: .scale,
-            kind: .reaction(input: .onset, base: 1, gain: 0.12),
+            // Emphasis letters pop harder on the beat.
+            kind: .reaction(input: .onset, base: 1, gain: emphasis.contains(wordIndex) ? 0.28 : 0.12),
             startFrame: charStartFrame,
             enabledParamId: "onsetPop"
           ),
         ]
       }
-      for char in chars { builder.add(char) }
+      for char in extraStyleStrokeTextNodes(chars, sizePoints: sizePoints) { builder.add(char) }
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }
 }
 
 // MARK: - Demo 2: Dream Sequence (cinematic)
+//
+// LYRIC-ONLY: the deep-indigo background, the particle field, the
+// light-trail path and its travelling glow dot, and the
+// loudness-driven glow wash are all gone — the whole old scene
+// was frame furniture. What survives is the dreaminess, as
+// typography: soft-fading word-by-word entrances with a gentle
+// drift, two faint offset echoes of the line (same reading order,
+// never reversed), and the line's emoji small at the end of the
+// line. No audio is read any more (the glow was the only
+// automation consumer), so needsAudioAutomation drops to false.
 
 final class DreamSequenceExtraStyle: ExtraStyleDefinition {
   let id = "dream-sequence"
   let version = 1
   let name = "Dream Sequence"
-  let tagline = "Lyrics drift and dissolve through light and dust."
+  let tagline = "Soft words, drifting and dissolving like a dream."
   let category = "cinematic"
-  let needsAudioAutomation = true
+  let needsAudioAutomation = false
   let needsSubjectMasks = false
   let internalStyle = false
 
   var parameters: [[String: Any]] {
     [
       extraStyleSliderParam(
-        id: "density", label: "Particle density", min: 0, max: 100, step: 1,
-        default: 35, affects: "density"
-      ),
-      extraStyleSliderParam(
         id: "driftSpeed", label: "Drift speed", min: 0.25, max: 2, step: 0.05,
         default: 1, affects: "motion"
-      ),
-      // 0–1 range: it multiplies the glow track's value directly
-      // (paramScale), so 0.6 means "60% glow".
-      extraStyleSliderParam(
-        id: "glow", label: "Glow", min: 0, max: 1, step: 0.05,
-        default: 0.6, affects: "appearance"
       ),
       extraStyleColorParam(id: "hue", label: "Dream colour", default: "#8FA8FF", affects: "appearance"),
     ]
@@ -177,155 +206,31 @@ final class DreamSequenceExtraStyle: ExtraStyleDefinition {
 
   var presets: [[String: Any]] {
     [
-      ["id": "gentle", "label": "Gentle", "values": ["density": 20, "driftSpeed": 0.6, "glow": 0.4]],
-      ["id": "intense", "label": "Intense", "values": ["density": 70, "driftSpeed": 1.4, "glow": 0.9]],
+      ["id": "gentle", "label": "Gentle", "values": ["driftSpeed": 0.6]],
+      ["id": "intense", "label": "Intense", "values": ["driftSpeed": 1.4]],
     ]
   }
 
-  var inputs: [String] { ["lines", "intelligence", "audio"] }
+  var inputs: [String] { ["lines", "words", "intelligence"] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
     let fps = input.fps > 0 ? input.fps : 30
-    let density = extraStyleParamDouble(input.params, "density", 35)
     var builder = ExtraStyleSceneBuilder()
 
-    // Deep-indigo night gradient.
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.05, g: 0.06, b: 0.14, a: 1),
-        ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
-    // Particle field — always added, even at rate 0 (the evaluator
-    // expands no particles then, so raising the slider later
-    // regains the field with no rebuild).
-    builder.add(ExtraStyleNode(
-      id: "particles", kind: .particles,
-      position: CGPoint(x: canvas.width / 2, y: canvas.height / 2),
-      zIndex: 1,
-      emitter: ExtraStyleEmitterContent(
-        rate: max(0, min(60, density * 0.5)),
-        rateParamId: "density",
-        rateParamMultiplier: 0.5,
-        lifetimeSeconds: 6,
-        origin: CGPoint(x: 0.5, y: 0.55),
-        velocity: CGVector(dx: 0, dy: -0.02),
-        spread: CGVector(dx: 0.15, dy: 0.02),
-        gravity: -0.002,
-        size: 0.01,
-        sizeSpread: 0.006,
-        opacityFrom: 0.8,
-        opacityTo: 0,
-        color: extraStyleColor(extraStyleParamString(input.params, "hue", "#8FA8FF")),
-        colorParamId: "hue",
-        spriteKind: .softCircle
-      )
-    ))
-
-    // Light-trail sine path across the frame.
-    let trailY = canvas.height * 0.42
-    let trailPath: CGPath = {
-      let path = CGMutablePath()
-      let step: CGFloat = 40
-      var x: CGFloat = 0
-      var first = true
-      while x <= canvas.width {
-        let y = trailY + sin(x / canvas.width * .pi * 4) * 40
-        if first { path.move(to: CGPoint(x: x, y: y)); first = false } else { path.addLine(to: CGPoint(x: x, y: y)) }
-        x += step
-      }
-      return path
-    }()
-    builder.add(ExtraStyleNode(
-      id: "trail", kind: .path,
-      position: .zero, anchor: .zero, zIndex: 2,
-      path: ExtraStylePathContent(
-        path: trailPath,
-        strokeColor: extraStyleColor(extraStyleParamString(input.params, "hue", "#8FA8FF"), alpha: 0.45),
-        strokeWidth: 3,
-        dash: nil
-      )
-    ))
-
-    // A glow dot travelling the trail: loop tracks (period re-timed
-    // by driftSpeed) — X sweeps the frame, Y follows the sine.
-    builder.add(ExtraStyleNode(
-      id: "trail-dot", kind: .shape,
-      position: CGPoint(x: 0, y: trailY), anchor: CGPoint(x: 0.5, y: 0.5),
-      zIndex: 3,
-      shape: ExtraStyleShapeContent(
-        shape: extraStyleEllipseShape(width: 26, height: 26),
-        fill: extraStyleColor(extraStyleParamString(input.params, "hue", "#8FA8FF")),
-        fillColorParamId: "hue",
-        stroke: nil, strokeWidth: 0
-      ),
-      tracks: [
-        ExtraStyleTrack(
-          property: .positionX,
-          kind: .loop(periodFrames: 240, periodParamId: "driftSpeed", keys: [
-            ExtraStyleKeyframe(frame: 0, value: 0, easing: .linear),
-            ExtraStyleKeyframe(frame: 240, value: Double(canvas.width), easing: .linear),
-          ]),
-          startFrame: 0
-        ),
-        ExtraStyleTrack(
-          property: .positionY,
-          kind: .loop(periodFrames: 240, periodParamId: "driftSpeed", keys: [
-            ExtraStyleKeyframe(frame: 0, value: 0, easing: .easeInOutSine),
-            ExtraStyleKeyframe(frame: 60, value: -40, easing: .easeInOutSine),
-            ExtraStyleKeyframe(frame: 120, value: 0, easing: .easeInOutSine),
-            ExtraStyleKeyframe(frame: 180, value: 40, easing: .easeInOutSine),
-            ExtraStyleKeyframe(frame: 240, value: 0, easing: .easeInOutSine),
-          ]),
-          startFrame: 0
-        ),
-      ]
-    ))
-
-    // Loudness-driven glow behind the text: a radial wash whose
-    // opacity follows the loudness curve, scaled by the glow param.
-    let glowNode = ExtraStyleNode(
-      id: "glow", kind: .gradient,
-      position: CGPoint(x: canvas.width / 2, y: canvas.height / 2),
-      anchor: CGPoint(x: 0.5, y: 0.5),
-      zIndex: 4,
-      gradient: ExtraStyleGradientContent(
-        kind: .radial(
-          center: CGPoint(x: canvas.width / 2, y: canvas.height / 2),
-          radius: max(canvas.width, canvas.height) * 0.55
-        ),
-        colors: [
-          extraStyleColor(extraStyleParamString(input.params, "hue", "#8FA8FF"), alpha: 0.35),
-          extraStyleColor(extraStyleParamString(input.params, "hue", "#8FA8FF"), alpha: 0),
-        ],
-        colorParamIds: ["hue", "hue"],
-        locations: [0, 1],
-        rect: CGRect(origin: .zero, size: canvas)
-      ),
-      tracks: [
-        ExtraStyleTrack(
-          property: .opacity,
-          kind: .reaction(input: .loudness, base: 0.2, gain: 0.6),
-          startFrame: 0,
-          paramScale: "glow"
-        ),
-      ]
-    )
-    builder.add(glowNode)
-
-    // Ghost text layers + the main line: the main line dissolves
-    // in and out; the ghosts drift on loops at lower opacity.
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     let hue = extraStyleColor(extraStyleParamString(input.params, "hue", "#8FA8FF"))
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
-      let sizePoints = canvas.width * 0.07
+      let sizePoints = extraStyleFitSize(
+        baseSize: canvas.width * 0.07, text: line.text,
+        font: ExtraStyleFonts.bold, canvasWidth: canvas.width
+      )
       let centerY = canvas.height * 0.5
-      // Ghost 1: hue, offset up-right, slow drift.
+      let emphasis = Set(line.emphasisWordIndices)
+      // Faint offset echoes of the line — the old ghost layers,
+      // kept as typography: same reading order, hue-tinted, low
+      // alpha, drifting slowly. Never reversed, never a wash.
       builder.add(extraStyleTextNode(
         id: "ghost1-\(lineIndex)",
         text: line.text, font: ExtraStyleFonts.regular, sizePoints: sizePoints,
@@ -347,7 +252,6 @@ final class DreamSequenceExtraStyle: ExtraStyleDefinition {
           ),
         ]
       ))
-      // Ghost 2: hue, offset down-left, slightly larger.
       builder.add(extraStyleTextNode(
         id: "ghost2-\(lineIndex)",
         text: line.text, font: ExtraStyleFonts.regular, sizePoints: sizePoints * 1.04,
@@ -369,16 +273,17 @@ final class DreamSequenceExtraStyle: ExtraStyleDefinition {
           ),
         ]
       ))
-      // The main line.
-      builder.add(extraStyleTextNode(
-        id: "line-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.bold, sizePoints: sizePoints,
+      // The main line, word by word, soft-fading in at each
+      // word's sung start and drifting gently while it is up.
+      let words = extraStyleWordNodes(
+        line: line, lineIndex: lineIndex, fps: fps,
+        lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        y: centerY, sizePoints: sizePoints,
         color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
-        position: CGPoint(x: canvas.width / 2, y: centerY),
-        zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.88,
-        tracks: [
-          extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 15, exitFrames: 15),
+        font: ExtraStyleFonts.bold, zIndex: 10, canvasWidth: canvas.width
+      ) { index, wordStart, wordEnd in
+        var tracks: [ExtraStyleTrack] = [
+          extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd, enterFrames: 15, exitFrames: 15),
           ExtraStyleTrack(
             property: .positionY,
             kind: .loop(periodFrames: 240, periodParamId: "driftSpeed", keys: [
@@ -386,22 +291,65 @@ final class DreamSequenceExtraStyle: ExtraStyleDefinition {
               ExtraStyleKeyframe(frame: 120, value: -10, easing: .easeInOutSine),
               ExtraStyleKeyframe(frame: 240, value: 0, easing: .easeInOutSine),
             ]),
-            startFrame: lineStartFrame
+            startFrame: wordStart
           ),
         ]
-      ))
+        if emphasis.contains(index) {
+          tracks.append(extraStyleSpringInTrack(start: wordStart, from: 0.85, stiffness: 160, damping: 12))
+        }
+        return tracks
+      }
+      if words.isEmpty {
+        builder.add(extraStyleLyricFallbackNode(
+          id: "line-\(lineIndex)", line: line,
+          range: lineStartFrame...lineEndFrame,
+          y: centerY, sizePoints: sizePoints,
+          color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+          font: ExtraStyleFonts.bold, zIndex: 10, canvasWidth: canvas.width
+        ))
+      } else {
+        for word in extraStyleStrokeTextNodes(words, sizePoints: sizePoints) { builder.add(word) }
+      }
+      // The line's emoji, small, at the end of the line (clamped
+      // inside the frame — a full-width line leaves no room past
+      // its last word).
+      let layoutWidth = extraStyleWordLayout(
+        words: line.words.map { $0.text }, font: ExtraStyleFonts.bold,
+        sizePoints: sizePoints, canvasWidth: canvas.width
+      ).totalWidth
+      let dreamEmojiSize = sizePoints * 0.8
+      if let emoji = extraStyleEmojiNode(
+        id: "emoji-\(lineIndex)", line: line,
+        position: CGPoint(
+          x: min(canvas.width - dreamEmojiSize * 0.6, canvas.width / 2 + layoutWidth / 2 + sizePoints * 0.9),
+          y: centerY - sizePoints * 0.55
+        ),
+        sizePoints: dreamEmojiSize, zIndex: 11,
+        visibleRange: lineStartFrame...lineEndFrame
+      ) {
+        builder.add(emoji)
+      }
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }
 }
 
 // MARK: - Demo 3: Comic Book (playful)
+//
+// LYRIC-ONLY, REPLACEMENT CONCEPT UNDER THE SAME ID: the panels
+// are gone — the big filled panel behind the text (88% of the
+// width, half the frame) was a scene, not lyrics. The replacement
+// is the comic energy as typography: big bold words that slam in
+// with a spring, emphasis words as impact words (harder slam +
+// a small burst behind the word), and short motion rays fanning
+// off the burst. The burst asset stays, but only ever behind an
+// emphasis word — never a panel corner.
 
 final class ComicBookExtraStyle: ExtraStyleDefinition {
   let id = "comic-book"
   let version = 1
   let name = "Comic Book"
-  let tagline = "Panels, bursts, and impact words — a page that moves."
+  let tagline = "Big bold words that slam in — POW, right on the beat."
   let category = "playful"
   let needsAudioAutomation = true
   let needsSubjectMasks = false
@@ -409,11 +357,6 @@ final class ComicBookExtraStyle: ExtraStyleDefinition {
 
   var parameters: [[String: Any]] {
     [
-      extraStyleSegmentedParam(
-        id: "panelStyle", label: "Panel style",
-        options: [("classic", "Classic"), ("bold", "Bold"), ("pop", "Pop")],
-        default: "classic", affects: "layout"
-      ),
       extraStyleSliderParam(
         id: "impactScale", label: "Impact scale", min: 0.5, max: 1.5, step: 0.05,
         default: 1, affects: "motion"
@@ -425,8 +368,8 @@ final class ComicBookExtraStyle: ExtraStyleDefinition {
 
   var presets: [[String: Any]] {
     [
-      ["id": "bold-pop", "label": "Bold Pop", "values": ["panelStyle": "bold", "impactScale": 1.3]],
-      ["id": "quiet", "label": "Quiet", "values": ["panelStyle": "classic", "impactScale": 0.8, "motionLines": false]],
+      ["id": "bold-pop", "label": "Bold Pop", "values": ["impactScale": 1.3]],
+      ["id": "quiet", "label": "Quiet", "values": ["impactScale": 0.8, "motionLines": false]],
     ]
   }
 
@@ -435,216 +378,150 @@ final class ComicBookExtraStyle: ExtraStyleDefinition {
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
     let fps = input.fps > 0 ? input.fps : 30
-    let panelStyle = extraStyleParamString(input.params, "panelStyle", "classic")
-    let panelWidth = canvas.width * 0.88
-    let panelHeight = canvas.height * 0.52
+    let accent = extraStyleColor(extraStyleParamString(input.params, "accent", "#FFD93D"))
     var builder = ExtraStyleSceneBuilder()
-
-    // Panel look by style: fill + stroke + rotation.
-    let (panelFill, panelStroke, panelStrokeWidth): (ExtraStyleRGBA, ExtraStyleRGBA, CGFloat) = {
-      switch panelStyle {
-      case "bold":
-        return (
-          ExtraStyleRGBA(r: 1, g: 0.95, b: 0.84, a: 1),
-          ExtraStyleRGBA(r: 0.05, g: 0.05, b: 0.06, a: 1),
-          10
-        )
-      case "pop":
-        return (
-          extraStyleColor(extraStyleParamString(input.params, "accent", "#FFD93D")),
-          ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1),
-          4
-        )
-      default:
-        return (
-          ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
-          ExtraStyleRGBA(r: 0.05, g: 0.05, b: 0.06, a: 1),
-          6
-        )
-      }
-    }()
 
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
-      var random = ExtraStyleSeededRandom(seed: input.seed ^ UInt64(lineIndex + 1))
-      let rotation = CGFloat(random.nextRange(min: -1.5, max: 1.5))
-      let panelY = canvas.height * (lineIndex % 2 == 0 ? 0.44 : 0.56)
-      let panelId = "panel-\(lineIndex)"
-
-      // Panel wipe: spring scale + quick opacity in at the line start.
-      let panelTracks: [ExtraStyleTrack] = [
-        ExtraStyleTrack(
-          property: .scale,
-          kind: .spring(from: 0.85, to: 1, stiffness: 160, damping: 12, initialVelocity: 0),
-          startFrame: lineStartFrame
-        ),
-        ExtraStyleTrack(
-          property: .opacity,
-          kind: .keyframes(keys: [
-            ExtraStyleKeyframe(frame: lineStartFrame, value: 0, easing: .linear),
-            ExtraStyleKeyframe(frame: min(lineEndFrame, lineStartFrame + 6), value: 1, easing: .easeOutCubic),
-            ExtraStyleKeyframe(frame: max(lineStartFrame, lineEndFrame - 9), value: 1, easing: .linear),
-            ExtraStyleKeyframe(frame: lineEndFrame, value: 0, easing: .easeInCubic),
-          ]),
-          startFrame: lineStartFrame
-        ),
-      ]
-
-      // Members are group children (addChild, not add) — they move
-      // with the panel and are evaluated exactly once.
-      var members: [String] = []
-      // Panel border.
-      let borderId = "panel-border-\(lineIndex)"
-      builder.addChild(extraStyleShapeNode(
-        id: borderId,
-        shape: extraStyleRectShape(width: panelWidth, height: panelHeight),
-        fill: panelFill,
-        stroke: panelStroke, strokeWidth: panelStrokeWidth,
-        position: .zero, zIndex: 0
-      ))
-      members.append(borderId)
-      // The line, inside the panel.
-      let textId = "panel-text-\(lineIndex)"
-      builder.addChild(extraStyleTextNode(
-        id: textId,
-        text: line.text, font: ExtraStyleFonts.black, sizePoints: canvas.width * 0.055,
-        color: ExtraStyleRGBA(r: 0.05, g: 0.05, b: 0.06, a: 1),
-        position: CGPoint(x: 0, y: -panelHeight * 0.08),
-        zIndex: 1,
-        visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: panelWidth * 0.86
-      ))
-      members.append(textId)
-      // Burst in the panel corner.
-      let burstId = "panel-burst-\(lineIndex)"
-      let burstSize = canvas.width * 0.26
-      builder.addChild(ExtraStyleNode(
-        id: burstId, kind: .image,
-        position: CGPoint(x: panelWidth * 0.32, y: -panelHeight * 0.32),
-        anchor: CGPoint(x: 0.5, y: 0.5),
-        // The asset is 512×512: scale it to the panel corner.
-        scale: burstSize / 512,
-        zIndex: 2,
-        visibleRange: lineStartFrame...lineEndFrame,
-        imageAssetId: "comic-burst",
-        tracks: [
-          extraStyleSpringInTrack(start: lineStartFrame + 2, from: 0.2, stiffness: 200, damping: 9),
-          ExtraStyleTrack(
-            property: .scale,
-            kind: .reaction(input: .onset, base: 1, gain: 0.25),
-            startFrame: lineStartFrame
-          ),
-        ]
-      ))
-      members.append(burstId)
-      // Impact words: the line's emphasis words (or its first word)
-      // as big rotated words near the panel top.
-      let impactWords: [String] = {
-        let indices = line.emphasisWordIndices
-        if !indices.isEmpty {
-          let words = line.text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-          return indices.compactMap { $0 >= 0 && $0 < words.count ? words[$0] : nil }
-        }
-        let words = line.text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-        return words.first.map { [$0] } ?? []
+      let centreY = canvas.height * (lineIndex % 2 == 0 ? 0.44 : 0.56)
+      let font = ExtraStyleFonts.black
+      let sizePoints = extraStyleFitSize(
+        baseSize: canvas.width * 0.07, text: line.text, font: font, canvasWidth: canvas.width
+      )
+      let emphasis = Set(line.emphasisWordIndices)
+      // Impact words: the line's emphasis words (or its first
+      // word when none are marked).
+      let impactIndices: [Int] = {
+        if !emphasis.isEmpty { return emphasis.sorted() }
+        return line.words.isEmpty ? [] : [0]
       }()
-      for (impactIndex, impactWord) in impactWords.enumerated() {
-        let impactId = "panel-impact-\(lineIndex)-\(impactIndex)"
-        let impactRotation = CGFloat(random.nextRange(min: -8, max: 8))
-        builder.addChild(ExtraStyleNode(
-          id: impactId, kind: .text,
-          position: CGPoint(
-            x: CGFloat(random.nextRange(min: -0.22, max: 0.22)) * panelWidth,
-            y: -panelHeight * 0.3
-          ),
+      let impactSet = Set(impactIndices)
+      // Every word slams in with a spring; impact words slam
+      // harder, scaled by the impact param.
+      let words = extraStyleWordNodes(
+        line: line, lineIndex: lineIndex, fps: fps,
+        lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        y: centreY, sizePoints: sizePoints,
+        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+        font: font, zIndex: 10, canvasWidth: canvas.width
+      ) { index, wordStart, wordEnd in
+        var tracks: [ExtraStyleTrack] = [
+          extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd, enterFrames: 6, exitFrames: 9),
+        ]
+        if impactSet.contains(index) {
+          tracks.append(ExtraStyleTrack(
+            property: .scale,
+            kind: .spring(from: 0.2, to: 1, stiffness: 220, damping: 9, initialVelocity: 0),
+            startFrame: wordStart,
+            paramScale: "impactScale"
+          ))
+        } else {
+          tracks.append(extraStyleSpringInTrack(start: wordStart, from: 0.6, stiffness: 200, damping: 10))
+        }
+        return tracks
+      }
+      if words.isEmpty {
+        builder.add(extraStyleLyricFallbackNode(
+          id: "line-\(lineIndex)", line: line,
+          range: lineStartFrame...lineEndFrame,
+          y: centreY, sizePoints: sizePoints,
+          color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+          font: font, zIndex: 10, canvasWidth: canvas.width
+        ))
+      } else {
+        for word in extraStyleStrokeTextNodes(words, sizePoints: sizePoints) { builder.add(word) }
+      }
+      // Burst + motion rays behind each impact word — small,
+      // word-attached, never a panel.
+      let layout = extraStyleWordLayout(
+        words: line.words.map { $0.text }, font: font,
+        sizePoints: sizePoints, canvasWidth: canvas.width
+      )
+      for wordIndex in impactIndices where wordIndex >= 0 && wordIndex < line.words.count && wordIndex < layout.centres.count {
+        let word = line.words[wordIndex]
+        let wordStartFrame = max(lineStartFrame, Int((word.startSeconds * fps).rounded()))
+        let wordEndFrame = min(lineEndFrame, Int((word.endSeconds * fps).rounded()))
+        guard wordEndFrame > wordStartFrame else { continue }
+        let burstCentre = CGPoint(x: layout.centres[wordIndex], y: centreY)
+        let burstSize = canvas.width * 0.2
+        builder.add(ExtraStyleNode(
+          id: "burst-\(lineIndex)-\(wordIndex)", kind: .image,
+          position: burstCentre,
           anchor: CGPoint(x: 0.5, y: 0.5),
-          rotationDeg: impactRotation,
-          zIndex: 3,
-          visibleRange: lineStartFrame...lineEndFrame,
-          text: ExtraStyleTextContent(
-            text: impactWord.uppercased(),
-            fontPostScriptName: ExtraStyleFonts.black,
-            sizePoints: canvas.width * 0.085,
-            color: extraStyleColor(extraStyleParamString(input.params, "accent", "#FFD93D")),
-            colorParamId: "accent",
-            strokeColor: ExtraStyleRGBA(r: 0.05, g: 0.05, b: 0.06, a: 1),
-            strokeWidthPoints: 3,
-            alignment: .center,
-            maxWidthPoints: nil
-          ),
+          // The asset is 512×512: scale it to the word.
+          scale: burstSize / 512,
+          zIndex: 9,
+          visibleRange: wordStartFrame...wordEndFrame,
+          imageAssetId: "comic-burst",
           tracks: [
+            extraStyleSpringInTrack(start: wordStartFrame + 2, from: 0.2, stiffness: 200, damping: 9),
             ExtraStyleTrack(
               property: .scale,
-              kind: .spring(from: 0.2, to: 1, stiffness: 220, damping: 9, initialVelocity: 0),
-              startFrame: lineStartFrame + 4 + impactIndex * 3,
-              paramScale: "impactScale"
+              kind: .reaction(input: .onset, base: 1, gain: 0.25),
+              startFrame: wordStartFrame
             ),
           ]
         ))
-        members.append(impactId)
-      }
-      // Motion lines radiating from the burst.
-      for ray in 0..<4 {
-        let rayId = "panel-ray-\(lineIndex)-\(ray)"
-        let angle = CGFloat(ray) * .pi / 2 + 0.4
-        let from = CGPoint(x: panelWidth * 0.32, y: -panelHeight * 0.32)
-        let to = CGPoint(
-          x: from.x + cos(angle) * panelWidth * 0.16,
-          y: from.y + sin(angle) * panelWidth * 0.16
-        )
-        let rayPath = CGMutablePath()
-        rayPath.move(to: from)
-        rayPath.addLine(to: to)
-        builder.addChild(ExtraStyleNode(
-          id: rayId, kind: .path,
-          position: .zero, anchor: .zero,
-          zIndex: 2,
-          visibleRange: lineStartFrame...lineEndFrame,
-          path: ExtraStylePathContent(
-            path: rayPath,
-            strokeColor: ExtraStyleRGBA(r: 0.05, g: 0.05, b: 0.06, a: 0.8),
-            strokeWidth: 4,
-            dash: nil
-          ),
-          tracks: [
-            ExtraStyleTrack(
-              property: .opacity,
-              kind: .keyframes(keys: [
-                ExtraStyleKeyframe(frame: lineStartFrame + ray * 2, value: 0, easing: .linear),
-                ExtraStyleKeyframe(frame: min(lineEndFrame, lineStartFrame + ray * 2 + 5), value: 1, easing: .easeOutCubic),
-                ExtraStyleKeyframe(frame: lineEndFrame, value: 0, easing: .linear),
-              ]),
-              startFrame: lineStartFrame,
-              enabledParamId: "motionLines"
+        // Motion rays fanning up off the burst. The opacity
+        // envelope ends at 0, so the motionLines toggle's end
+        // value hides them when off.
+        for ray in 0..<3 {
+          let angle = -CGFloat.pi / 2 + CGFloat(ray - 1) * 0.5
+          let to = CGPoint(
+            x: burstCentre.x + cos(angle) * canvas.width * 0.1,
+            y: burstCentre.y + sin(angle) * canvas.width * 0.1
+          )
+          let rayPath = CGMutablePath()
+          rayPath.move(to: burstCentre)
+          rayPath.addLine(to: to)
+          builder.add(ExtraStyleNode(
+            id: "ray-\(lineIndex)-\(wordIndex)-\(ray)", kind: .path,
+            position: .zero, anchor: .zero,
+            zIndex: 9,
+            visibleRange: wordStartFrame...wordEndFrame,
+            path: ExtraStylePathContent(
+              path: rayPath,
+              strokeColor: accent.withAlpha(0.9),
+              strokeWidth: 4,
+              dash: nil
             ),
-          ]
-        ))
-        members.append(rayId)
+            tracks: [
+              ExtraStyleTrack(
+                property: .opacity,
+                kind: .keyframes(keys: [
+                  ExtraStyleKeyframe(frame: wordStartFrame + ray * 2, value: 0, easing: .linear),
+                  ExtraStyleKeyframe(frame: min(wordEndFrame, wordStartFrame + ray * 2 + 5), value: 1, easing: .easeOutCubic),
+                  ExtraStyleKeyframe(frame: wordEndFrame, value: 0, easing: .linear),
+                ]),
+                startFrame: wordStartFrame,
+                enabledParamId: "motionLines"
+              ),
+            ]
+          ))
+        }
       }
-
-      builder.add(ExtraStyleNode(
-        id: panelId, kind: .group,
-        children: members,
-        position: CGPoint(x: canvas.width / 2, y: panelY),
-        anchor: .zero,
-        rotationDeg: rotation,
-        zIndex: 10,
-        visibleRange: lineStartFrame...lineEndFrame,
-        tracks: panelTracks
-      ))
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }
 }
 
 // MARK: - Demo 4: Holographic Interface (digital)
+//
+// LYRIC-ONLY: the background gradient, the 14 full-width
+// scanlines, the full-width travelling scan sweep, the four
+// corner brackets and both floating HUD panels are gone — a
+// full-screen HUD. What survives is the holo feel on the words:
+// mono type with an accent stroke, sliding in word by word,
+// floating gently, with a thin scanline shimmer under each word
+// (gated by the flicker toggle) and ONE small corner chip
+// ("HOLO //") — a label, not a HUD.
 
 final class HolographicInterfaceExtraStyle: ExtraStyleDefinition {
   let id = "holographic-interface"
   let version = 1
   let name = "Holographic Interface"
-  let tagline = "HUD panels, scanlines, and floating data."
+  let tagline = "Words with a scanline shimmer and a holo chip — nothing else."
   let category = "digital"
   let needsAudioAutomation = false
   let needsSubjectMasks = false
@@ -653,10 +530,6 @@ final class HolographicInterfaceExtraStyle: ExtraStyleDefinition {
   var parameters: [[String: Any]] {
     [
       extraStyleColorParam(id: "panelColor", label: "Interface colour", default: "#7DF9FF", affects: "appearance"),
-      extraStyleSliderParam(
-        id: "scanlines", label: "Scanline intensity", min: 0, max: 1, step: 0.05,
-        default: 0.7, affects: "appearance"
-      ),
       extraStyleToggleParam(id: "flicker", label: "Flicker", default: true, affects: "motion"),
       extraStyleSliderParam(
         id: "floatSpeed", label: "Float speed", min: 0.25, max: 2, step: 0.05,
@@ -667,12 +540,12 @@ final class HolographicInterfaceExtraStyle: ExtraStyleDefinition {
 
   var presets: [[String: Any]] {
     [
-      ["id": "calm", "label": "Calm", "values": ["scanlines": 0.3, "flicker": false, "floatSpeed": 0.5]],
-      ["id": "glitchy", "label": "Glitchy", "values": ["scanlines": 1, "flicker": true, "floatSpeed": 1.6]],
+      ["id": "calm", "label": "Calm", "values": ["flicker": false, "floatSpeed": 0.5]],
+      ["id": "glitchy", "label": "Glitchy", "values": ["flicker": true, "floatSpeed": 1.6]],
     ]
   }
 
-  var inputs: [String] { ["lines", "intelligence"] }
+  var inputs: [String] { ["lines", "words", "intelligence"] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
@@ -680,174 +553,50 @@ final class HolographicInterfaceExtraStyle: ExtraStyleDefinition {
     let accent = extraStyleColor(extraStyleParamString(input.params, "panelColor", "#7DF9FF"))
     var builder = ExtraStyleSceneBuilder()
 
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.03, g: 0.05, b: 0.08, a: 1),
-        ExtraStyleRGBA(r: 0.01, g: 0.02, b: 0.03, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
+    // One small corner chip — a label, not a HUD.
+    builder.add(extraStyleTextNode(
+      id: "chip-label",
+      text: "HOLO //", font: ExtraStyleFonts.mono, sizePoints: canvas.width * 0.028,
+      color: accent,
+      position: CGPoint(x: canvas.width - canvas.width * 0.09, y: canvas.height * 0.035),
+      zIndex: 5,
+      colorParamId: "panelColor"
+    ))
+    builder.add(extraStyleShapeNode(
+      id: "chip-underline",
+      shape: extraStyleRectShape(width: canvas.width * 0.11, height: 3),
+      fill: accent.withAlpha(0.7),
+      position: CGPoint(x: canvas.width - canvas.width * 0.09, y: canvas.height * 0.035 + canvas.width * 0.028),
+      zIndex: 5,
+      fillColorParamId: "panelColor"
     ))
 
-    // Scanlines: thin full-width bars, intensity via paramScale
-    // (a single-key opacity track multiplied by the 0–1 param).
-    for row in 0..<14 {
-      let y = canvas.height * CGFloat(row + 1) / 15
-      builder.add(ExtraStyleNode(
-        id: "scanline-\(row)", kind: .shape,
-        position: CGPoint(x: canvas.width / 2, y: y),
-        anchor: CGPoint(x: 0.5, y: 0.5),
-        zIndex: 1,
-        shape: ExtraStyleShapeContent(
-          shape: extraStyleRectShape(width: canvas.width, height: 3),
-          fill: accent.withAlpha(0.06),
-          fillColorParamId: "panelColor",
-          stroke: nil, strokeWidth: 0
-        ),
-        tracks: [
-          ExtraStyleTrack(
-            property: .opacity,
-            kind: .keyframes(keys: [ExtraStyleKeyframe(frame: 0, value: 1, easing: .linear)]),
-            startFrame: 0,
-            paramScale: "scanlines"
-          ),
-        ]
-      ))
-    }
-
-    // Scan sweep: a bright bar travelling top → bottom on a loop.
-    builder.add(ExtraStyleNode(
-      id: "scan-sweep", kind: .shape,
-      position: CGPoint(x: canvas.width / 2, y: 0),
-      anchor: CGPoint(x: 0.5, y: 0.5),
-      zIndex: 2,
-      shape: ExtraStyleShapeContent(
-        shape: extraStyleRectShape(width: canvas.width, height: 10),
-        fill: accent.withAlpha(0.2),
-        fillColorParamId: "panelColor",
-        stroke: nil, strokeWidth: 0
-      ),
-      tracks: [
-        ExtraStyleTrack(
-          property: .positionY,
-          kind: .loop(periodFrames: 180, periodParamId: "floatSpeed", keys: [
-            ExtraStyleKeyframe(frame: 0, value: 0, easing: .linear),
-            ExtraStyleKeyframe(frame: 180, value: Double(canvas.height), easing: .linear),
-          ]),
-          startFrame: 0
-        ),
-      ]
-    ))
-
-    // Corner brackets (static HUD chrome).
-    let bracketLength = canvas.width * 0.09
-    let corners: [(CGPoint, CGFloat, CGFloat)] = [
-      (CGPoint(x: 24, y: 24), 1, 1),
-      (CGPoint(x: canvas.width - 24, y: 24), -1, 1),
-      (CGPoint(x: 24, y: canvas.height - 24), 1, -1),
-      (CGPoint(x: canvas.width - 24, y: canvas.height - 24), -1, -1),
-    ]
-    for (cornerIndex, corner) in corners.enumerated() {
-      let (origin, sx, sy) = corner
-      let path = CGMutablePath()
-      path.move(to: CGPoint(x: origin.x + sx * bracketLength, y: origin.y))
-      path.addLine(to: CGPoint(x: origin.x, y: origin.y))
-      path.addLine(to: CGPoint(x: origin.x, y: origin.y + sy * bracketLength))
-      builder.add(ExtraStyleNode(
-        id: "corner-\(cornerIndex)", kind: .path,
-        position: .zero, anchor: .zero, zIndex: 3,
-        path: ExtraStylePathContent(
-          path: path,
-          strokeColor: accent.withAlpha(0.7),
-          strokeWidth: 3,
-          dash: nil
-        )
-      ))
-    }
-
-    // HUD panels: top-left (status) and bottom-right (sync), each
-    // floating on a loop and flickering with seeded noise. Members
-    // are registered first (addChild), then the group (add).
-    func addHudPanel(
-      builder: inout ExtraStyleSceneBuilder,
-      panelId: String, position: CGPoint, width: CGFloat, height: CGFloat,
-      label: String, seed: UInt64
-    ) {
-      builder.addChild(extraStyleShapeNode(
-        id: "\(panelId)-frame",
-        shape: extraStyleRectShape(width: width, height: height),
-        fill: accent.withAlpha(0.05),
-        stroke: accent, strokeWidth: 2,
-        position: .zero, zIndex: 0
-      ))
-      builder.addChild(extraStyleTextNode(
-        id: "\(panelId)-label",
-        text: label, font: ExtraStyleFonts.mono, sizePoints: canvas.width * 0.028,
-        color: accent,
-        position: CGPoint(x: 0, y: -height * 0.22),
-        zIndex: 1,
-        colorParamId: "panelColor"
-      ))
-      builder.addChild(extraStyleShapeNode(
-        id: "\(panelId)-bar",
-        shape: extraStyleRectShape(width: width * 0.6, height: 4),
-        fill: accent.withAlpha(0.8),
-        position: CGPoint(x: 0, y: height * 0.28),
-        zIndex: 1
-      ))
-      builder.add(ExtraStyleNode(
-        id: panelId, kind: .group,
-        children: ["\(panelId)-frame", "\(panelId)-label", "\(panelId)-bar"],
-        position: position, anchor: .zero,
-        zIndex: 4,
-        tracks: [
-          ExtraStyleTrack(
-            property: .positionY,
-            kind: .loop(periodFrames: 150, periodParamId: "floatSpeed", keys: [
-              ExtraStyleKeyframe(frame: 0, value: 0, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: 75, value: -8, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: 150, value: 0, easing: .easeInOutSine),
-            ]),
-            startFrame: 0
-          ),
-          extraStyleFlickerTrack(start: 0, end: input.durationFrames, base: 0.95, amplitude: 0.12, seed: seed),
-        ]
-      ))
-    }
-    addHudPanel(
-      builder: &builder, panelId: "hud-top",
-      position: CGPoint(x: canvas.width * 0.22, y: canvas.height * 0.1),
-      width: canvas.width * 0.34, height: canvas.height * 0.07,
-      label: "MVMT // LIVE", seed: input.seed ^ 0x4855_4400_0001
-    )
-    addHudPanel(
-      builder: &builder, panelId: "hud-bottom",
-      position: CGPoint(x: canvas.width * 0.78, y: canvas.height * 0.88),
-      width: canvas.width * 0.3, height: canvas.height * 0.06,
-      label: "SYNC 30FPS", seed: input.seed ^ 0x4855_4400_0002
-    )
-
-    // Per-line floating labels + the main line.
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
-      // Floating label: slides in from the left, floats, exits.
-      builder.add(extraStyleTextNode(
-        id: "label-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.mono, sizePoints: canvas.width * 0.042,
-        color: accent,
-        position: CGPoint(x: canvas.width / 2, y: canvas.height * 0.5),
-        zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.88,
-        colorParamId: "panelColor",
-        tracks: [
+      let centreY = canvas.height * 0.56
+      let font = ExtraStyleFonts.mono
+      let sizePoints = extraStyleFitSize(
+        baseSize: canvas.width * 0.058, text: line.text, font: font, canvasWidth: canvas.width
+      )
+      let emphasis = Set(line.emphasisWordIndices)
+      // Mono words sliding in from the left, floating gently,
+      // accent-stroked so they read as holo type on any footage.
+      let words = extraStyleWordNodes(
+        line: line, lineIndex: lineIndex, fps: fps,
+        lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        y: centreY, sizePoints: sizePoints,
+        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+        font: font, zIndex: 10, canvasWidth: canvas.width
+      ) { index, wordStart, wordEnd in
+        var tracks: [ExtraStyleTrack] = [
           ExtraStyleTrack(
             property: .positionX,
             kind: .keyframes(keys: [
-              ExtraStyleKeyframe(frame: lineStartFrame, value: -60, easing: .easeOutCubic),
-              ExtraStyleKeyframe(frame: min(lineEndFrame, lineStartFrame + 10), value: 0, easing: .easeOutCubic),
+              ExtraStyleKeyframe(frame: wordStart, value: -60, easing: .easeOutCubic),
+              ExtraStyleKeyframe(frame: min(wordEnd, wordStart + 10), value: 0, easing: .easeOutCubic),
             ]),
-            startFrame: lineStartFrame
+            startFrame: wordStart
           ),
           ExtraStyleTrack(
             property: .positionY,
@@ -856,22 +605,61 @@ final class HolographicInterfaceExtraStyle: ExtraStyleDefinition {
               ExtraStyleKeyframe(frame: 75, value: -6, easing: .easeInOutSine),
               ExtraStyleKeyframe(frame: 150, value: 0, easing: .easeInOutSine),
             ]),
-            startFrame: lineStartFrame
+            startFrame: wordStart
           ),
-          extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 8, exitFrames: 8),
+          extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd, enterFrames: 8, exitFrames: 8),
         ]
-      ))
-      // Main line, mono, with an accent stroke.
-      builder.add(extraStyleTextNode(
-        id: "line-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.mono, sizePoints: canvas.width * 0.058,
-        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
-        position: CGPoint(x: canvas.width / 2, y: canvas.height * 0.62),
-        zIndex: 11, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.88,
-        strokeColor: accent, strokeWidthPoints: 1.5,
-        tracks: [extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame)]
-      ))
+        if emphasis.contains(index) {
+          tracks.append(extraStyleSpringInTrack(start: wordStart, from: 0.8, stiffness: 180, damping: 11))
+        }
+        return tracks
+      }
+      if words.isEmpty {
+        builder.add(extraStyleLyricFallbackNode(
+          id: "line-\(lineIndex)", line: line,
+          range: lineStartFrame...lineEndFrame,
+          y: centreY, sizePoints: sizePoints,
+          color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+          font: font, zIndex: 10, canvasWidth: canvas.width
+        ))
+      } else {
+        // Accent stroke (not the default dark one) — holo type.
+        for word in extraStyleStrokeTextNodes(words, sizePoints: sizePoints, stroke: accent.withAlpha(0.8)) { builder.add(word) }
+      }
+      // Scanline shimmer: a thin accent line under each word,
+      // visible only while the word is sung. The opacity envelope
+      // ends at 0, so the flicker toggle's end value hides the
+      // shimmer when off.
+      let layout = extraStyleWordLayout(
+        words: line.words.map { $0.text }, font: font,
+        sizePoints: sizePoints, canvasWidth: canvas.width
+      )
+      for (wordIndex, word) in line.words.enumerated() where wordIndex < layout.centres.count {
+        let wordStartFrame = max(lineStartFrame, Int((word.startSeconds * fps).rounded()))
+        let wordEndFrame = min(lineEndFrame, Int((word.endSeconds * fps).rounded()))
+        guard wordEndFrame > wordStartFrame else { continue }
+        let wordWidth = extraStyleTextWidth(word.text, fontPostScriptName: font, sizePoints: sizePoints)
+        builder.add(extraStyleShapeNode(
+          id: "shimmer-\(lineIndex)-\(wordIndex)",
+          shape: extraStyleRectShape(width: wordWidth, height: 3),
+          fill: accent.withAlpha(0.55),
+          position: CGPoint(x: layout.centres[wordIndex], y: centreY + sizePoints * 0.78),
+          zIndex: 9,
+          visibleRange: wordStartFrame...wordEndFrame,
+          fillColorParamId: "panelColor",
+          tracks: [ExtraStyleTrack(
+            property: .opacity,
+            kind: .keyframes(keys: [
+              ExtraStyleKeyframe(frame: wordStartFrame, value: 0, easing: .linear),
+              ExtraStyleKeyframe(frame: min(wordEndFrame, wordStartFrame + 5), value: 1, easing: .easeOutCubic),
+              ExtraStyleKeyframe(frame: max(wordStartFrame, wordEndFrame - 6), value: 1, easing: .linear),
+              ExtraStyleKeyframe(frame: wordEndFrame, value: 0, easing: .linear),
+            ]),
+            startFrame: wordStartFrame,
+            enabledParamId: "flicker"
+          )]
+        ))
+      }
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }
@@ -887,6 +675,12 @@ final class HolographicInterfaceExtraStyle: ExtraStyleDefinition {
 // the hero falls back to the tone's first reaction emoji so the
 // style is never empty — that fallback is NOT the v1 bug: the
 // stored emoji, when present, is always the hero.
+//
+// LYRIC-ONLY re-scope: the tone-tinted backdrop wash (a
+// full-canvas radial gradient per line) is gone, and the hero
+// emoji is no longer a huge centrepiece floating above the line —
+// it is small and attached to the words, at the end of the line,
+// with the line itself sung word by word underneath the reactions.
 
 final class EmojiStorytellingExtraStyle: ExtraStyleDefinition {
   let id = "emoji-storytelling"
@@ -909,58 +703,77 @@ final class EmojiStorytellingExtraStyle: ExtraStyleDefinition {
         default: 0.7, affects: "motion"
       ),
       extraStyleToggleParam(id: "float", label: "Float", default: true, affects: "motion"),
-      extraStyleSegmentedParam(
-        id: "backdrop", label: "Backdrop",
-        options: [("soft", "Soft"), ("none", "None"), ("vivid", "Vivid")],
-        default: "soft", affects: "layout"
-      ),
     ]
   }
 
   var presets: [[String: Any]] {
     [
       ["id": "big-feelings", "label": "Big feelings", "values": ["emojiSize": 1.6, "reactionScale": 1]],
-      ["id": "quiet", "label": "Quiet", "values": ["emojiSize": 0.9, "reactionScale": 0.4, "backdrop": "none"]],
+      ["id": "quiet", "label": "Quiet", "values": ["emojiSize": 0.9, "reactionScale": 0.4]],
     ]
   }
 
-  var inputs: [String] { ["lines", "intelligence"] }
+  var inputs: [String] { ["lines", "words", "intelligence"] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
     let fps = input.fps > 0 ? input.fps : 30
     let emojiSize = extraStyleParamDouble(input.params, "emojiSize", 1.2)
-    let backdrop = extraStyleParamString(input.params, "backdrop", "soft")
     var builder = ExtraStyleSceneBuilder()
 
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
-      let toneColor = extraStyleToneColor(line.tone)
-      let emojiCenter = CGPoint(x: canvas.width / 2, y: canvas.height * 0.36)
-      let heroSize = canvas.width * 0.16 * CGFloat(emojiSize)
-
-      // Tone-tinted backdrop wash behind the hero emoji.
-      if backdrop != "none" {
-        let alpha: CGFloat = backdrop == "vivid" ? 0.55 : 0.3
-        builder.add(ExtraStyleNode(
-          id: "backdrop-\(lineIndex)", kind: .gradient,
-          position: CGPoint(x: canvas.width / 2, y: canvas.height / 2),
-          anchor: CGPoint(x: 0.5, y: 0.5),
-          zIndex: 5,
-          visibleRange: lineStartFrame...lineEndFrame,
-          gradient: ExtraStyleGradientContent(
-            kind: .radial(center: emojiCenter, radius: max(canvas.width, canvas.height) * 0.5),
-            colors: [toneColor.withAlpha(alpha), toneColor.withAlpha(0)],
-            locations: [0, 1],
-            rect: CGRect(origin: .zero, size: canvas)
-          )
+      let centreY = canvas.height * 0.58
+      let font = ExtraStyleFonts.bold
+      let sizePoints = extraStyleFitSize(
+        baseSize: canvas.width * 0.055, text: line.text, font: font, canvasWidth: canvas.width
+      )
+      let emphasis = Set(line.emphasisWordIndices)
+      // The line itself, word by word — the karaoke line the
+      // emoji attaches to.
+      let words = extraStyleWordNodes(
+        line: line, lineIndex: lineIndex, fps: fps,
+        lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        y: centreY, sizePoints: sizePoints,
+        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+        font: font, zIndex: 10, canvasWidth: canvas.width
+      ) { index, wordStart, wordEnd in
+        var tracks: [ExtraStyleTrack] = [
+          extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd),
+        ]
+        if emphasis.contains(index) {
+          tracks.append(extraStyleSpringInTrack(start: wordStart, from: 0.8, stiffness: 180, damping: 11))
+        }
+        return tracks
+      }
+      if words.isEmpty {
+        builder.add(extraStyleLyricFallbackNode(
+          id: "line-\(lineIndex)", line: line,
+          range: lineStartFrame...lineEndFrame,
+          y: centreY, sizePoints: sizePoints,
+          color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+          font: font, zIndex: 10, canvasWidth: canvas.width
         ))
+      } else {
+        for word in extraStyleStrokeTextNodes(words, sizePoints: sizePoints) { builder.add(word) }
       }
 
-      // THE HERO EMOJI — unconditional when the payload line has
-      // one (extraStyleEmojiNode returns nil ONLY when there is no
+      // THE HERO EMOJI — small, attached at the end of the line.
+      // Unconditional when the payload line has one
+      // (extraStyleEmojiNode returns nil ONLY when there is no
       // stored emoji). Float loop added on top of the pop.
+      let layoutWidth = extraStyleWordLayout(
+        words: line.words.map { $0.text }, font: font,
+        sizePoints: sizePoints, canvasWidth: canvas.width
+      ).totalWidth
+      let heroSize = canvas.width * 0.09 * CGFloat(emojiSize)
+      // Clamped inside the frame — a full-width line leaves no
+      // room past its last word.
+      let emojiCenter = CGPoint(
+        x: min(canvas.width - heroSize * 0.6, canvas.width / 2 + layoutWidth / 2 + heroSize * 0.75),
+        y: centreY
+      )
       if var hero = extraStyleEmojiNode(
         id: "emoji-\(lineIndex)", line: line,
         position: emojiCenter, sizePoints: heroSize, zIndex: 11,
@@ -1007,7 +820,7 @@ final class EmojiStorytellingExtraStyle: ExtraStyleDefinition {
       var reactionRandom = ExtraStyleSeededRandom(seed: input.seed ^ UInt64(lineIndex + 7))
       for (reactionIndex, reaction) in reactions.enumerated() {
         let angle = Double(reactionIndex) * (2 * Double.pi / Double(max(1, reactions.count))) + reactionRandom.nextDouble() * 0.5
-        let radius = canvas.width * 0.22
+        let radius = canvas.width * 0.16
         let reactionPosition = CGPoint(
           x: emojiCenter.x + CGFloat(cos(angle)) * radius,
           y: emojiCenter.y + CGFloat(sin(angle)) * radius * 0.8
@@ -1020,7 +833,7 @@ final class EmojiStorytellingExtraStyle: ExtraStyleDefinition {
           text: ExtraStyleTextContent(
             text: reaction,
             fontPostScriptName: ExtraStyleFonts.emoji,
-            sizePoints: canvas.width * 0.07,
+            sizePoints: canvas.width * 0.06,
             color: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1),
             strokeColor: nil,
             strokeWidthPoints: 0,
@@ -1047,17 +860,6 @@ final class EmojiStorytellingExtraStyle: ExtraStyleDefinition {
           ]
         ))
       }
-
-      // The line itself, below the hero.
-      builder.add(extraStyleTextNode(
-        id: "line-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.bold, sizePoints: canvas.width * 0.055,
-        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
-        position: CGPoint(x: canvas.width / 2, y: canvas.height * 0.58),
-        zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.88,
-        tracks: [extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame)]
-      ))
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }

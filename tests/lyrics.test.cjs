@@ -869,9 +869,10 @@ test('composite lyric line keys match the Swift LyricLineRecord fields', () => {
   for (const key of Object.keys(payload.lines[0])) {
     assert.ok(swiftLineFields.includes(key), `payload line key ${key} has no Swift field`);
   }
-  // Stage 2: `decor` is optional on LyricsRecord (nil = classic
-  // style), so the classic payload's top-level keys are a SUBSET —
-  // the exact match lives in the template payload test below.
+  // `decor` is optional on LyricsRecord (nil = classic style), so
+  // the classic payload's top-level keys are a SUBSET of
+  // LyricsRecord — v1 templates are retired (2026-11-13), so no
+  // payload ever carries decor now.
   const swiftLyricsFields = swiftRecordFields('LyricsRecord');
   for (const key of Object.keys(payload)) {
     assert.ok(swiftLyricsFields.includes(key), `payload key ${key} has no Swift field`);
@@ -1007,118 +1008,21 @@ test('catalog: unknown font ids fall back to the default font', () => {
   assert.equal(lyricFontById('not-a-font').id, 'avenir-next');
 });
 
-// ── Extra Styles contract (Styles Redesign Stage 2) ──────────────
-// Thirty complete templates (own font/palette/animation/decor) over one
-// parametric decor model; the decor registry must exist on BOTH
-// sides (JS preview + Swift burn-in) or a kind renders nowhere.
-const {
-  LYRIC_TEMPLATES,
-  LYRIC_DECOR_KINDS,
-  EXTRA_STYLE_CATEGORIES,
-  lyricTemplateById,
-  resolveLyricDecor,
-} = require('./.build-lyrics/src/lib/lyricTemplates.js');
+// ── Extra Styles v1 templates — RETIRED 2026-11-13 ───────────────
+// The 30 v1 templates (src/lib/lyricTemplates.ts) are deleted: no
+// template is selectable or applied any more. The tests that asserted
+// the v1 contract were deleted with them; what remains below is the
+// classic payload contract, and the 2.0 migration contract lives in
+// tests/extra-styles.test.cjs. Lyric intelligence (analyzeLyricLine)
+// still exists — the 2.0 scenes read it directly.
 const { analyzeLyricLine } = require('./.build-lyrics/src/lib/lyrics.js');
 
-test('templates: exactly 30, unique ids, one of the 6 categories each', () => {
-  assert.equal(LYRIC_TEMPLATES.length, 30);
-  const ids = LYRIC_TEMPLATES.map((t) => t.id);
-  assert.equal(new Set(ids).size, 30);
-  for (const t of LYRIC_TEMPLATES) {
-    assert.ok(EXTRA_STYLE_CATEGORIES.includes(t.category), `${t.id} category ${t.category}`);
-    assert.ok(t.name && t.tagline, `${t.id} needs a name and tagline`);
-  }
-  assert.equal(lyricTemplateById('not-a-template'), undefined);
-  assert.equal(lyricTemplateById('emoji-story').name, 'Emoji Story');
-  assert.equal(lyricTemplateById('split-screen-words').name, 'Split Screen Words');
-});
-
-test('templates: every template references a real picker animation and a real font', () => {
-  const pickerIds = new Set(PICKER_ANIMATIONS.map((a) => a.id));
-  const fontIds = new Set(LYRIC_FONTS.map((f) => f.id));
-  for (const t of LYRIC_TEMPLATES) {
-    assert.ok(pickerIds.has(t.style.animationId), `${t.id} animationId ${t.style.animationId} is not in the picker`);
-    assert.ok(fontIds.has(t.style.fontId), `${t.id} fontId ${t.style.fontId} is not in the font catalog`);
-  }
-});
-
-test('decor: resolveLyricDecor folds the Stage 3 field defaults', () => {
-  const bare = resolveLyricDecor({ kind: 'glow' });
-  assert.equal(bare.rotationDeg, 0);
-  assert.equal(bare.tracking, 0);
-  assert.equal(bare.align, 'center');
-  assert.equal(bare.kind, 'glow');
-  // Explicit values survive the fold.
-  const tilted = resolveLyricDecor({ kind: 'spray', rotationDeg: -3, tracking: 0.35, align: 'left' });
-  assert.equal(tilted.rotationDeg, -3);
-  assert.equal(tilted.tracking, 0.35);
-  assert.equal(tilted.align, 'left');
-});
-
-// LyricStyle fields, read from the type itself — defaultLyricStyle()
-// omits the optional fields (strokeColor, maxWidthRatio, …), so its
-// keys are not the full field set.
-function lyricStyleFields() {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'types.ts'), 'utf8');
-  const match = source.match(/export interface LyricStyle \{([\s\S]*?)\n\}/);
-  assert.ok(match, 'LyricStyle interface not found');
-  return new Set([...match[1].matchAll(/^  (\w+)\??:/gm)].map((m) => m[1]));
-}
-
-test('templates: every style override is a real LyricStyle field and resolves', () => {
-  const styleKeys = lyricStyleFields();
-  for (const t of LYRIC_TEMPLATES) {
-    for (const key of Object.keys(t.style)) {
-      assert.ok(styleKeys.has(key), `${t.id} style key ${key} is not a LyricStyle field`);
-    }
-    // The merged style must resolve exactly like a classic style.
-    const payload = buildCompositeLyrics(
-      payloadProject(
-        [{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }],
-        { ...t.style },
-      ),
-      0,
-      FPS,
-    );
-    assert.equal(payload.style.fontPostScriptName.length > 0, true);
-    assert.equal(payload.style.animation.wordMode, lyricAnimationById(t.style.animationId ?? 'karaoke').wordMode);
-  }
-});
-
-test('decor: the 20 kinds exist on the Swift side too (registry parity)', () => {
-  // The Swift side has no decor enum — `LyricDecorRecord.kind` is a
-  // plain string and the builders switch on the literal
-  // (`decorKind == "emoji-row"`, …). Parity is pinned two ways: the
-  // JS mirror list SWIFT_DECOR_KINDS must equal the preview list,
-  // and every kind's literal must appear in the Swift source, so a
-  // kind can never exist on one side only.
-  const {
-    SWIFT_DECOR_KINDS,
-  } = require('./.build-lyrics/src/lib/lyricTemplates.js');
-  assert.deepEqual([...LYRIC_DECOR_KINDS].sort(), [...SWIFT_DECOR_KINDS].sort());
-  const swiftPath = path.join(__dirname, '..', 'modules', 'mvmt-compositor', 'ios', 'MvmtCompositorModule.swift');
-  const source = fs.readFileSync(swiftPath, 'utf8');
-  for (const kind of LYRIC_DECOR_KINDS) {
-    assert.ok(source.includes(`"${kind}"`), `Swift has no branch for decor kind ${kind}`);
-  }
-});
-
-test('decor: every template decor kind is in the registry', () => {
-  for (const t of LYRIC_TEMPLATES) {
-    assert.ok(LYRIC_DECOR_KINDS.includes(t.decor.kind), `${t.id} decor kind ${t.decor.kind}`);
-  }
-});
-
-test('payload: template decor keys match the Swift LyricDecorRecord fields exactly', () => {
-  const decor = resolveLyricDecor(LYRIC_TEMPLATES[0].decor);
-  assert.deepEqual(Object.keys(decor).sort(), swiftRecordFields('LyricDecorRecord'));
-  // Every template's decor resolves to the same key set.
-  for (const t of LYRIC_TEMPLATES) {
-    assert.deepEqual(Object.keys(resolveLyricDecor(t.decor)).sort(), swiftRecordFields('LyricDecorRecord'));
-  }
-});
-
-test('payload: a template project emits decor + line intelligence; a classic project emits neither', () => {
+test('payload: a classic project emits no decor and no line intelligence', () => {
+  // v1 templates are retired (2026-11-13): the payload builder is
+  // classic-only now. A line may still carry stored intelligence
+  // (analyzeLyricLine), but the payload never emits it and never
+  // carries decor — the 2.0 scenes read intelligence directly.
+  // A stale stored templateId is ignored the same way.
   const line = {
     id: 'a',
     text: 'I love you NEVER',
@@ -1132,31 +1036,26 @@ test('payload: a template project emits decor + line intelligence; a classic pro
     ],
     decor: analyzeLyricLine('I love you NEVER'),
   };
-  const templatePayload = buildCompositeLyrics(
-    { ...payloadProject([line]), templateId: 'emoji-story' },
-    0,
-    FPS,
-  );
-  assert.ok(templatePayload.decor, 'template payload carries decor');
-  assert.deepEqual(Object.keys(templatePayload.decor).sort(), swiftRecordFields('LyricDecorRecord'));
-  // With a template active the top-level keys match LyricsRecord
-  // exactly (the classic payload is a subset — see the line-keys
-  // test above).
-  assert.deepEqual(Object.keys(templatePayload).sort(), swiftRecordFields('LyricsRecord'));
-  assert.equal(templatePayload.lines[0].emoji, '❤️');
-  assert.equal(templatePayload.lines[0].tone, 'love');
-  assert.deepEqual(templatePayload.lines[0].emphasisWordIndices, [3]);
-  for (const key of Object.keys(templatePayload.lines[0])) {
+  const payload = buildCompositeLyrics(payloadProject([line]), 0, FPS);
+  assert.equal(payload.decor, undefined);
+  assert.equal(payload.lines[0].emoji, undefined);
+  assert.equal(payload.lines[0].tone, undefined);
+  assert.equal(payload.lines[0].emphasisWordIndices, undefined);
+  for (const key of Object.keys(payload.lines[0])) {
     assert.ok(
       swiftRecordFields('LyricLineRecord').includes(key),
       `payload line key ${key} has no Swift field`,
     );
   }
-  const classicPayload = buildCompositeLyrics(payloadProject([line]), 0, FPS);
-  assert.equal(classicPayload.decor, undefined);
-  assert.equal(classicPayload.lines[0].emoji, undefined);
-  assert.equal(classicPayload.lines[0].tone, undefined);
-  assert.equal(classicPayload.lines[0].emphasisWordIndices, undefined);
+  // Classic top-level keys are a subset of LyricsRecord (decor is
+  // optional on the Swift side, nil = classic).
+  for (const key of Object.keys(payload)) {
+    assert.ok(swiftRecordFields('LyricsRecord').includes(key), `payload key ${key} has no Swift field`);
+  }
+  // A stale templateId left on an old project changes nothing.
+  const stale = buildCompositeLyrics({ ...payloadProject([line]), templateId: 'emoji-story' }, 0, FPS);
+  assert.equal(stale.decor, undefined);
+  assert.equal(JSON.stringify(stale), JSON.stringify(payload));
 });
 
 // ── Lyric intelligence (Styles Redesign Stage 2) ─────────────────
@@ -1210,20 +1109,14 @@ test('intelligence: detection stores decor on the line', () => {
 // are separate renderers fed by ONE composite payload. A device
 // can only judge pixels; these tests pin everything that CAN be
 // automated: one deterministic payload, the wrap limit carried in
-// it, animation resolution on both sides, every decor kind
-// branched in both sources, and the audited geometry constants
-// agreeing between the two renderers.
+// it, animation resolution on both sides, and the audited geometry
+// constants agreeing between the two renderers. (Decor kinds are
+// retired with the v1 templates; the branches that remain in both
+// renderers are dead code that no payload can reach.)
 const SWIFT_PATH = path.join(__dirname, '..', 'modules', 'mvmt-compositor', 'ios', 'MvmtCompositorModule.swift');
 const OVERLAY_PATH = path.join(__dirname, '..', 'src', 'components', 'LyricsOverlay.tsx');
 const swiftSource = fs.readFileSync(SWIFT_PATH, 'utf8');
 const overlaySource = fs.readFileSync(OVERLAY_PATH, 'utf8');
-
-test('parity: every decor kind has a branch in both renderers', () => {
-  for (const kind of LYRIC_DECOR_KINDS) {
-    assert.ok(overlaySource.includes(`'${kind}'`), `JS overlay has no branch for decor kind ${kind}`);
-    assert.ok(swiftSource.includes(`"${kind}"`), `Swift burn-in has no branch for decor kind ${kind}`);
-  }
-});
 
 test('parity: the resolved payload is deterministic and round-trips (one payload feeds both sides)', () => {
   const line = {
@@ -1239,39 +1132,30 @@ test('parity: the resolved payload is deterministic and round-trips (one payload
     ],
     decor: analyzeLyricLine('I love you NEVER'),
   };
-  for (const t of LYRIC_TEMPLATES) {
-    // Built the way the app builds it: picking a template folds
-    // its style overrides into the project style at pick time
-    // (setLyricTemplate in StudioContext) and stores templateId
-    // for the decor — the payload builder itself resolves style
-    // from lyrics.style and decor from templateId.
-    const project = { ...payloadProject([line], { ...t.style }), templateId: t.id };
-    const first = JSON.stringify(buildCompositeLyrics(project, 0, FPS));
-    const second = JSON.stringify(buildCompositeLyrics(project, 0, FPS));
-    assert.equal(first, second, `${t.id} payload is not deterministic`);
-    // Round-trip: parsing the serialised payload and serialising
-    // it again gives the same bytes (a fresh build is NOT
-    // deep-equal to the parsed form — it carries undefined-valued
-    // keys that JSON drops — so compare through JSON on both sides).
-    assert.equal(JSON.stringify(JSON.parse(first)), first, `${t.id} payload does not round-trip`);
-    // The payload the Swift side receives carries the resolved
-    // decor and animation — never a raw template id.
-    const parsed = JSON.parse(first);
-    assert.equal(parsed.decor.kind, t.decor.kind, `${t.id} decor kind`);
-    assert.equal(parsed.style.animation.wordMode, lyricAnimationById(t.style.animationId ?? 'karaoke').wordMode);
-  }
+  const project = payloadProject([line]);
+  const first = JSON.stringify(buildCompositeLyrics(project, 0, FPS));
+  const second = JSON.stringify(buildCompositeLyrics(project, 0, FPS));
+  assert.equal(first, second, 'classic payload is not deterministic');
+  // Round-trip: parsing the serialised payload and serialising
+  // it again gives the same bytes (a fresh build is NOT
+  // deep-equal to the parsed form — it carries undefined-valued
+  // keys that JSON drops — so compare through JSON on both sides).
+  assert.equal(JSON.stringify(JSON.parse(first)), first, 'classic payload does not round-trip');
+  // The payload the Swift side receives carries no decor and no
+  // template id — classic only.
+  const parsed = JSON.parse(first);
+  assert.equal(parsed.decor, undefined);
+  assert.equal(parsed.templateId, undefined);
 });
 
-test('parity: maxWidthRatio is carried in the payload for every template, and the Swift wrap limit is container-wide', () => {
-  for (const t of LYRIC_TEMPLATES) {
-    const payload = buildCompositeLyrics(
-      payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }], { ...t.style }),
-      0,
-      FPS,
-    );
-    const ratio = payload.style.maxWidthRatio;
-    assert.ok(typeof ratio === 'number' && ratio >= 0.3 && ratio <= 1, `${t.id} maxWidthRatio ${ratio}`);
-  }
+test('parity: maxWidthRatio is carried in the payload, and the Swift wrap limit is container-wide', () => {
+  const payload = buildCompositeLyrics(
+    payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }]),
+    0,
+    FPS,
+  );
+  const ratio = payload.style.maxWidthRatio;
+  assert.ok(typeof ratio === 'number' && ratio >= 0.3 && ratio <= 1, `maxWidthRatio ${ratio}`);
   // Default 0.88 when unset.
   const classic = buildCompositeLyrics(payloadProject([{ id: 'a', text: 'hi', startFrame: 0, endFrame: 30 }]), 0, FPS);
   assert.equal(classic.style.maxWidthRatio, 0.88);
@@ -1284,17 +1168,12 @@ test('parity: maxWidthRatio is carried in the payload for every template, and th
   );
 });
 
-test('parity: every template animationId resolves on both sides, aliases included', () => {
+test('parity: animation ids resolve on both sides, aliases included', () => {
   // The Swift side switches on the resolved wordMode literals.
   for (const mode of ['stagger', 'karaoke', 'typewriter']) {
     assert.ok(swiftSource.includes(`wordMode == "${mode}"`), `Swift never handles word mode ${mode}`);
   }
   assert.ok(swiftSource.includes('"none"'), 'Swift never handles the none word mode');
-  for (const t of LYRIC_TEMPLATES) {
-    const resolved = lyricAnimationById(t.style.animationId);
-    assert.notEqual(resolved.id, undefined, `${t.id} animationId does not resolve`);
-    assert.ok(['none', 'stagger', 'karaoke', 'typewriter'].includes(resolved.wordMode), `${t.id} wordMode ${resolved.wordMode}`);
-  }
   // Aliased ids resolve to the same survivor on the JS side that
   // the payload carries to Swift (spot-check the full alias map
   // contract in the catalog tests above).

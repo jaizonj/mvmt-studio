@@ -9,10 +9,34 @@ import Foundation
 // against src/lib/extra-styles/catalog.ts STYLE_CAPABILITY_MAP),
 // so they never require automation or masks and read neither.
 //
+// LYRIC-ONLY RE-SCOPE (2026-11-13, Jaizon ~10:28 MST: "no styles
+// that take up the whole screen just lyrics with cool animations").
+// The video is the star: the full-screen sky / chat / paper
+// backdrops are gone from this file, and the Sticker World ring
+// that crowded the whole frame is gone too. What remains is words
+// on the footage: word-by-word entrances tied to the lyric timing,
+// emphasis pops from the stored intelligence, and small accents
+// pinned to the words (a star burst, a reaction emoji, a sticker
+// at the line's end). The chat/speech bubbles stay — they are
+// sized to the words, not the frame — and the words inside them
+// now type/pop in one by one instead of arriving as one block.
+// Style IDs are unchanged.
+//
+// NOTE: the other two playful styles — Emoji Storytelling and
+// Comic Book — live in ExtraStylesDemos.swift, NOT in this file,
+// so they are NOT re-scoped here. Whoever owns Demos.swift needs
+// to: strip Emoji Storytelling's tone-tinted full-canvas radial
+// backdrop wash (keep the hero emoji + words, small and attached
+// to the line) and shrink Comic Book's full panel (0.88W × 0.52H
+// board) down to bold words with pop/slam entrances and small
+// burst accents on emphasis words only. The unconditional emoji
+// passthrough (extraStyleEmojiNode, no gate) must survive both.
+//
 // Shared notes:
 // - Speech / chat bubbles are groups: a rounded-rect path shape
-//   (+ a tail triangle for Cartoon) with a text child, so the
-//   whole bubble pops / slides as one unit.
+//   (+ a tail triangle for Cartoon) with word children, so the
+//   whole bubble pops / slides as one unit while the words inside
+//   arrive one by one.
 // - No path-trim / draw-progress track kind exists in the engine,
 //   so motion lines reveal with an opacity envelope (plus a short
 //   scale-in on the burst shapes), not a stroke draw-on.
@@ -88,13 +112,92 @@ private func extraStylePlayfulTailPath(width: CGFloat, height: CGFloat) -> CGPat
   return path
 }
 
+/// One word's placement on a centred, greedily wrapped row layout.
+/// `x` / `y` are offsets from the line's centre, so the same
+/// placements work as group-local coordinates (Cartoon, Message)
+/// or shifted onto the canvas (Sticker).
+private struct PlayfulWordPlacement {
+  var index: Int
+  var text: String
+  var x: CGFloat
+  var y: CGFloat
+  var width: CGFloat
+  var startFrame: Int
+  var endFrame: Int
+}
+
+/// Word placements laid out in centred rows no wider than
+/// `maxWidth`. Falls back to splitting the line text (staggered
+/// starts) when the line carries no word timings.
+private func playfulWordPlacements(
+  line: ExtraStyleInputLine, fps: Double,
+  lineStartFrame: Int, lineEndFrame: Int,
+  font: String, sizePoints: CGFloat, maxWidth: CGFloat, lineHeight: CGFloat,
+  staggerFrames: Int = 3
+) -> (placements: [PlayfulWordPlacement], totalWidth: CGFloat, totalHeight: CGFloat) {
+  let raw: [(text: String, start: Int, end: Int)]
+  if !line.words.isEmpty {
+    raw = line.words.enumerated().map { (index, word) in
+      let start = max(lineStartFrame, Int((word.startSeconds * fps).rounded()))
+      let end = min(lineEndFrame, Int((word.endSeconds * fps).rounded()))
+      return (
+        text: word.text,
+        start: start,
+        end: end > start ? end : lineEndFrame
+      )
+    }
+  } else {
+    raw = line.text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }.enumerated().map { (index, word) in
+      (
+        text: word,
+        start: min(lineEndFrame, lineStartFrame + index * staggerFrames),
+        end: lineEndFrame
+      )
+    }
+  }
+  guard !raw.isEmpty else { return ([], 0, 0) }
+  let spaceWidth = extraStyleTextWidth(" ", fontPostScriptName: font, sizePoints: sizePoints)
+  let widths = raw.map { extraStyleTextWidth($0.text, fontPostScriptName: font, sizePoints: sizePoints) }
+  // Greedy rows.
+  var rows: [[Int]] = [[]]
+  var rowWidths: [CGFloat] = [0]
+  for (index, _) in raw.enumerated() {
+    let needed = rowWidths[rowWidths.count - 1] == 0
+      ? widths[index]
+      : rowWidths[rowWidths.count - 1] + spaceWidth + widths[index]
+    if needed > maxWidth, !rows[rows.count - 1].isEmpty {
+      rows.append([index])
+      rowWidths.append(widths[index])
+    } else {
+      rows[rows.count - 1].append(index)
+      rowWidths[rowWidths.count - 1] = needed
+    }
+  }
+  let totalWidth = rowWidths.max() ?? 0
+  let totalHeight = CGFloat(rows.count) * lineHeight
+  var placements: [PlayfulWordPlacement] = []
+  for (rowIndex, row) in rows.enumerated() {
+    var cursorX = -rowWidths[rowIndex] / 2
+    let y = (CGFloat(rowIndex) - CGFloat(rows.count - 1) / 2) * lineHeight
+    for index in row {
+      placements.append(PlayfulWordPlacement(
+        index: index, text: raw[index].text,
+        x: cursorX + widths[index] / 2, y: y, width: widths[index],
+        startFrame: raw[index].start, endFrame: raw[index].end
+      ))
+      cursorX += widths[index] + spaceWidth
+    }
+  }
+  return (placements, totalWidth, totalHeight)
+}
+
 // MARK: - Style 22: Cartoon Universe (playful)
 
 final class CartoonUniverseExtraStyle: ExtraStyleDefinition {
   let id = "cartoon-universe"
   let version = 1
   let name = "Cartoon Universe"
-  let tagline = "Speech bubbles, motion lines, and illustrated pops."
+  let tagline = "Bouncy cartoon words in speech bubbles."
   let category = "playful"
   let needsAudioAutomation = false
   let needsSubjectMasks = false
@@ -134,26 +237,20 @@ final class CartoonUniverseExtraStyle: ExtraStyleDefinition {
     let ink = ExtraStyleRGBA(r: 0.05, g: 0.05, b: 0.06, a: 1)
     var builder = ExtraStyleSceneBuilder()
 
-    // Bright cartoon sky.
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.55, g: 0.83, b: 1, a: 1),
-        ExtraStyleRGBA(r: 1, g: 0.96, b: 0.77, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
       var random = ExtraStyleSeededRandom(seed: input.seed ^ UInt64(lineIndex + 1))
       let sizePoints = canvas.width * 0.055
-      let maxTextWidth = canvas.width * 0.68
-      let textWidth = extraStyleTextWidth(line.text, fontPostScriptName: ExtraStyleFonts.marker, sizePoints: sizePoints)
-      let estLines = max(1, Int(ceil(textWidth / maxTextWidth)))
-      let bubbleWidth = min(canvas.width * 0.86, max(textWidth + 72, canvas.width * 0.42))
-      let bubbleHeight = CGFloat(estLines) * sizePoints * 1.35 + 58
+      let lineHeight = sizePoints * 1.35
+      let (placements, totalWidth, totalHeight) = playfulWordPlacements(
+        line: line, fps: fps, lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        font: ExtraStyleFonts.marker, sizePoints: sizePoints,
+        maxWidth: canvas.width * 0.68, lineHeight: lineHeight
+      )
+      guard !placements.isEmpty else { continue }
+      let bubbleWidth = min(canvas.width * 0.86, max(totalWidth + 72, canvas.width * 0.42))
+      let bubbleHeight = totalHeight + 58
       // Alternate sides / heights so consecutive bubbles feel
       // like a back-and-forth, and give each a slight tilt.
       let side: CGFloat = lineIndex % 2 == 0 ? -1 : 1
@@ -226,18 +323,54 @@ final class CartoonUniverseExtraStyle: ExtraStyleDefinition {
         members.append(tailId)
       }
 
-      // The line, inside the bubble.
-      let textId = "bubble-text-\(lineIndex)"
-      builder.addChild(extraStyleTextNode(
-        id: textId,
-        text: line.text, font: ExtraStyleFonts.marker, sizePoints: sizePoints,
-        color: ink,
-        position: CGPoint(x: 0, y: -2),
-        zIndex: 1,
-        visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: bubbleWidth - 48
-      ))
-      members.append(textId)
+      // The words, inside the bubble — bouncing in one by one at
+      // their sung starts (spring scale + a short rise), instead
+      // of arriving as one block. The bubble is the contrast the
+      // words sit on, so no outline is needed.
+      for placement in placements {
+        guard placement.endFrame > placement.startFrame else { continue }
+        let wordId = "bubble-word-\(lineIndex)-\(placement.index)"
+        builder.addChild(extraStyleTextNode(
+          id: wordId,
+          text: placement.text, font: ExtraStyleFonts.marker, sizePoints: sizePoints,
+          color: ink,
+          position: CGPoint(x: placement.x, y: placement.y - 2),
+          zIndex: 1,
+          visibleRange: placement.startFrame...placement.endFrame,
+          tracks: [
+            extraStyleSpringInTrack(start: placement.startFrame, from: 0.55, stiffness: 170, damping: 11),
+            ExtraStyleTrack(
+              property: .positionY,
+              kind: .keyframes(keys: [
+                ExtraStyleKeyframe(frame: placement.startFrame, value: -12, easing: .easeOutCubic),
+                ExtraStyleKeyframe(frame: min(placement.endFrame, placement.startFrame + 8), value: 0, easing: .easeOutCubic),
+              ]),
+              startFrame: placement.startFrame
+            ),
+            extraStyleEnterExitOpacityTrack(start: placement.startFrame, end: placement.endFrame, enterFrames: 6, exitFrames: 9),
+          ]
+        ))
+        members.append(wordId)
+
+        // Emphasis words get a small star burst pinned above the
+        // word — the only burst in the style, and it is attached
+        // to the word, not scattered over the frame.
+        if line.emphasisWordIndices.contains(placement.index) {
+          let burstId = "bubble-burst-\(lineIndex)-\(placement.index)"
+          let burstSize = canvas.width * 0.045
+          builder.addChild(extraStyleShapeNode(
+            id: burstId,
+            shape: extraStyleStarShape(outerRadius: burstSize, innerRadius: burstSize * 0.45, spikes: 5),
+            fill: extraStyleToneColor(line.tone),
+            stroke: ink, strokeWidth: 3,
+            position: CGPoint(x: placement.x, y: placement.y - sizePoints * 1.15),
+            zIndex: 2,
+            visibleRange: placement.startFrame...placement.endFrame,
+            tracks: [extraStyleSpringInTrack(start: placement.startFrame + 2, from: 0.2, stiffness: 200, damping: 9)]
+          ))
+          members.append(burstId)
+        }
+      }
 
       // A small star accent at the bubble corner, springing in.
       let starId = "bubble-star-\(lineIndex)"
@@ -365,16 +498,6 @@ final class MessageUniverseExtraStyle: ExtraStyleDefinition {
     let showTyping = extraStyleParamBool(input.params, "typing", true)
     var builder = ExtraStyleSceneBuilder()
 
-    // Dark chat backdrop.
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.06, g: 0.07, b: 0.08, a: 1),
-        ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
@@ -388,11 +511,15 @@ final class MessageUniverseExtraStyle: ExtraStyleDefinition {
       ))
       let textColor = ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1)
       let sizePoints = canvas.width * 0.048
-      let maxTextWidth = canvas.width * 0.62
-      let textWidth = extraStyleTextWidth(line.text, fontPostScriptName: ExtraStyleFonts.avenirBold, sizePoints: sizePoints)
-      let estLines = max(1, Int(ceil(textWidth / maxTextWidth)))
-      let bubbleWidth = min(canvas.width * 0.78, max(textWidth + 56, canvas.width * 0.3))
-      let bubbleHeight = CGFloat(estLines) * sizePoints * 1.4 + 44
+      let lineHeight = sizePoints * 1.4
+      let (placements, totalWidth, totalHeight) = playfulWordPlacements(
+        line: line, fps: fps, lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        font: ExtraStyleFonts.avenirBold, sizePoints: sizePoints,
+        maxWidth: canvas.width * 0.62, lineHeight: lineHeight
+      )
+      guard !placements.isEmpty else { continue }
+      let bubbleWidth = min(canvas.width * 0.78, max(totalWidth + 56, canvas.width * 0.3))
+      let bubbleHeight = totalHeight + 44
       let margin = canvas.width * 0.06
       let bubbleCenterX = isOutgoing
         ? canvas.width - margin - bubbleWidth / 2
@@ -400,13 +527,14 @@ final class MessageUniverseExtraStyle: ExtraStyleDefinition {
       let bubbleCenterY = canvas.height * (isOutgoing ? 0.62 : 0.52)
 
       // Typing window, then the reveal. When typing is off the
-      // message appears at the line start.
+      // message appears at the line start. Words never appear
+      // before the reveal, even when sung earlier.
       let typingFrames = showTyping ? min(21, max(0, (lineEndFrame - lineStartFrame) / 3)) : 0
       let revealFrame = min(lineEndFrame - 3, lineStartFrame + typingFrames)
 
       var members: [String] = []
 
-      // Bubble body: rounded-rect path shape.
+      // Bubble body: rounded-rect path shape, sized to the words.
       let bodyId = "msg-body-\(lineIndex)"
       builder.addChild(extraStyleShapeNode(
         id: bodyId,
@@ -420,19 +548,41 @@ final class MessageUniverseExtraStyle: ExtraStyleDefinition {
       ))
       members.append(bodyId)
 
-      // The message text, revealed with the bubble.
-      let textId = "msg-text-\(lineIndex)"
-      builder.addChild(extraStyleTextNode(
-        id: textId,
-        text: line.text, font: ExtraStyleFonts.avenirBold, sizePoints: sizePoints,
-        color: textColor,
-        position: CGPoint(x: 0, y: -1),
-        zIndex: 1,
-        visibleRange: revealFrame...lineEndFrame,
-        maxWidthPoints: bubbleWidth - 36,
-        alignment: isOutgoing ? .right : .left
-      ))
-      members.append(textId)
+      // The message words, typing in one by one: each word pops
+      // in at its sung start (or the reveal, whichever is later),
+      // so the bubble reads as typed live in time with the song.
+      // The bubble is the contrast the words sit on.
+      for placement in placements {
+        let wordStart = max(placement.startFrame, revealFrame)
+        guard placement.endFrame > wordStart else { continue }
+        let wordId = "msg-word-\(lineIndex)-\(placement.index)"
+        builder.addChild(extraStyleTextNode(
+          id: wordId,
+          text: placement.text, font: ExtraStyleFonts.avenirBold, sizePoints: sizePoints,
+          color: textColor,
+          position: CGPoint(x: placement.x, y: placement.y - 1),
+          zIndex: 1,
+          visibleRange: wordStart...placement.endFrame,
+          tracks: [
+            ExtraStyleTrack(
+              property: .opacity,
+              kind: .keyframes(keys: [
+                ExtraStyleKeyframe(frame: wordStart, value: 0, easing: .linear),
+                ExtraStyleKeyframe(frame: min(placement.endFrame, wordStart + 4), value: 1, easing: .easeOutCubic),
+                ExtraStyleKeyframe(frame: max(wordStart, placement.endFrame - 9), value: 1, easing: .linear),
+                ExtraStyleKeyframe(frame: placement.endFrame, value: 0, easing: .easeInCubic),
+              ]),
+              startFrame: wordStart
+            ),
+            ExtraStyleTrack(
+              property: .scale,
+              kind: .spring(from: 0.6, to: 1, stiffness: 200, damping: 12, initialVelocity: 0),
+              startFrame: wordStart
+            ),
+          ]
+        ))
+        members.append(wordId)
+      }
 
       // Typing dots: three circles on a staggered loop, visible
       // only until the reveal. Each dot's loop keys are offset
@@ -558,7 +708,7 @@ final class StickerWorldExtraStyle: ExtraStyleDefinition {
   let id = "sticker-world"
   let version = 1
   let name = "Sticker World"
-  let tagline = "Stickers bounce, float, and crowd the lyrics."
+  let tagline = "Lyrics as peel-and-stick stickers that pop in word by word."
   let category = "playful"
   let needsAudioAutomation = false
   let needsSubjectMasks = false
@@ -587,7 +737,7 @@ final class StickerWorldExtraStyle: ExtraStyleDefinition {
     ]
   }
 
-  var inputs: [String] { ["lines", "intelligence"] }
+  var inputs: [String] { ["lines", "words", "intelligence"] }
   var rebuildParamIds: [String] { ["theme"] }
 
   /// One themed sticker shape (procedural — no sticker art in the
@@ -644,52 +794,102 @@ final class StickerWorldExtraStyle: ExtraStyleDefinition {
     let palette = stickerPalette(theme: theme, accent: accent)
     var builder = ExtraStyleSceneBuilder()
 
-    // Warm paper backdrop so the stickers read as stuck-on.
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.98, g: 0.95, b: 0.88, a: 1),
-        ExtraStyleRGBA(r: 0.93, g: 0.88, b: 0.78, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
       var random = ExtraStyleSeededRandom(seed: input.seed ^ UInt64(lineIndex + 11))
       let centerY = canvas.height * 0.5
-      let sizePoints = canvas.width * 0.06
-      let stickerCount = 5
+      let sizePoints = canvas.width * 0.06 * CGFloat(stickerSizeScale)
+      let lineHeight = sizePoints * 1.35
+      let (placements, totalWidth, totalHeight) = playfulWordPlacements(
+        line: line, fps: fps, lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        font: ExtraStyleFonts.black, sizePoints: sizePoints,
+        maxWidth: canvas.width * 0.72, lineHeight: lineHeight
+      )
+      guard !placements.isEmpty else { continue }
       let stickerBase = canvas.width * 0.13 * CGFloat(stickerSizeScale)
 
-      // Stickers ring the text: seeded angles / radii, each with
-      // a dark offset shadow layer (the sticker "peel" depth) and
-      // a bold white stroke on the face. They spring in staggered,
-      // float on a loop, and drift toward the words mid-line then
-      // back out — the interact behaviour from the §17 row.
-      for stickerIndex in 0..<stickerCount {
-        let angle = Double(stickerIndex) * (2 * Double.pi / Double(stickerCount))
-          + random.nextRange(min: -0.3, max: 0.3)
-        let radiusX = canvas.width * 0.32
-        let radiusY = canvas.height * 0.2
-        let baseX = canvas.width / 2 + CGFloat(cos(angle)) * radiusX
-        let baseY = centerY + CGFloat(sin(angle)) * radiusY
-        let stickerSize = stickerBase * CGFloat(random.nextRange(min: 0.75, max: 1.25))
-        let kind = (stickerIndex + lineIndex) % 5
-        let fill = palette[stickerIndex % palette.count]
-        let startFrame = lineStartFrame + stickerIndex * 4
-        // Toward the words = an inward X offset that eases to 0
-        // mid-line and back out at the exit.
-        let inward: Double = -Double(cos(angle)) * Double(canvas.width) * 0.08
-        let interactKeys: [ExtraStyleKeyframe] = [
-          ExtraStyleKeyframe(frame: startFrame, value: -inward, easing: .easeOutCubic),
-          ExtraStyleKeyframe(frame: min(lineEndFrame, startFrame + 18), value: 0, easing: .easeOutCubic),
-          ExtraStyleKeyframe(frame: max(startFrame, lineEndFrame - 18), value: 0, easing: .linear),
-          ExtraStyleKeyframe(frame: lineEndFrame, value: -inward, easing: .easeInCubic),
+      // Each word IS a sticker: bold ink text with a white
+      // peel outline, a seeded tilt, springing in at its sung
+      // start. Emphasis words get a theme-coloured star stuck
+      // behind them.
+      for placement in placements {
+        guard placement.endFrame > placement.startFrame else { continue }
+        let wordPosition = CGPoint(x: canvas.width / 2 + placement.x, y: centerY + placement.y)
+        let tilt = CGFloat(random.nextRange(min: -6, max: 6))
+        if line.emphasisWordIndices.contains(placement.index) {
+          let starSize = sizePoints * 1.1
+          builder.add(extraStyleShapeNode(
+            id: "sticker-star-\(lineIndex)-\(placement.index)",
+            shape: extraStyleStarShape(outerRadius: starSize / 2, innerRadius: starSize / 4, spikes: 5),
+            fill: palette[placement.index % palette.count],
+            stroke: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1), strokeWidth: 4,
+            position: wordPosition,
+            zIndex: 9,
+            visibleRange: placement.startFrame...placement.endFrame,
+            tracks: [
+              ExtraStyleTrack(
+                property: .scale,
+                kind: .spring(from: 0.2, to: 1, stiffness: 200, damping: 10, initialVelocity: 0),
+                startFrame: placement.startFrame
+              ),
+            ]
+          ))
+        }
+        var wordTracks: [ExtraStyleTrack] = [
+          extraStyleEnterExitOpacityTrack(start: placement.startFrame, end: placement.endFrame),
         ]
-        var stickerTracks: [ExtraStyleTrack] = [
-          ExtraStyleTrack(property: .positionX, kind: .keyframes(keys: interactKeys), startFrame: startFrame),
+        if bounce {
+          wordTracks.append(ExtraStyleTrack(
+            property: .scale,
+            kind: .spring(from: 0.2, to: 1, stiffness: 200, damping: 10, initialVelocity: 0),
+            startFrame: placement.startFrame
+          ))
+        }
+        builder.add(ExtraStyleNode(
+          id: "sticker-word-\(lineIndex)-\(placement.index)", kind: .text,
+          position: wordPosition,
+          anchor: CGPoint(x: 0.5, y: 0.5),
+          rotationDeg: tilt,
+          zIndex: 10,
+          visibleRange: placement.startFrame...placement.endFrame,
+          text: ExtraStyleTextContent(
+            text: placement.text,
+            fontPostScriptName: ExtraStyleFonts.black,
+            sizePoints: sizePoints,
+            color: ExtraStyleRGBA(r: 0.1, g: 0.1, b: 0.12, a: 1),
+            colorParamId: nil,
+            strokeColor: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1),
+            strokeWidthPoints: 5,
+            alignment: .center,
+            maxWidthPoints: nil
+          ),
+          tracks: wordTracks
+        ))
+      }
+
+      // Two small stickers tucked at the ends of the lyric line —
+      // the only free-floating stickers left, and they stay
+      // attached to the line. Each has a dark offset shadow layer
+      // (the sticker "peel" depth) and a bold white stroke, a
+      // spring entrance, and a gentle float.
+      let accentSpots: [(x: CGFloat, y: CGFloat, kind: Int)] = [
+        (
+          x: max(canvas.width * 0.09, canvas.width / 2 - totalWidth / 2 - stickerBase * 0.7),
+          y: centerY - totalHeight / 2 - stickerBase * 0.35,
+          kind: lineIndex % 5
+        ),
+        (
+          x: min(canvas.width * 0.91, canvas.width / 2 + totalWidth / 2 + stickerBase * 0.7),
+          y: centerY + totalHeight / 2 + stickerBase * 0.35,
+          kind: (lineIndex + 2) % 5
+        ),
+      ]
+      for (accentIndex, spot) in accentSpots.enumerated() {
+        let stickerSize = stickerBase * 0.8 * CGFloat(random.nextRange(min: 0.85, max: 1.15))
+        let fill = palette[(accentIndex + lineIndex) % palette.count]
+        let startFrame = lineStartFrame + accentIndex * 4
+        var accentTracks: [ExtraStyleTrack] = [
           ExtraStyleTrack(
             property: .positionY,
             kind: .loop(periodFrames: 150, periodParamId: nil, keys: [
@@ -701,7 +901,7 @@ final class StickerWorldExtraStyle: ExtraStyleDefinition {
           ),
         ]
         if bounce {
-          stickerTracks.append(ExtraStyleTrack(
+          accentTracks.append(ExtraStyleTrack(
             property: .scale,
             kind: .spring(from: 0.2, to: 1, stiffness: 200, damping: 10, initialVelocity: 0),
             startFrame: startFrame
@@ -709,56 +909,32 @@ final class StickerWorldExtraStyle: ExtraStyleDefinition {
         }
         // Shadow layer (offset, dark, no stroke).
         builder.add(extraStyleShapeNode(
-          id: "sticker-shadow-\(lineIndex)-\(stickerIndex)",
-          shape: stickerShape(kind: kind, size: stickerSize),
+          id: "sticker-shadow-\(lineIndex)-\(accentIndex)",
+          shape: stickerShape(kind: spot.kind, size: stickerSize),
           fill: ExtraStyleRGBA(r: 0.1, g: 0.1, b: 0.1, a: 0.25),
-          position: CGPoint(x: baseX + 6, y: baseY + 8),
+          position: CGPoint(x: spot.x + 6, y: spot.y + 8),
           zIndex: 8,
           visibleRange: lineStartFrame...lineEndFrame,
-          tracks: stickerTracks
+          tracks: accentTracks
         ))
         // Face layer (theme colour, bold white stroke).
         builder.add(extraStyleShapeNode(
-          id: "sticker-\(lineIndex)-\(stickerIndex)",
-          shape: stickerShape(kind: kind, size: stickerSize),
+          id: "sticker-accent-\(lineIndex)-\(accentIndex)",
+          shape: stickerShape(kind: spot.kind, size: stickerSize),
           fill: fill,
           stroke: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1), strokeWidth: 6,
-          position: CGPoint(x: baseX, y: baseY),
+          position: CGPoint(x: spot.x, y: spot.y),
           zIndex: 9,
           visibleRange: lineStartFrame...lineEndFrame,
-          tracks: stickerTracks
+          tracks: accentTracks
         ))
       }
 
-      // The line itself, centred, with a white sticker-style
-      // outline so it reads over the busy field.
-      builder.add(extraStyleTextNode(
-        id: "line-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.black, sizePoints: sizePoints,
-        color: ExtraStyleRGBA(r: 0.1, g: 0.1, b: 0.12, a: 1),
-        position: CGPoint(x: canvas.width / 2, y: centerY),
-        zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.72,
-        strokeColor: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1), strokeWidthPoints: 4,
-        tracks: [
-          extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame),
-          ExtraStyleTrack(
-            property: .positionY,
-            kind: .loop(periodFrames: 150, periodParamId: nil, keys: [
-              ExtraStyleKeyframe(frame: 0, value: 0, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: 75, value: -6, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: 150, value: 0, easing: .easeInOutSine),
-            ]),
-            startFrame: lineStartFrame
-          ),
-        ]
-      ))
-
-      // The line's stored emoji rides as one more sticker, top
-      // centre — nil-safe, never gated on a template flag.
+      // The line's stored emoji rides as one more sticker, above
+      // the line — nil-safe, never gated on a template flag.
       if let hero = extraStyleEmojiNode(
         id: "sticker-emoji-\(lineIndex)", line: line,
-        position: CGPoint(x: canvas.width / 2, y: centerY - canvas.height * 0.24),
+        position: CGPoint(x: canvas.width / 2, y: centerY - totalHeight / 2 - canvas.width * 0.09),
         sizePoints: canvas.width * 0.1, zIndex: 11,
         visibleRange: lineStartFrame...lineEndFrame
       ) {

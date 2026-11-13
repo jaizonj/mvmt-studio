@@ -238,11 +238,14 @@ export function isIdentityLookParams(lookParams: LookParams): boolean {
  * intensity), everything clamped to the legal ranges. Returns null
  * when the result is identity — the request then carries no look at
  * all and the engine renders unfiltered, exactly as before looks
- * existed.
+ * existed. Original short-circuits to null BEFORE overrides are
+ * applied (2026-11-13, Leak C): a stored Original with overrides
+ * must never grade — Original means no grade, full stop.
  */
 export function resolveLookParams(look: ProjectLook | null | undefined): LookParams | null {
   if (!look) return null;
   const preset = lookPresetById(look.presetId);
+  if (preset.id === 'original') return null;
   const intensity = Math.min(1, Math.max(0, look.intensity ?? 1));
   const resolved = { ...IDENTITY_LOOK_PARAMS };
   for (const key of LOOK_PARAM_KEYS) {

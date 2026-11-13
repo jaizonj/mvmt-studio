@@ -28,7 +28,7 @@ export interface StyleCapabilityEntry {
 }
 
 export const STYLE_CAPABILITY_MAP: StyleCapabilityEntry[] = [
-  { id: 'dream-sequence', name: 'Dream Sequence', category: 'cinematic', demo: true, capabilities: ['text-line', 'particles', 'paths', 'keyframes', 'looping', 'seeded-random', 'audio-loudness', 'subject-mask'], needsAudioAutomation: true, needsSubjectMasks: false },
+  { id: 'dream-sequence', name: 'Dream Sequence', category: 'cinematic', demo: true, capabilities: ['text-line', 'particles', 'paths', 'keyframes', 'looping', 'seeded-random', 'audio-loudness', 'subject-mask'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'memory-fragments', name: 'Memory Fragments', category: 'cinematic', capabilities: ['nested-groups', 'images', 'keyframes', 'stagger', 'subject-face'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'floating-universe', name: 'Floating Universe', category: 'cinematic', capabilities: ['particles', 'shapes', 'paths', 'path-animation', 'looping', 'text-line'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'film-credits-reimagined', name: 'Film Credits Reimagined', category: 'cinematic', capabilities: ['text-line', 'shapes', 'gradients', 'keyframes'], needsAudioAutomation: false, needsSubjectMasks: false },
@@ -41,7 +41,7 @@ export const STYLE_CAPABILITY_MAP: StyleCapabilityEntry[] = [
   { id: 'holographic-interface', name: 'Holographic Interface', category: 'digital', demo: true, capabilities: ['nested-groups', 'shapes', 'gradients', 'keyframes', 'looping', 'seeded-random'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'digital-corruption', name: 'Digital Corruption', category: 'digital', capabilities: ['text-line', 'rgb-split', 'blend-modes', 'masks', 'keyframes', 'seeded-random', 'audio-onset'], needsAudioAutomation: true, needsSubjectMasks: false },
   { id: 'cyber-terminal', name: 'Cyber Terminal', category: 'digital', capabilities: ['nested-groups', 'text-char', 'shapes', 'keyframes', 'stagger'], needsAudioAutomation: false, needsSubjectMasks: false },
-  { id: 'virtual-reality', name: 'Virtual Reality', category: 'digital', capabilities: ['nested-groups', 'text-line', 'perspective', 'subject-face', 'keyframes'], needsAudioAutomation: false, needsSubjectMasks: true },
+  { id: 'virtual-reality', name: 'Virtual Reality', category: 'digital', capabilities: ['nested-groups', 'text-line', 'perspective', 'subject-face', 'keyframes'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'data-visualization', name: 'Data Visualization', category: 'digital', capabilities: ['shapes', 'paths', 'counters', 'keyframes', 'audio-bands', 'audio-loudness'], needsAudioAutomation: true, needsSubjectMasks: false },
   { id: 'editorial-magazine', name: 'Editorial Magazine', category: 'design', capabilities: ['text-line', 'text-phrase', 'shapes', 'paths', 'keyframes'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'brutalist-typography', name: 'Brutalist Typography', category: 'design', capabilities: ['text-line', 'shapes', 'keyframes', 'audio-onset'], needsAudioAutomation: true, needsSubjectMasks: false },
@@ -59,7 +59,7 @@ export const STYLE_CAPABILITY_MAP: StyleCapabilityEntry[] = [
   { id: 'rhythm-typography', name: 'Rhythm Typography', category: 'music', capabilities: ['text-word', 'text-char', 'syllables', 'springs', 'keyframes', 'audio-beat', 'audio-onset'], needsAudioAutomation: true, needsSubjectMasks: false },
   { id: 'audio-energy-world', name: 'Audio Energy World', category: 'music', capabilities: ['text-line', 'audio-loudness', 'keyframes', 'particles'], needsAudioAutomation: true, needsSubjectMasks: false },
   { id: 'glitch-reality', name: 'Glitch Reality', category: 'experimental', capabilities: ['displacement', 'text-line', 'masks', 'keyframes', 'seeded-random', 'audio-onset'], needsAudioAutomation: true, needsSubjectMasks: false },
-  { id: 'surveillance-system', name: 'Surveillance System', category: 'experimental', capabilities: ['shapes', 'text-line', 'keyframes', 'subject-face', 'subject-mask'], needsAudioAutomation: false, needsSubjectMasks: true },
+  { id: 'surveillance-system', name: 'Surveillance System', category: 'experimental', capabilities: ['shapes', 'text-line', 'keyframes', 'subject-face', 'subject-mask'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'newspaper-explosion', name: 'Newspaper Explosion', category: 'experimental', capabilities: ['text-line', 'text-word', 'shapes', 'paths', 'keyframes', 'seeded-random'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'vhs-dream', name: 'VHS Dream', category: 'experimental', capabilities: ['text-line', 'shapes', 'displacement', 'keyframes', 'seeded-random'], needsAudioAutomation: false, needsSubjectMasks: false },
   { id: 'optical-illusion', name: 'Optical Illusion', category: 'experimental', capabilities: ['shapes', 'nested-groups', 'text-line', 'looping', 'keyframes', 'perspective'], needsAudioAutomation: false, needsSubjectMasks: false },

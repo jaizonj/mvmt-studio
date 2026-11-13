@@ -7,7 +7,6 @@ import type { LyricLine, LyricLineDecor, LyricStyle, LyricWord, ProjectLyrics } 
 import { framesToSeconds, secondsToFrames } from './edl';
 import { DEFAULT_ANIMATION_ID, resolveAnimationParams } from './lyricAnimations';
 import { DEFAULT_FONT_ID, lyricFontById } from './lyricFonts';
-import { lyricTemplateById, resolveLyricDecor } from './lyricTemplates';
 import type { WhisperSegment } from './whisper';
 
 /**
@@ -785,12 +784,12 @@ export function buildCompositeLyrics(
   // at the one boundary every renderer (preview overlay + export
   // burn-in) reads, so the authored line timings never change.
   const offset = Math.round(lyrics.offsetFrames ?? 0);
-  // Extra Styles (Stage 2): the template's resolved decor rides
-  // the same payload as the style, and each line carries its
-  // stored intelligence (emoji / tone / emphasis) — but ONLY when
-  // a template is active. The classic path (no templateId) emits
-  // exactly the keys it always has.
-  const template = lyricTemplateById(lyrics.templateId);
+  // v1 Extra Styles retired (Jaizon, 2026-11-13): no template is
+  // ever resolved here any more — the payload is always the classic
+  // one (lines + resolved style, no decor, no line intelligence).
+  // A stored v1 templateId is retired at load by migrateV1Template
+  // (src/lib/extra-styles/persistence.ts); the per-line intelligence
+  // (line.decor) is still stored and still feeds the 2.0 scenes.
   const out: CompositeLyricLine[] = [];
   for (const line of sortLyricLines(lyrics.lines)) {
     const startTl = songFrameToTimelineFrame(line.startFrame, regionStartFrame) + offset;
@@ -814,15 +813,11 @@ export function buildCompositeLyrics(
       startSeconds: framesToSeconds(clampedStart, fps),
       endSeconds: framesToSeconds(endTl, fps),
       ...(words && words.length > 0 ? { words } : {}),
-      ...(template && line.decor?.emoji ? { emoji: line.decor.emoji } : {}),
-      ...(template && line.decor?.tone ? { tone: line.decor.tone } : {}),
-      ...(template && line.decor?.emphasisWordIndices ? { emphasisWordIndices: line.decor.emphasisWordIndices } : {}),
     });
   }
   if (out.length === 0) return null;
   return {
     lines: out,
     style: resolveLyricStyle(lyrics.style),
-    ...(template ? { decor: resolveLyricDecor(template.decor) } : {}),
   };
 }

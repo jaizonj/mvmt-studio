@@ -14,12 +14,25 @@ import Foundation
 //   - Data Visualization — number counters, band-driven bars,
 //     loudness-driven waveform, diagram groups.
 //
+// LYRIC-ONLY RE-SCOPE (Phase 4, Jaizon 2026-11-13 ~10:28 MST:
+// "no styles that take up the whole screen just lyrics with cool
+// animations" — the video is the star): every style below is now
+// lyrics with kinetic/digital animation ONLY. Full-screen
+// backgrounds, noise fields, displacement waves, scanlines,
+// terminal panels, floor grids, perspective planes, face-tracked
+// HUDs and full-frame charts are gone; what remains is
+// word-attached (RGB-split glitch slices on the line itself, a
+// typing caret, tiny bars under the line, depth-drifted words).
+// Virtual Reality's face tracking is retired with its HUD, so
+// its needsSubjectMasks flag is now false. (Holographic
+// Interface, the 5th digital style, lives in
+// ExtraStylesDemos.swift — not this file.)
+//
 // Flags (STYLE_CAPABILITY_MAP, src/lib/extra-styles/catalog.ts,
 // authoritative): Digital Corruption and Data Visualization
 // REQUIRE audio automation (needsAudioAutomation = true —
-// automation is supplied, so bars/waveform/glitch bursts read it
-// directly); Virtual Reality REQUIRES subject masks
-// (needsSubjectMasks = true); Cyber Terminal needs neither.
+// automation is supplied, so bars/glitch bursts read it
+// directly); Cyber Terminal needs neither audio nor masks.
 
 // MARK: - Shared private helpers (digital family only)
 
@@ -68,73 +81,14 @@ private func digitalBurstOpacityKeys(start: Int, end: Int, seed: UInt64) -> [Ext
   return keys
 }
 
-/// Face-centre position tracks with a CENTRE FALLBACK: sampled
-/// every 15 frames; a sample with no face box uses the canvas
-/// centre (upper-middle) instead of holding a stale box, so the
-/// HUD never strands off-frame. Base position must be (0, 0) —
-/// these values are absolute canvas points, added as offsets.
-private func vrFaceTracks(
-  maskIndex: ExtraStyleSubjectMaskIndex?, fps: Double, canvas: CGSize,
-  startFrame: Int, endFrame: Int
-) -> [ExtraStyleTrack] {
-  guard let maskIndex, !maskIndex.faces.isEmpty else { return [] }
-  var xKeys: [ExtraStyleKeyframe] = []
-  var yKeys: [ExtraStyleKeyframe] = []
-  var frame = startFrame
-  while frame <= endFrame {
-    let seconds = Double(frame) / fps
-    let boxes = maskIndex.faceBoxes(at: seconds)
-    let cx: Double
-    let cy: Double
-    if let box = boxes.first {
-      cx = Double(box.origin.x + box.size.width / 2) * Double(canvas.width)
-      cy = Double(box.origin.y + box.size.height / 2) * Double(canvas.height)
-    } else {
-      cx = Double(canvas.width) / 2
-      cy = Double(canvas.height) * 0.3
-    }
-    xKeys.append(ExtraStyleKeyframe(frame: frame, value: cx, easing: .linear))
-    yKeys.append(ExtraStyleKeyframe(frame: frame, value: cy, easing: .linear))
-    frame += 15
-  }
-  guard !xKeys.isEmpty else { return [] }
-  return [
-    ExtraStyleTrack(property: .positionX, kind: .keyframes(keys: xKeys), startFrame: startFrame),
-    ExtraStyleTrack(property: .positionY, kind: .keyframes(keys: yKeys), startFrame: startFrame),
-  ]
-}
-
-/// Camera-tracking illusion: the background grid counter-moves
-/// against the face (offset = −0.3 × face displacement from
-/// centre), sampled every 15 frames. Empty when no faces exist.
-private func vrCounterMoveTracks(
-  maskIndex: ExtraStyleSubjectMaskIndex?, fps: Double, canvas: CGSize,
-  startFrame: Int, endFrame: Int
-) -> [ExtraStyleTrack] {
-  guard let maskIndex, !maskIndex.faces.isEmpty else { return [] }
-  var xKeys: [ExtraStyleKeyframe] = []
-  var yKeys: [ExtraStyleKeyframe] = []
-  var frame = startFrame
-  while frame <= endFrame {
-    let seconds = Double(frame) / fps
-    let boxes = maskIndex.faceBoxes(at: seconds)
-    var dx = 0.0
-    var dy = 0.0
-    if let box = boxes.first {
-      let cx = Double(box.origin.x + box.size.width / 2) * Double(canvas.width)
-      let cy = Double(box.origin.y + box.size.height / 2) * Double(canvas.height)
-      dx = -(cx - Double(canvas.width) / 2) * 0.3
-      dy = -(cy - Double(canvas.height) * 0.5) * 0.3
-    }
-    xKeys.append(ExtraStyleKeyframe(frame: frame, value: dx, easing: .linear))
-    yKeys.append(ExtraStyleKeyframe(frame: frame, value: dy, easing: .linear))
-    frame += 15
-  }
-  guard !xKeys.isEmpty else { return [] }
-  return [
-    ExtraStyleTrack(property: .positionX, kind: .keyframes(keys: xKeys), startFrame: startFrame),
-    ExtraStyleTrack(property: .positionY, kind: .keyframes(keys: yKeys), startFrame: startFrame),
-  ]
+/// Append a keyframe only when its frame is strictly after the
+/// previous key's frame — clamped schedules (short lines/words)
+/// must never emit duplicate-frame keys.
+private func digitalAppendKeyframe(
+  _ keys: inout [ExtraStyleKeyframe], frame: Int, value: Double, easing: ExtraStyleEasing
+) {
+  guard keys.isEmpty || frame > keys[keys.count - 1].frame else { return }
+  keys.append(ExtraStyleKeyframe(frame: frame, value: value, easing: easing))
 }
 
 // MARK: - Style 12: Digital Corruption (digital)
@@ -159,24 +113,19 @@ final class DigitalCorruptionExtraStyle: ExtraStyleDefinition {
         id: "splitAmount", label: "RGB split", min: 0, max: 16, step: 0.5,
         default: 6, affects: "appearance"
       ),
-      extraStyleSliderParam(
-        id: "noiseDensity", label: "Noise density", min: 0, max: 100, step: 1,
-        default: 40, affects: "density"
-      ),
-      extraStyleToggleParam(id: "displacement", label: "Signal distortion", default: true, affects: "motion"),
       extraStyleColorParam(id: "accent", label: "Glitch colour", default: "#FF2E63", affects: "appearance"),
     ]
   }
 
   var presets: [[String: Any]] {
     [
-      ["id": "subtle", "label": "Subtle", "values": ["glitchIntensity": 0.35, "splitAmount": 3, "noiseDensity": 20]],
-      ["id": "meltdown", "label": "Meltdown", "values": ["glitchIntensity": 1, "splitAmount": 14, "noiseDensity": 80]],
+      ["id": "subtle", "label": "Subtle", "values": ["glitchIntensity": 0.35, "splitAmount": 3]],
+      ["id": "meltdown", "label": "Meltdown", "values": ["glitchIntensity": 1, "splitAmount": 14]],
     ]
   }
 
   var inputs: [String] { ["lines", "words", "intelligence", "audio"] }
-  var rebuildParamIds: [String] { ["glitchIntensity", "splitAmount", "displacement"] }
+  var rebuildParamIds: [String] { ["glitchIntensity", "splitAmount"] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
@@ -186,77 +135,11 @@ final class DigitalCorruptionExtraStyle: ExtraStyleDefinition {
     let accent = extraStyleColor(extraStyleParamString(input.params, "accent", "#FF2E63"))
     var builder = ExtraStyleSceneBuilder()
 
-    // Near-black blue-tinted background.
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.04, g: 0.04, b: 0.08, a: 1),
-        ExtraStyleRGBA(r: 0.01, g: 0.01, b: 0.02, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
-    // Noise field: square sprites scattered over the frame. The
-    // rate follows the noiseDensity param with no rebuild.
-    builder.add(ExtraStyleNode(
-      id: "noise", kind: .particles,
-      position: CGPoint(x: canvas.width / 2, y: canvas.height / 2),
-      zIndex: 1,
-      emitter: ExtraStyleEmitterContent(
-        rate: max(0, min(60, extraStyleParamDouble(input.params, "noiseDensity", 40) * 0.4)),
-        rateParamId: "noiseDensity",
-        rateParamMultiplier: 0.4,
-        lifetimeSeconds: 1.5,
-        origin: CGPoint(x: 0.5, y: 0.5),
-        velocity: CGVector(dx: 0, dy: 0),
-        spread: CGVector(dx: 0.5, dy: 0.5),
-        gravity: 0,
-        size: 0.004,
-        sizeSpread: 0.003,
-        opacityFrom: 0.5,
-        opacityTo: 0,
-        color: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1),
-        spriteKind: .square
-      )
-    ))
-
-    // Signal distortion: a full-frame displacement wave whose
-    // scale follows the onset envelope — glitch bursts land on
-    // accents. (Base scale 10 matches the Metal-spike precedent
-    // of 20 for a full-strength wave; the reaction lifts it to
-    // ~30 on onsets.)
-    if extraStyleParamBool(input.params, "displacement", true) {
-      builder.add(ExtraStyleNode(
-        id: "glitch-wave", kind: .displacement,
-        position: .zero, anchor: .zero,
-        displacement: ExtraStyleDisplacementContent(baseScale: 10, frequency: 6),
-        tracks: [
-          ExtraStyleTrack(
-            property: .scale,
-            kind: .reaction(input: .onset, base: 6, gain: 24),
-            startFrame: 0
-          ),
-        ]
-      ))
-    }
-
-    // Scanlines: thin full-width bars with seeded flicker.
-    for row in 0..<8 {
-      let y = canvas.height * CGFloat(row + 1) / 9
-      builder.add(extraStyleShapeNode(
-        id: "scanline-\(row)",
-        shape: extraStyleRectShape(width: canvas.width, height: 2),
-        fill: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 0.05),
-        position: CGPoint(x: canvas.width / 2, y: y),
-        zIndex: 2,
-        tracks: [
-          extraStyleFlickerTrack(
-            start: 0, end: input.durationFrames, base: 0.6, amplitude: 0.4,
-            seed: input.seed ^ UInt64(0xD161_0000 + row), stepFrames: 4
-          ),
-        ]
-      ))
-    }
+    // LYRIC-ONLY: no background, no full-frame noise field, no
+    // full-frame displacement wave (it distorted the video
+    // itself), no full-width scanlines. The corruption lives on
+    // the lyric line: RGB-split copies, masked glitch slices of
+    // the line itself, and an onset-driven pop.
 
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
@@ -270,7 +153,8 @@ final class DigitalCorruptionExtraStyle: ExtraStyleDefinition {
       let textHeight = sizePoints * 1.25
       let jitterAmount = max(0, split * intensity)
 
-      // Base copy: warm white, small jitter.
+      // Base copy: warm white, small jitter, dark outline so
+      // it stays legible over any footage.
       builder.add(extraStyleTextNode(
         id: "base-\(lineIndex)",
         text: line.text, font: ExtraStyleFonts.mono, sizePoints: sizePoints,
@@ -278,6 +162,8 @@ final class DigitalCorruptionExtraStyle: ExtraStyleDefinition {
         position: center, zIndex: 10,
         visibleRange: lineStartFrame...lineEndFrame,
         maxWidthPoints: canvas.width * 0.88,
+        strokeColor: ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9),
+        strokeWidthPoints: 2,
         tracks: [
           extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 6, exitFrames: 6),
           ExtraStyleTrack(
@@ -383,10 +269,14 @@ final class DigitalCorruptionExtraStyle: ExtraStyleDefinition {
         builder.add(sliceNode)
       }
 
-      // The line's stored emoji, glitched at the frame edge.
+      // The line's stored emoji, glitched at the line's end
+      // (was floating at the frame edge, detached from the lyric).
       if let emojiNode = extraStyleEmojiNode(
         id: "emoji-\(lineIndex)", line: line,
-        position: CGPoint(x: canvas.width * 0.84, y: canvas.height * 0.28),
+        position: CGPoint(
+          x: min(canvas.width * 0.94, center.x + textWidth / 2 + sizePoints),
+          y: center.y
+        ),
         sizePoints: canvas.width * 0.07, zIndex: 15,
         visibleRange: lineStartFrame...lineEndFrame
       ) {
@@ -425,10 +315,6 @@ final class CyberTerminalExtraStyle: ExtraStyleDefinition {
         id: "typingSpeed", label: "Typing speed", min: 0.5, max: 2, step: 0.05,
         default: 1, affects: "motion"
       ),
-      extraStyleSliderParam(
-        id: "scanlineIntensity", label: "Scanline intensity", min: 0, max: 1, step: 0.05,
-        default: 0.6, affects: "appearance"
-      ),
       extraStyleToggleParam(id: "cursorBlink", label: "Blinking cursor", default: true, affects: "motion"),
       extraStyleToggleParam(id: "systemLines", label: "System messages", default: true, affects: "layout"),
     ]
@@ -437,7 +323,7 @@ final class CyberTerminalExtraStyle: ExtraStyleDefinition {
   var presets: [[String: Any]] {
     [
       ["id": "matrix", "label": "Matrix", "values": ["accent": "#33FF66", "typingSpeed": 1.2]],
-      ["id": "amber", "label": "Amber", "values": ["accent": "#FFB000", "typingSpeed": 0.8, "scanlineIntensity": 0.4]],
+      ["id": "amber", "label": "Amber", "values": ["accent": "#FFB000", "typingSpeed": 0.8]],
     ]
   }
 
@@ -453,116 +339,19 @@ final class CyberTerminalExtraStyle: ExtraStyleDefinition {
     let showSystemLines = extraStyleParamBool(input.params, "systemLines", true)
     var builder = ExtraStyleSceneBuilder()
 
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.01, g: 0.05, b: 0.02, a: 1),
-        ExtraStyleRGBA(r: 0, g: 0, b: 0, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
+    // LYRIC-ONLY: no background, no terminal panel (frame /
+    // header / scanlines), no full-width scan sweep, no boot
+    // line. What remains is the typing itself: per-char reveal,
+    // a travelling block caret, a ">" prompt at the line's left
+    // edge, small system-message lines above the lyric, and one
+    // small corner tag as the only chrome.
+    builder.add(extraStyleTextNode(
+      id: "corner-tag",
+      text: "MVMT://TERM", font: ExtraStyleFonts.mono,
+      sizePoints: canvas.width * 0.024, color: accent.withAlpha(0.75),
+      position: CGPoint(x: canvas.width * 0.09, y: canvas.height * 0.055),
+      zIndex: 5, colorParamId: "accent"
     ))
-
-    // Terminal panel: one group for the whole scene — frame,
-    // header bar, header label, and scanlines move together.
-    let panelWidth = canvas.width * 0.9
-    let panelHeight = canvas.height * 0.62
-    let panelCenter = CGPoint(x: canvas.width / 2, y: canvas.height * 0.46)
-    var panelMembers: [String] = []
-    builder.addChild(extraStyleShapeNode(
-      id: "panel-frame",
-      shape: extraStyleRectShape(width: panelWidth, height: panelHeight),
-      fill: accent.withAlpha(0.04),
-      stroke: accent, strokeWidth: 2,
-      position: .zero, zIndex: 0,
-      fillColorParamId: nil
-    ))
-    panelMembers.append("panel-frame")
-    builder.addChild(extraStyleShapeNode(
-      id: "panel-header",
-      shape: extraStyleRectShape(width: panelWidth, height: 36),
-      fill: accent.withAlpha(0.18),
-      position: CGPoint(x: 0, y: -panelHeight / 2 + 18),
-      zIndex: 1
-    ))
-    panelMembers.append("panel-header")
-    builder.addChild(extraStyleTextNode(
-      id: "panel-title",
-      text: "MVMT://TERMINAL — SESSION 001", font: ExtraStyleFonts.mono,
-      sizePoints: canvas.width * 0.026, color: accent,
-      position: CGPoint(x: 0, y: -panelHeight / 2 + 18),
-      zIndex: 2,
-      colorParamId: "accent"
-    ))
-    panelMembers.append("panel-title")
-    // Scanlines inside the panel: intensity via paramScale.
-    for row in 0..<10 {
-      let rowId = "panel-scanline-\(row)"
-      let y = -panelHeight / 2 + 48 + CGFloat(row) * (panelHeight - 60) / 10
-      builder.addChild(ExtraStyleNode(
-        id: rowId, kind: .shape,
-        position: CGPoint(x: 0, y: y), anchor: CGPoint(x: 0.5, y: 0.5),
-        zIndex: 1,
-        shape: ExtraStyleShapeContent(
-          shape: extraStyleRectShape(width: panelWidth, height: 2),
-          fill: accent.withAlpha(0.07),
-          fillColorParamId: "accent",
-          stroke: nil, strokeWidth: 0
-        ),
-        tracks: [
-          ExtraStyleTrack(
-            property: .opacity,
-            kind: .keyframes(keys: [ExtraStyleKeyframe(frame: 0, value: 1, easing: .linear)]),
-            startFrame: 0,
-            paramScale: "scanlineIntensity"
-          ),
-        ]
-      ))
-      panelMembers.append(rowId)
-    }
-    builder.add(ExtraStyleNode(
-      id: "panel", kind: .group,
-      children: panelMembers,
-      position: panelCenter, anchor: .zero,
-      zIndex: 3
-    ))
-
-    // Scan sweep: a bright bar travelling top → bottom on a loop.
-    builder.add(ExtraStyleNode(
-      id: "scan-sweep", kind: .shape,
-      position: CGPoint(x: canvas.width / 2, y: 0),
-      anchor: CGPoint(x: 0.5, y: 0.5),
-      zIndex: 4,
-      shape: ExtraStyleShapeContent(
-        shape: extraStyleRectShape(width: canvas.width, height: 8),
-        fill: accent.withAlpha(0.15),
-        fillColorParamId: "accent",
-        stroke: nil, strokeWidth: 0
-      ),
-      tracks: [
-        ExtraStyleTrack(
-          property: .positionY,
-          kind: .loop(periodFrames: 240, periodParamId: "typingSpeed", keys: [
-            ExtraStyleKeyframe(frame: 0, value: 0, easing: .linear),
-            ExtraStyleKeyframe(frame: 240, value: Double(canvas.height), easing: .linear),
-          ]),
-          startFrame: 0
-        ),
-      ]
-    ))
-
-    // Boot line: the terminal announces itself, then yields.
-    let bootEnd = min(input.durationFrames, 90)
-    if bootEnd > 12 {
-      builder.add(extraStyleTextNode(
-        id: "boot",
-        text: "MVMT OS v2.0 — boot sequence OK", font: ExtraStyleFonts.mono,
-        sizePoints: canvas.width * 0.028, color: accent,
-        position: CGPoint(x: canvas.width / 2, y: canvas.height * 0.2),
-        zIndex: 5, visibleRange: 0...bootEnd,
-        colorParamId: "accent",
-        tracks: [extraStyleEnterExitOpacityTrack(start: 0, end: bootEnd, enterFrames: 6, exitFrames: 12)]
-      ))
-    }
 
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
@@ -595,7 +384,12 @@ final class CyberTerminalExtraStyle: ExtraStyleDefinition {
           ),
         ]
       }
-      for char in chars { builder.add(char) }
+      for char in chars {
+        var stroked = char
+        stroked.text?.strokeColor = ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9)
+        stroked.text?.strokeWidthPoints = 2
+        builder.add(stroked)
+      }
 
       // Cursor: a block that travels left → right as the chars
       // reveal, then blinks in place. Total typed width is
@@ -677,12 +471,13 @@ final class CyberTerminalExtraStyle: ExtraStyleDefinition {
         ))
       }
 
-      // Prompt marker at the panel's left edge for the active line.
+      // Prompt marker at the typed line's left edge for the
+      // active line (was pinned to a fixed frame position).
       builder.add(extraStyleTextNode(
         id: "prompt-\(lineIndex)",
         text: ">", font: ExtraStyleFonts.mono, sizePoints: sizePoints,
         color: accent,
-        position: CGPoint(x: canvas.width * 0.08, y: lineY),
+        position: CGPoint(x: max(14, leftEdgeX - 18), y: lineY),
         zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
         colorParamId: "accent",
         tracks: [extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 4, exitFrames: 6)]
@@ -698,24 +493,26 @@ final class VirtualRealityExtraStyle: ExtraStyleDefinition {
   let id = "virtual-reality"
   let version = 1
   let name = "Virtual Reality"
-  let tagline = "Floating panels in depth, tracking you."
+  let tagline = "Lyrics drift in depth — near, mid and far planes."
   let category = "digital"
   let needsAudioAutomation = false
-  let needsSubjectMasks = true
+  // RETIRED+REPLACED (Phase 4 lyric-only re-scope): the
+  // face-tracked HUD and perspective planes are gone, so this
+  // style no longer needs subject masks.
+  let needsSubjectMasks = false
   let internalStyle = false
 
   var parameters: [[String: Any]] {
     [
       extraStyleSliderParam(
-        id: "depthAmount", label: "Depth", min: 0, max: 1, step: 0.05,
+        id: "depthAmount", label: "Depth drift", min: 0, max: 1, step: 0.05,
         default: 0.7, affects: "layout"
       ),
-      extraStyleColorParam(id: "panelColor", label: "Panel colour", default: "#7DF9FF", affects: "appearance"),
+      extraStyleColorParam(id: "panelColor", label: "Accent colour", default: "#7DF9FF", affects: "appearance"),
       extraStyleSliderParam(
         id: "floatSpeed", label: "Float speed", min: 0.25, max: 2, step: 0.05,
         default: 1, affects: "motion"
       ),
-      extraStyleToggleParam(id: "faceTracking", label: "Track my face", default: true, affects: "motion"),
     ]
   }
 
@@ -726,247 +523,127 @@ final class VirtualRealityExtraStyle: ExtraStyleDefinition {
     ]
   }
 
-  var inputs: [String] { ["lines", "words", "intelligence", "subject"] }
-  var rebuildParamIds: [String] { ["depthAmount", "faceTracking"] }
+  var inputs: [String] { ["lines", "words", "intelligence"] }
+  var rebuildParamIds: [String] { ["depthAmount"] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
     let fps = input.fps > 0 ? input.fps : 30
     let depthAmount = extraStyleParamDouble(input.params, "depthAmount", 0.7)
     let panelColor = extraStyleColor(extraStyleParamString(input.params, "panelColor", "#7DF9FF"))
-    let faceTracking = extraStyleParamBool(input.params, "faceTracking", true)
     var builder = ExtraStyleSceneBuilder()
 
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.02, g: 0.04, b: 0.09, a: 1),
-        ExtraStyleRGBA(r: 0.005, g: 0.005, b: 0.01, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
-    // Perspective floor grid: horizontal + converging vertical
-    // paths in one group that counter-moves against the face —
-    // the camera-tracking illusion. Paths are absolute canvas
-    // coords; the group sits at (0, 0) so its offset tracks
-    // shift the whole grid.
-    var gridMembers: [String] = []
-    for row in 0..<5 {
-      let t = Double(row) / 4
-      let y = canvas.height * CGFloat(0.62 + 0.33 * t * t)
-      let path = CGMutablePath()
-      path.move(to: CGPoint(x: 0, y: y))
-      path.addLine(to: CGPoint(x: canvas.width, y: y))
-      let rowId = "grid-h-\(row)"
-      builder.addChild(ExtraStyleNode(
-        id: rowId, kind: .path,
-        position: .zero, anchor: .zero, zIndex: 0,
-        path: ExtraStylePathContent(
-          path: path,
-          strokeColor: panelColor.withAlpha(0.16),
-          strokeWidth: 1.5,
-          dash: nil
-        )
-      ))
-      gridMembers.append(rowId)
-    }
-    for col in 0..<5 {
-      let t = Double(col) / 4
-      let topX = canvas.width * CGFloat(0.5 + (t - 0.5) * 0.3)
-      let bottomX = canvas.width * CGFloat(0.5 + (t - 0.5) * 1.7)
-      let path = CGMutablePath()
-      path.move(to: CGPoint(x: topX, y: canvas.height * 0.6))
-      path.addLine(to: CGPoint(x: bottomX, y: canvas.height))
-      let colId = "grid-v-\(col)"
-      builder.addChild(ExtraStyleNode(
-        id: colId, kind: .path,
-        position: .zero, anchor: .zero, zIndex: 0,
-        path: ExtraStylePathContent(
-          path: path,
-          strokeColor: panelColor.withAlpha(0.12),
-          strokeWidth: 1.5,
-          dash: nil
-        )
-      ))
-      gridMembers.append(colId)
-    }
-    builder.add(ExtraStyleNode(
-      id: "grid", kind: .group,
-      children: gridMembers,
-      position: .zero, anchor: .zero,
-      zIndex: 1,
-      tracks: faceTracking
-        ? vrCounterMoveTracks(maskIndex: input.maskIndex, fps: fps, canvas: canvas, startFrame: 0, endFrame: input.durationFrames)
-        : []
-    ))
-
+    // LYRIC-ONLY REPLACEMENT (the old concept — near-full-frame
+    // perspective planes, a floor grid, and a face-tracked HUD
+    // reticle — cannot exist without taking over the frame, so it
+    // is retired): depth is now a property of the words. Lines
+    // cycle near / mid / far tiers — nearer lines render larger
+    // and drift more, farther lines smaller and calmer — with a
+    // gentle parallax float. No background, no grid, no planes,
+    // no HUD, no face tracking, no masks.
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
-      // Depth tier per line: near / mid / far cycle, so
-      // consecutive lines sit on different depth planes.
       let tier = lineIndex % 3
-      let depth = 0.6 + Double(tier) * 0.5 + depthAmount * 0.4
-      let panelWidth = canvas.width * 0.8
-      let panelHeight = canvas.height * 0.42
-      let panelCenter = CGPoint(x: canvas.width / 2, y: canvas.height * 0.5)
-      // Perspective corners are absolute canvas points in
-      // [topLeft, topRight, bottomRight, bottomLeft] order. The
-      // engine warps the group's full-canvas raster into this
-      // quad, so the plane is near-full-frame: a trapezoid whose
-      // top edge narrows with depth — the 2.5D tilt.
-      let squeeze = CGFloat(depthAmount * 60 + Double(tier) * 24)
-      let corners: [CGPoint] = [
-        CGPoint(x: canvas.width * 0.10 + squeeze, y: canvas.height * 0.24),
-        CGPoint(x: canvas.width * 0.90 - squeeze, y: canvas.height * 0.24),
-        CGPoint(x: canvas.width * 0.97, y: canvas.height * 0.78),
-        CGPoint(x: canvas.width * 0.03, y: canvas.height * 0.78),
-      ]
+      // Near tier 0 renders largest, far tier 2 smallest; the
+      // spread scales with depthAmount (0 = all tiers equal).
+      let tierScale = 1 + CGFloat(1 - tier) * 0.12 * CGFloat(depthAmount)
+      let drift = (12 - Double(tier) * 4) * depthAmount + 2
+      let sizePoints = canvas.width * 0.055 * tierScale
+      let centerY = canvas.height * 0.5
+      let ink = ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9)
+      let warmWhite = ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1)
 
-      var members: [String] = []
-      builder.addChild(extraStyleShapeNode(
-        id: "plane-frame-\(lineIndex)",
-        shape: extraStyleRectShape(width: panelWidth, height: panelHeight),
-        fill: panelColor.withAlpha(0.06),
-        stroke: panelColor, strokeWidth: 2,
-        position: .zero, zIndex: 0
-      ))
-      members.append("plane-frame-\(lineIndex)")
-      // Depth-scaled text: farther tiers render smaller.
-      let textScale = 1.0 - CGFloat(tier) * 0.12
-      let textNode = extraStyleTextNode(
-        id: "plane-text-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.bold,
-        sizePoints: canvas.width * 0.055 * textScale,
-        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
-        position: CGPoint(x: 0, y: -panelHeight * 0.06),
-        zIndex: 1,
-        visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: panelWidth * 0.88,
-        tracks: [extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 10, exitFrames: 10)]
-      )
-      builder.addChild(textNode)
-      members.append("plane-text-\(lineIndex)")
-      builder.addChild(extraStyleTextNode(
-        id: "plane-depth-\(lineIndex)",
-        text: String(format: "DEPTH %.1fm · PLANE %d", depth, tier + 1),
-        font: ExtraStyleFonts.mono, sizePoints: canvas.width * 0.026,
-        color: panelColor,
-        position: CGPoint(x: 0, y: -panelHeight / 2 + 34),
-        zIndex: 1,
-        colorParamId: "panelColor"
-      ))
-      members.append("plane-depth-\(lineIndex)")
-      if let emojiNode = extraStyleEmojiNode(
-        id: "plane-emoji-\(lineIndex)", line: line,
-        position: CGPoint(x: 0, y: panelHeight * 0.3),
-        sizePoints: canvas.width * 0.08, zIndex: 2,
-        visibleRange: lineStartFrame...lineEndFrame
-      ) {
-        builder.addChild(emojiNode)
-        members.append("plane-emoji-\(lineIndex)")
-      }
-      // Depth movement: the plane breathes (scale) and floats
-      // (positionY loop) — nearer planes move more.
-      let breathe = 1.0 + 0.06 * depthAmount + Double(tier) * 0.02
-      builder.add(ExtraStyleNode(
-        id: "plane-\(lineIndex)", kind: .group,
-        children: members,
-        position: panelCenter, anchor: .zero,
-        zIndex: 10,
-        visibleRange: lineStartFrame...lineEndFrame,
-        perspectiveCorners: corners,
-        tracks: [
-          ExtraStyleTrack(
-            property: .scale,
-            kind: .keyframes(keys: [
-              ExtraStyleKeyframe(frame: lineStartFrame, value: 1, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: (lineStartFrame + lineEndFrame) / 2, value: breathe, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: lineEndFrame, value: 1, easing: .easeInOutSine),
-            ]),
-            startFrame: lineStartFrame
-          ),
+      let wordNodes = extraStyleWordNodes(
+        line: line, lineIndex: lineIndex, fps: fps,
+        lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        y: centerY, sizePoints: sizePoints,
+        color: warmWhite,
+        font: ExtraStyleFonts.bold, zIndex: 10, canvasWidth: canvas.width
+      ) { _, wordStart, wordEnd in
+        [
+          extraStyleSpringInTrack(start: wordStart, from: 0.6, stiffness: 140, damping: 11),
           ExtraStyleTrack(
             property: .positionY,
             kind: .loop(periodFrames: 180, periodParamId: "floatSpeed", keys: [
               ExtraStyleKeyframe(frame: 0, value: 0, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: 90, value: -10 - Double(tier) * 4, easing: .easeInOutSine),
+              ExtraStyleKeyframe(frame: 90, value: -drift, easing: .easeInOutSine),
               ExtraStyleKeyframe(frame: 180, value: 0, easing: .easeInOutSine),
             ]),
-            startFrame: lineStartFrame
+            startFrame: wordStart
           ),
-        ]
-      ))
-
-      // Face-tracked HUD: a reticle + lock label that follows
-      // the face box. Base position (0, 0) when tracking (the
-      // face tracks carry absolute canvas points); canvas
-      // centre when tracking is off or no faces exist.
-      let hasFaces = (input.maskIndex?.faces.isEmpty == false)
-      let hudBase: CGPoint
-      let hudTracks: [ExtraStyleTrack]
-      if faceTracking, hasFaces {
-        hudBase = .zero
-        hudTracks = vrFaceTracks(
-          maskIndex: input.maskIndex, fps: fps, canvas: canvas,
-          startFrame: lineStartFrame, endFrame: lineEndFrame
-        ) + [
           ExtraStyleTrack(
-            property: .positionY,
-            kind: .loop(periodFrames: 150, periodParamId: "floatSpeed", keys: [
+            property: .positionX,
+            kind: .loop(periodFrames: 240, periodParamId: "floatSpeed", keys: [
               ExtraStyleKeyframe(frame: 0, value: 0, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: 75, value: -6, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: 150, value: 0, easing: .easeInOutSine),
+              ExtraStyleKeyframe(frame: 120, value: drift * 0.6, easing: .easeInOutSine),
+              ExtraStyleKeyframe(frame: 240, value: 0, easing: .easeInOutSine),
             ]),
-            startFrame: lineStartFrame
+            startFrame: wordStart
           ),
+          extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd, enterFrames: 8, exitFrames: 8),
         ]
-      } else {
-        hudBase = CGPoint(x: canvas.width / 2, y: canvas.height * 0.3)
-        hudTracks = []
       }
-      var hudMembers: [String] = []
-      // Reticle corners around the origin (±44 pt).
-      let reticleCorners: [(CGFloat, CGFloat, CGFloat, CGFloat)] = [
-        (-44, -44, 1, 1), (44, -44, -1, 1), (-44, 44, 1, -1), (44, 44, -1, -1),
-      ]
-      for (cornerIndex, corner) in reticleCorners.enumerated() {
-        let (ox, oy, sx, sy) = corner
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: ox + sx * 22, y: oy))
-        path.addLine(to: CGPoint(x: ox, y: oy))
-        path.addLine(to: CGPoint(x: ox, y: oy + sy * 22))
-        let cornerId = "hud-corner-\(lineIndex)-\(cornerIndex)"
-        builder.addChild(ExtraStyleNode(
-          id: cornerId, kind: .path,
-          position: .zero, anchor: .zero, zIndex: 0,
-          path: ExtraStylePathContent(
-            path: path,
-            strokeColor: panelColor.withAlpha(0.9),
-            strokeWidth: 3,
-            dash: nil
-          )
+      if wordNodes.isEmpty {
+        builder.add(extraStyleTextNode(
+          id: "vr-line-\(lineIndex)",
+          text: line.text, font: ExtraStyleFonts.bold, sizePoints: sizePoints,
+          color: warmWhite,
+          position: CGPoint(x: canvas.width / 2, y: centerY),
+          zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
+          maxWidthPoints: canvas.width * 0.88,
+          strokeColor: ink, strokeWidthPoints: 2,
+          tracks: [
+            extraStyleSpringInTrack(start: lineStartFrame, from: 0.6, stiffness: 140, damping: 11),
+            ExtraStyleTrack(
+              property: .positionY,
+              kind: .loop(periodFrames: 180, periodParamId: "floatSpeed", keys: [
+                ExtraStyleKeyframe(frame: 0, value: 0, easing: .easeInOutSine),
+                ExtraStyleKeyframe(frame: 90, value: -drift, easing: .easeInOutSine),
+                ExtraStyleKeyframe(frame: 180, value: 0, easing: .easeInOutSine),
+              ]),
+              startFrame: lineStartFrame
+            ),
+            extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 10, exitFrames: 10),
+          ]
         ))
-        hudMembers.append(cornerId)
+        continue
       }
-      builder.addChild(extraStyleTextNode(
-        id: "hud-label-\(lineIndex)",
-        text: "SUBJECT LOCK", font: ExtraStyleFonts.mono,
-        sizePoints: canvas.width * 0.024, color: panelColor,
-        position: CGPoint(x: 0, y: -68),
-        zIndex: 1,
-        colorParamId: "panelColor"
-      ))
-      hudMembers.append("hud-label-\(lineIndex)")
-      builder.add(ExtraStyleNode(
-        id: "hud-\(lineIndex)", kind: .group,
-        children: hudMembers,
-        position: hudBase, anchor: .zero,
-        zIndex: 20,
-        visibleRange: lineStartFrame...lineEndFrame,
-        tracks: hudTracks
-      ))
+      for wordNode in wordNodes {
+        var node = wordNode
+        node.text?.strokeColor = ink
+        node.text?.strokeWidthPoints = 2
+        let wordIndex = node.id.split(separator: "-").last.flatMap { Int($0) } ?? -1
+        if line.emphasisWordIndices.contains(wordIndex) {
+          node.text?.color = panelColor
+          node.text?.colorParamId = "panelColor"
+          if let size = node.text?.sizePoints { node.text?.sizePoints = size * 1.15 }
+        }
+        builder.add(node)
+      }
+
+      // The line's stored emoji, small, at the line's end.
+      let lineWidth: CGFloat = {
+        let font = ExtraStyleFonts.bold
+        if line.words.isEmpty {
+          return extraStyleTextWidth(line.text, fontPostScriptName: font, sizePoints: sizePoints)
+        }
+        let space = extraStyleTextWidth(" ", fontPostScriptName: font, sizePoints: sizePoints)
+        return line.words.map {
+          extraStyleTextWidth($0.text, fontPostScriptName: font, sizePoints: sizePoints)
+        }.reduce(0, +) + space * CGFloat(max(0, line.words.count - 1))
+      }()
+      if let emojiNode = extraStyleEmojiNode(
+        id: "vr-emoji-\(lineIndex)", line: line,
+        position: CGPoint(
+          x: min(canvas.width * 0.94, canvas.width / 2 + lineWidth / 2 + sizePoints * 0.8),
+          y: centerY
+        ),
+        sizePoints: sizePoints * 0.9, zIndex: 11,
+        visibleRange: lineStartFrame...lineEndFrame
+      ) {
+        builder.add(emojiNode)
+      }
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }
@@ -978,7 +655,7 @@ final class DataVisualizationExtraStyle: ExtraStyleDefinition {
   let id = "data-visualization"
   let version = 1
   let name = "Data Visualization"
-  let tagline = "The song, charted live — bars, waves, counters."
+  let tagline = "Tiny live bars under the line — the song, charted small."
   let category = "digital"
   let needsAudioAutomation = true
   let needsSubjectMasks = false
@@ -986,19 +663,10 @@ final class DataVisualizationExtraStyle: ExtraStyleDefinition {
 
   var parameters: [[String: Any]] {
     [
-      extraStyleSegmentedParam(
-        id: "chartStyle", label: "Chart",
-        options: [("bars", "Bars"), ("wave", "Waveform"), ("both", "Both")],
-        default: "both", affects: "layout"
-      ),
       extraStyleColorParam(id: "accent", label: "Chart colour", default: "#C9F36B", affects: "appearance"),
       extraStyleSliderParam(
         id: "sensitivity", label: "Sensitivity", min: 0.5, max: 2, step: 0.05,
         default: 1, affects: "motion"
-      ),
-      extraStyleNumberParam(
-        id: "barCount", label: "Bar count", min: 4, max: 12, step: 1,
-        default: 8, affects: "layout"
       ),
       extraStyleToggleParam(id: "showCounters", label: "Counters", default: true, affects: "layout"),
     ]
@@ -1006,73 +674,116 @@ final class DataVisualizationExtraStyle: ExtraStyleDefinition {
 
   var presets: [[String: Any]] {
     [
-      ["id": "bars-only", "label": "Bars only", "values": ["chartStyle": "bars"]],
-      ["id": "wave-only", "label": "Wave only", "values": ["chartStyle": "wave"]],
+      ["id": "gentle", "label": "Gentle", "values": ["sensitivity": 0.6]],
+      ["id": "intense", "label": "Intense", "values": ["sensitivity": 1.8]],
     ]
   }
 
   var inputs: [String] { ["lines", "words", "intelligence", "audio"] }
-  var rebuildParamIds: [String] { ["barCount", "chartStyle", "showCounters"] }
+  var rebuildParamIds: [String] { ["showCounters"] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
     let fps = input.fps > 0 ? input.fps : 30
     let accent = extraStyleColor(extraStyleParamString(input.params, "accent", "#C9F36B"))
     let sensitivity = extraStyleParamDouble(input.params, "sensitivity", 1)
-    let barCount = max(4, min(12, Int(extraStyleParamDouble(input.params, "barCount", 8).rounded())))
-    let chartStyle = extraStyleParamString(input.params, "chartStyle", "both")
     let showCounters = extraStyleParamBool(input.params, "showCounters", true)
-    let showBars = chartStyle == "bars" || chartStyle == "both"
-    let showWave = chartStyle == "wave" || chartStyle == "both"
     let automation = input.automation
+    let bandCount = automation.map { $0.bandEnergies(at: 0).count } ?? 0
     var builder = ExtraStyleSceneBuilder()
 
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.04, g: 0.06, b: 0.06, a: 1),
-        ExtraStyleRGBA(r: 0.01, g: 0.02, b: 0.02, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
+    // LYRIC-ONLY: no background, no faint full-frame chart grid,
+    // no full-width bars, no 48-segment full-width waveform, no
+    // animated BPM/word counters floating above the line. The
+    // chart shrinks to the lyric: karaoke words that dim once
+    // sung, 8 tiny bars under the line reading the song's band
+    // energies, and one small data chip under the bars.
+    let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
+    for (lineIndex, line) in sortedLines.enumerated() {
+      guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
+      let sizePoints = canvas.width * 0.05
+      let centerY = canvas.height * 0.42
+      let ink = ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9)
+      let warmWhite = ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1)
+      let font = ExtraStyleFonts.bold
 
-    // Faint chart grid.
-    for row in 0..<5 {
-      let y = canvas.height * CGFloat(0.2 + Double(row) * 0.15)
-      builder.add(extraStyleShapeNode(
-        id: "grid-\(row)",
-        shape: extraStyleRectShape(width: canvas.width, height: 1),
-        fill: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 0.06),
-        position: CGPoint(x: canvas.width / 2, y: y),
-        zIndex: 1
-      ))
-    }
+      // Word layout (measured, centred). Nodes are built
+      // manually — not via extraStyleWordNodes — because karaoke
+      // needs each word to stay visible for the whole line: a
+      // sung word dims to 0.6 once the next word starts instead
+      // of vanishing at its own end frame.
+      let entryTexts: [String] = line.words.isEmpty ? [line.text] : line.words.map { $0.text }
+      let entryStarts: [Double] = line.words.isEmpty ? [line.startSeconds] : line.words.map { $0.startSeconds }
+      let entryEnds: [Double] = line.words.isEmpty ? [line.endSeconds] : line.words.map { $0.endSeconds }
+      let spaceWidth = extraStyleTextWidth(" ", fontPostScriptName: font, sizePoints: sizePoints)
+      let widths = entryTexts.map { extraStyleTextWidth($0, fontPostScriptName: font, sizePoints: sizePoints) }
+      let totalWidth = widths.reduce(0, +) + spaceWidth * CGFloat(max(0, entryTexts.count - 1))
+      var cursorX = (canvas.width - totalWidth) / 2
+      for (index, wordText) in entryTexts.enumerated() {
+        let wordWidth = widths[index]
+        defer { cursorX += wordWidth + spaceWidth }
+        let wordStartFrame = max(lineStartFrame, Int((entryStarts[index] * fps).rounded()))
+        let wordEndFrame = min(lineEndFrame, Int((entryEnds[index] * fps).rounded()))
+        let startFrame = wordEndFrame > wordStartFrame
+          ? wordStartFrame : min(lineEndFrame - 1, lineStartFrame + index * 3)
+        guard lineEndFrame > startFrame else { continue }
+        let isEmphasis = line.emphasisWordIndices.contains(index)
+        // Karaoke opacity: 0 until sung, 1 while current, 0.6
+        // after the next word starts (this word's end when
+        // timings are contiguous), out at the line end.
+        var opacityKeys: [ExtraStyleKeyframe] = []
+        digitalAppendKeyframe(&opacityKeys, frame: startFrame, value: 0, easing: .linear)
+        digitalAppendKeyframe(&opacityKeys, frame: min(lineEndFrame, startFrame + 4), value: 1, easing: .easeOutCubic)
+        let dimFrame = max(wordEndFrame, startFrame + 5)
+        if dimFrame < lineEndFrame {
+          digitalAppendKeyframe(&opacityKeys, frame: dimFrame, value: 1, easing: .linear)
+          digitalAppendKeyframe(&opacityKeys, frame: min(lineEndFrame, dimFrame + 6), value: 0.6, easing: .easeInOutSine)
+        }
+        digitalAppendKeyframe(&opacityKeys, frame: lineEndFrame, value: 0, easing: .easeInCubic)
+        builder.add(extraStyleTextNode(
+          id: "viz-word-\(lineIndex)-\(index)",
+          text: wordText, font: font,
+          sizePoints: isEmphasis ? sizePoints * 1.12 : sizePoints,
+          color: isEmphasis ? accent : warmWhite,
+          position: CGPoint(x: cursorX + wordWidth / 2, y: centerY),
+          zIndex: 10,
+          visibleRange: startFrame...lineEndFrame,
+          strokeColor: ink, strokeWidthPoints: 2,
+          colorParamId: isEmphasis ? "accent" : nil,
+          tracks: [
+            extraStyleSpringInTrack(start: startFrame, from: isEmphasis ? 0.5 : 0.7, stiffness: 160, damping: 11),
+            ExtraStyleTrack(
+              property: .opacity,
+              kind: .keyframes(keys: opacityKeys),
+              startFrame: startFrame
+            ),
+          ]
+        ))
+      }
 
-    // Bars: one shape node per bar, anchored at its bottom edge
-    // so the scale track grows it upward from the baseline.
-    // Each bar reads its own band's energy, sampled every 6
-    // frames across the scene. Without automation (defensive
-    // only — automation is required for this style) a seeded
-    // sine pattern stands in.
-    if showBars {
-      let bandCount = automation.map { $0.bandEnergies(at: 0).count } ?? 0
-      let barWidth = canvas.width * 0.9 / CGFloat(barCount) * 0.62
-      let barHeight: CGFloat = 220
-      let baselineY = canvas.height * 0.8
-      for bar in 0..<barCount {
-        let x = canvas.width * 0.05 + canvas.width * 0.9 * (CGFloat(bar) + 0.5) / CGFloat(barCount)
-        let bandIndex = bandCount > 0 ? bar * bandCount / barCount : 0
+      // Tiny bars under the lyric line: 8 small bars reading the
+      // song's band energies across the line window — a chart the
+      // size of the lyric, not a full-screen one. Without
+      // automation (defensive only — automation is required for
+      // this style) a seeded sine pattern stands in.
+      let miniBarCount = 8
+      let miniBarWidth = totalWidth / CGFloat(miniBarCount) * 0.62
+      let miniBarHeight: CGFloat = 26
+      let miniBaselineY = centerY + sizePoints * 1.25
+      for bar in 0..<miniBarCount {
+        let x = canvas.width / 2 - totalWidth / 2 + totalWidth * (CGFloat(bar) + 0.5) / CGFloat(miniBarCount)
+        let bandIndex = bandCount > 0 ? bar * bandCount / miniBarCount : 0
         var random = ExtraStyleSeededRandom(seed: input.seed ^ UInt64(0x4241_5200 + bar))
         let phase = random.nextDouble() * 2 * Double.pi
         var keys: [ExtraStyleKeyframe] = []
-        var frame = 0
-        while frame <= input.durationFrames {
+        var frame = lineStartFrame
+        while frame <= lineEndFrame {
           let seconds = Double(frame) / fps
           let value: Double
           if let automation, bandCount > 0 {
             let energies = automation.bandEnergies(at: seconds)
             let energy = bandIndex < energies.count ? energies[bandIndex] : 0
-            value = max(0.12, min(1, energy * sensitivity * 1.4))
+            value = max(0.15, min(1, energy * sensitivity * 1.4))
           } else {
             value = 0.35 + 0.3 * sin(Double(frame) / 18 + phase)
           }
@@ -1080,167 +791,54 @@ final class DataVisualizationExtraStyle: ExtraStyleDefinition {
           frame += 6
         }
         builder.add(ExtraStyleNode(
-          id: "bar-\(bar)", kind: .shape,
-          position: CGPoint(x: x, y: baselineY),
+          id: "minibar-\(lineIndex)-\(bar)", kind: .shape,
+          position: CGPoint(x: x, y: miniBaselineY),
           anchor: CGPoint(x: 0.5, y: 1),
-          zIndex: 5,
+          zIndex: 9,
+          visibleRange: lineStartFrame...lineEndFrame,
           shape: ExtraStyleShapeContent(
-            shape: extraStyleRectShape(width: barWidth, height: barHeight),
-            fill: accent.withAlpha(0.55 + 0.45 * Double(bar) / Double(max(1, barCount))),
+            shape: extraStyleRectShape(width: miniBarWidth, height: miniBarHeight),
+            fill: accent.withAlpha(0.45 + 0.5 * Double(bar) / Double(max(1, miniBarCount))),
             fillColorParamId: "accent",
             stroke: nil, strokeWidth: 0
           ),
           tracks: [
-            ExtraStyleTrack(property: .scale, kind: .keyframes(keys: keys), startFrame: 0),
+            ExtraStyleTrack(property: .scale, kind: .keyframes(keys: keys), startFrame: lineStartFrame),
+            extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 6, exitFrames: 6),
           ]
         ))
       }
-      // Baseline rule under the bars.
-      builder.add(extraStyleShapeNode(
-        id: "bar-baseline",
-        shape: extraStyleRectShape(width: canvas.width * 0.9, height: 2),
-        fill: accent.withAlpha(0.5),
-        position: CGPoint(x: canvas.width / 2, y: baselineY),
-        zIndex: 5,
-        fillColorParamId: "accent"
-      ))
-    }
 
-    // Waveform: 48 segments spanning the frame, each drawn from
-    // the loudness curve at its time. The engine has no path
-    // trim/progress, so draw progress is faked with per-segment
-    // visible ranges — segments appear left to right across the
-    // scene — and the whole waveform's opacity follows loudness.
-    if showWave {
-      let segmentCount = 48
-      let waveY = canvas.height * 0.6
-      let waveLeft = canvas.width * 0.05
-      let waveWidth = canvas.width * 0.9
-      var waveMembers: [String] = []
-      for segment in 0..<segmentCount {
-        let t0 = Double(segment) / Double(segmentCount)
-        let t1 = Double(segment + 1) / Double(segmentCount)
-        let seconds0 = t0 * Double(input.durationFrames) / fps
-        let seconds1 = t1 * Double(input.durationFrames) / fps
-        func wavePoint(t: Double, seconds: Double) -> CGPoint {
-          let loudness = automation?.loudness(at: seconds) ?? -30
-          let normalized = max(0, min(1, (loudness + 60) / 60))
-          let amp = CGFloat(normalized * sensitivity) * canvas.height * 0.06
-          // Alternate above/below the centre line for a wave look.
-          let sign: CGFloat = segment % 2 == 0 ? -1 : 1
-          return CGPoint(
-            x: waveLeft + CGFloat(t) * waveWidth,
-            y: waveY + sign * amp
-          )
-        }
-        let path = CGMutablePath()
-        path.move(to: wavePoint(t: t0, seconds: seconds0))
-        path.addLine(to: wavePoint(t: t1, seconds: seconds1))
-        let revealFrame = Int(Double(segment) / Double(segmentCount) * Double(input.durationFrames))
-        let segmentId = "wave-seg-\(segment)"
-        builder.addChild(ExtraStyleNode(
-          id: segmentId, kind: .path,
-          position: .zero, anchor: .zero, zIndex: 0,
-          visibleRange: revealFrame...input.durationFrames,
-          path: ExtraStylePathContent(
-            path: path,
-            strokeColor: accent,
-            strokeWidth: 3,
-            dash: nil
-          ),
-          tracks: [
-            ExtraStyleTrack(
-              property: .opacity,
-              kind: .keyframes(keys: [
-                ExtraStyleKeyframe(frame: revealFrame, value: 0, easing: .linear),
-                ExtraStyleKeyframe(frame: min(input.durationFrames, revealFrame + 4), value: 1, easing: .linear),
-              ]),
-              startFrame: revealFrame
-            ),
-          ]
-        ))
-        waveMembers.append(segmentId)
-      }
-      // Centre line for the waveform.
-      let centrePath = CGMutablePath()
-      centrePath.move(to: CGPoint(x: waveLeft, y: waveY))
-      centrePath.addLine(to: CGPoint(x: waveLeft + waveWidth, y: waveY))
-      builder.addChild(ExtraStyleNode(
-        id: "wave-centre", kind: .path,
-        position: .zero, anchor: .zero, zIndex: 0,
-        path: ExtraStylePathContent(
-          path: centrePath,
-          strokeColor: accent.withAlpha(0.3),
-          strokeWidth: 1,
-          dash: [6, 6]
-        )
-      ))
-      waveMembers.append("wave-centre")
-      builder.add(ExtraStyleNode(
-        id: "waveform", kind: .group,
-        children: waveMembers,
-        position: .zero, anchor: .zero,
-        zIndex: 6,
-        tracks: [
-          ExtraStyleTrack(
-            property: .opacity,
-            kind: .reaction(input: .loudness, base: 0.55, gain: 0.45),
-            startFrame: 0
-          ),
-        ]
-      ))
-    }
-
-    let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
-    for (lineIndex, line) in sortedLines.enumerated() {
-      guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
-      let centerY = canvas.height * 0.42
-
-      // Counters: tempo (from the automation) and the line's
-      // word count — the style's primary content is data.
+      // One small data chip under the bars (was two animated
+      // counters floating above the line).
       if showCounters {
         let tempo = automation?.tempoBpm ?? 0
-        let tempoTarget = tempo > 0 ? tempo : 120
-        for node in extraStyleCounterNodes(
-          idPrefix: "bpm-\(lineIndex)", from: 0, to: tempoTarget, steps: 12,
-          startFrame: lineStartFrame, endFrame: lineEndFrame,
-          position: CGPoint(x: canvas.width * 0.32, y: canvas.height * 0.3),
-          sizePoints: canvas.width * 0.055, color: accent,
-          font: ExtraStyleFonts.mono, zIndex: 10,
-          format: { String(format: "%.0f BPM", $0) }
-        ) { builder.add(node) }
-        let wordCount = max(1, line.words.count)
-        for node in extraStyleCounterNodes(
-          idPrefix: "words-\(lineIndex)", from: 0, to: Double(wordCount), steps: wordCount,
-          startFrame: lineStartFrame, endFrame: lineEndFrame,
-          position: CGPoint(x: canvas.width * 0.68, y: canvas.height * 0.3),
-          sizePoints: canvas.width * 0.055, color: accent,
-          font: ExtraStyleFonts.mono, zIndex: 10,
-          format: { String(format: "%.0f WORDS", $0) }
-        ) { builder.add(node) }
+        let tempoText = tempo > 0 ? String(format: "%.0f BPM", tempo) : "— BPM"
+        let tone = (line.tone ?? "neutral").uppercased()
+        builder.add(extraStyleTextNode(
+          id: "chip-\(lineIndex)",
+          text: "\(tone) · \(tempoText) · \(line.words.count) WORDS",
+          font: ExtraStyleFonts.mono, sizePoints: canvas.width * 0.024,
+          color: accent,
+          position: CGPoint(x: canvas.width / 2, y: miniBaselineY + 34),
+          zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
+          colorParamId: "accent",
+          tracks: [extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 12, exitFrames: 12)]
+        ))
       }
 
-      // The line itself, with a data chip underneath.
-      builder.add(extraStyleTextNode(
-        id: "line-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.bold, sizePoints: canvas.width * 0.05,
-        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
-        position: CGPoint(x: canvas.width / 2, y: centerY),
-        zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.88,
-        tracks: [extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame)]
-      ))
-      let tone = (line.tone ?? "neutral").uppercased()
-      builder.add(extraStyleTextNode(
-        id: "chip-\(lineIndex)",
-        text: "\(tone) · \(line.words.count) WORDS",
-        font: ExtraStyleFonts.mono, sizePoints: canvas.width * 0.024,
-        color: accent,
-        position: CGPoint(x: canvas.width / 2, y: centerY + canvas.width * 0.055),
-        zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
-        colorParamId: "accent",
-        tracks: [extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 12, exitFrames: 12)]
-      ))
+      // The line's stored emoji, small, at the line's end.
+      if let emojiNode = extraStyleEmojiNode(
+        id: "emoji-\(lineIndex)", line: line,
+        position: CGPoint(
+          x: min(canvas.width * 0.94, canvas.width / 2 + totalWidth / 2 + sizePoints * 0.8),
+          y: centerY
+        ),
+        sizePoints: sizePoints * 0.9, zIndex: 10,
+        visibleRange: lineStartFrame...lineEndFrame
+      ) {
+        builder.add(emojiNode)
+      }
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }

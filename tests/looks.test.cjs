@@ -118,6 +118,22 @@ test('looks: identity results resolve to null (no filter rides the request)', ()
   assert.equal(resolveLookParams({ presetId: 'vivid', intensity: 0 }), null);
 });
 
+test('looks: Original means no grade even with overrides stored', () => {
+  // Leak C (2026-11-13): overrides were applied as absolute values
+  // after the preset lerp, so a stored Original with overrides
+  // resolved non-null and graded. Original now short-circuits
+  // before overrides are applied.
+  assert.equal(
+    resolveLookParams({ presetId: 'original', intensity: 1, overrides: { saturation: 1.5, temperature: 20 } }),
+    null,
+  );
+  // A non-Original preset with overrides still grades.
+  assert.notEqual(
+    resolveLookParams({ presetId: 'vivid', intensity: 1, overrides: { saturation: 1.5 } }),
+    null,
+  );
+});
+
 test('looks: intensity lerps every param from identity toward the preset', () => {
   const half = resolveLookParams({ presetId: 'vivid', intensity: 0.5 });
   approx(half.saturation, 1 + (1.32 - 1) * 0.5);

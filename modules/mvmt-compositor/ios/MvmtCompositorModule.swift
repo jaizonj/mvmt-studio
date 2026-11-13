@@ -1597,6 +1597,12 @@ private enum MvmtCompositorEngine {
         LookCompositorStore.current = look
         videoComposition.customVideoCompositorClass = LookVideoCompositor.self
       }
+    } else if !forExport {
+      // A no-look / identity preview build must not inherit a stale
+      // grade from an earlier preview build (2026-11-13, Leak D):
+      // the store is only written above, never cleared, so clear it
+      // here — matching the transcode's defer discipline.
+      LookCompositorStore.current = nil
     }
 
     // ---- Optional Extra Style scene (2.0) ----
@@ -1622,6 +1628,11 @@ private enum MvmtCompositorEngine {
           scene: scene, look: slotLook)
         videoComposition.customVideoCompositorClass = ExtraStylesCompositor.self
       }
+    } else if !forExport {
+      // Same stale-slot discipline as the grade above: a preview
+      // build with no resolvable scene must not inherit a previous
+      // build's scene slot.
+      ExtraStyleCompositorStore.current = nil
     }
 
     return BuiltComposition(

@@ -321,15 +321,17 @@ export interface ProjectLyrics {
   favoriteFontIds?: string[];
   favoriteAnimationIds?: string[];
   /**
-   * Active Extra Style template (Styles Redesign Stage 2): the id
-   * of a template in src/lib/lyricTemplates.ts. Undefined = the
-   * classic style — no template, no decor, byte-identical rendering
-   * to before templates existed.
+   * RETIRED v1 Extra Style template id (Jaizon, 2026-11-13). The
+   * field is kept ONLY so the load-time migration can read it:
+   * StudioContext retires a stored id one-shot via
+   * migrateV1Template (2.0 successor or classic) and clears it.
+   * Nothing in the app sets it any more — undefined = classic.
    */
   templateId?: string;
   /**
-   * Extra Styles favorites: template ids hearted in the Extra tab.
-   * Same persistence shape as the font/animation favorites above.
+   * RETIRED v1 Extra Styles favorites: template ids hearted in the
+   * (removed) Extra tab. Kept only so old persisted projects still
+   * typecheck; nothing reads or writes it any more.
    */
   favoriteTemplateIds?: string[];
   /**

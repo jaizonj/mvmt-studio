@@ -9,6 +9,18 @@ import Foundation
 //   - Portal Typography — portal rings, words pass through per phrase.
 //   - Typography Explosion — per-character explosion + spring reassembly.
 //
+// LYRIC-ONLY RE-SCOPE (Phase 4, Jaizon 2026-11-13 ~10:28 MST:
+// "no styles that take up the whole screen just lyrics with cool
+// animations" — the video is the star): every style below is now
+// lyrics with kinetic animation ONLY. Full-screen backgrounds,
+// full-frame displacement warps, tunnel rings, portal glows and
+// full-width ripple paths are gone; what remains is word-attached
+// accents (blobs behind the words, a ring hugging the line,
+// shards bursting from the line) plus word-by-word entrances,
+// emphasis pops from the stored intelligence, and karaoke-style
+// timing. (Typography Physics, the 5th typography style, lives in
+// ExtraStylesDemos.swift — not this file.)
+//
 // Audio flags match the authoritative TS static map
 // (src/lib/extra-styles/catalog.ts, STYLE_CAPABILITY_MAP):
 // Liquid Letters, Infinite Tunnel and Typography Explosion declare
@@ -106,7 +118,6 @@ final class LiquidLettersExtraStyle: ExtraStyleDefinition {
         id: "ripple", label: "Ripple", min: 0, max: 30, step: 1,
         default: 14, affects: "motion"
       ),
-      extraStyleToggleParam(id: "liquidWarp", label: "Liquid warp", default: true, affects: "motion"),
       extraStyleColorParam(id: "accent", label: "Liquid colour", default: "#7DD8FF", affects: "appearance"),
     ]
   }
@@ -130,33 +141,10 @@ final class LiquidLettersExtraStyle: ExtraStyleDefinition {
     let accent = extraStyleColor(extraStyleParamString(input.params, "accent", "#7DD8FF"))
     var builder = ExtraStyleSceneBuilder()
 
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.05, g: 0.09, b: 0.13, a: 1),
-        ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
-    // Full-frame liquid warp: the CIDisplacementDistortion scale
-    // follows the loudness curve DIRECTLY (automation is
-    // guaranteed for this style — no missing-automation fallback).
-    // Base 0, so the warp is fully off when the toggle disables
-    // the track (a disabled reaction track contributes its base).
-    builder.add(ExtraStyleNode(
-      id: "liquid-warp", kind: .displacement,
-      position: .zero, anchor: .zero, zIndex: 1,
-      displacement: ExtraStyleDisplacementContent(baseScale: 0, frequency: 3),
-      tracks: [
-        ExtraStyleTrack(
-          property: .scale,
-          kind: .reaction(input: .loudness, base: 0, gain: 12),
-          startFrame: 0,
-          enabledParamId: "liquidWarp"
-        ),
-      ]
-    ))
+    // LYRIC-ONLY: no background wash, no full-frame displacement
+    // warp (it distorted the video itself, not just the text).
+    // The liquid lives in the words: blobs behind the line,
+    // rippling words, and a ripple stroke under the line.
 
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     let sizePoints = canvas.width * 0.075
@@ -238,20 +226,27 @@ final class LiquidLettersExtraStyle: ExtraStyleDefinition {
         guard wordEndFrame > startFrame else { continue }
         let relX = cursorX + wordWidth / 2 - totalWidth / 2
         let midFrame = startFrame + (wordEndFrame - startFrame) / 2
+        // Emphasis pop (stored intelligence): an emphasized word
+        // stretches further and renders in the line's tone colour
+        // instead of the accent.
+        let isEmphasis = line.emphasisWordIndices.contains(index)
         var scaleKeys: [ExtraStyleKeyframe] = []
         typographyAppendKeyframe(&scaleKeys, frame: startFrame, value: 1, easing: .easeInOutSine)
-        typographyAppendKeyframe(&scaleKeys, frame: midFrame, value: 1.16, easing: .easeInOutSine)
+        typographyAppendKeyframe(&scaleKeys, frame: midFrame, value: isEmphasis ? 1.3 : 1.16, easing: .easeInOutSine)
         typographyAppendKeyframe(&scaleKeys, frame: wordEndFrame, value: 1, easing: .easeInOutSine)
         var mergeKeys: [ExtraStyleKeyframe] = []
         typographyAppendKeyframe(&mergeKeys, frame: startFrame, value: Double(relX) * 0.15, easing: .easeOutCubic)
         typographyAppendKeyframe(&mergeKeys, frame: min(wordEndFrame, startFrame + 18), value: 0, easing: .easeOutCubic)
         builder.addChild(extraStyleTextNode(
           id: "liquid-word-\(lineIndex)-\(index)",
-          text: wordText, font: font, sizePoints: sizePoints, color: accent,
+          text: wordText, font: font, sizePoints: sizePoints,
+          color: isEmphasis ? toneColor : accent,
           position: CGPoint(x: relX, y: 0),
           zIndex: 2,
           visibleRange: startFrame...wordEndFrame,
-          colorParamId: "accent",
+          strokeColor: ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9),
+          strokeWidthPoints: 2,
+          colorParamId: isEmphasis ? nil : "accent",
           tracks: [
             // Sine ripple along the line; the loop's period is
             // re-timed by flowSpeed, and each word is phase-shifted
@@ -311,17 +306,21 @@ final class LiquidLettersExtraStyle: ExtraStyleDefinition {
         ]
       ))
 
-      // Ripple path under the line: a sine stroke in the line's
-      // tone colour, bobbing on the same flow loop.
+      // Ripple stroke under the line — the width of the lyric
+      // line only (was full canvas width), in the line's tone
+      // colour, bobbing on the same flow loop.
       let ripplePath: CGPath = {
         let path = CGMutablePath()
-        var x: CGFloat = 0
+        let leftX = canvas.width / 2 - totalWidth / 2
+        let rightX = canvas.width / 2 + totalWidth / 2
+        var x: CGFloat = leftX
         var first = true
-        while x <= canvas.width {
-          let y = centerY + sin(x / canvas.width * .pi * 6) * 26
+        while x <= rightX {
+          let t = (x - leftX) / max(1, rightX - leftX)
+          let y = centerY + sizePoints * 1.15 + sin(t * .pi * 4) * 8
           if first { path.move(to: CGPoint(x: x, y: y)); first = false }
           else { path.addLine(to: CGPoint(x: x, y: y)) }
-          x += 32
+          x += 16
         }
         return path
       }()
@@ -359,7 +358,7 @@ final class InfiniteTunnelExtraStyle: ExtraStyleDefinition {
   let id = "infinite-tunnel"
   let version = 1
   let name = "Infinite Tunnel"
-  let tagline = "Lyrics rush toward you down an endless tunnel."
+  let tagline = "Words fly toward you, one by one, out of the dark."
   let category = "typography"
   let needsAudioAutomation = true
   let needsSubjectMasks = false
@@ -368,119 +367,41 @@ final class InfiniteTunnelExtraStyle: ExtraStyleDefinition {
   var parameters: [[String: Any]] {
     [
       extraStyleSliderParam(
-        id: "speed", label: "Tunnel speed", min: 0.25, max: 2, step: 0.05,
+        id: "speed", label: "Flight speed", min: 0.25, max: 2, step: 0.05,
         default: 1, affects: "motion"
       ),
-      extraStyleNumberParam(
-        id: "rings", label: "Rings", min: 4, max: 12, step: 1,
-        default: 8, affects: "layout"
-      ),
-      extraStyleColorParam(id: "accent", label: "Tunnel colour", default: "#C9F36B", affects: "appearance"),
-      extraStyleSliderParam(
-        id: "glow", label: "Glow", min: 0, max: 1, step: 0.05,
-        default: 0.6, affects: "appearance"
-      ),
+      extraStyleColorParam(id: "accent", label: "Emphasis colour", default: "#C9F36B", affects: "appearance"),
     ]
   }
 
   var presets: [[String: Any]] {
     [
-      ["id": "slow-dive", "label": "Slow dive", "values": ["speed": 0.6, "rings": 6]],
-      ["id": "warp", "label": "Warp", "values": ["speed": 1.8, "rings": 10]],
+      ["id": "slow-dive", "label": "Slow dive", "values": ["speed": 0.6]],
+      ["id": "warp", "label": "Warp", "values": ["speed": 1.8]],
     ]
   }
 
-  var inputs: [String] { ["lines", "audio"] }
+  var inputs: [String] { ["lines", "words", "audio", "intelligence"] }
 
-  /// Ring count changes the node count.
-  var rebuildParamIds: [String] { ["rings"] }
+  /// Flight speed re-times the fly-in at build time; no param
+  /// changes the node count anymore.
+  var rebuildParamIds: [String] { [] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
     let fps = input.fps > 0 ? input.fps : 30
     var builder = ExtraStyleSceneBuilder()
 
-    // Tunnel speed follows the tempo DIRECTLY: one ring cycle is
-    // four beats, baked into the loop period at build time from
-    // input.automation.tempoBpm (automation is guaranteed for
-    // this style). No automation / no tempo → 120 BPM default.
-    // The speed param re-times the baked period with no rebuild.
-    let cycleFrames: Int = {
-      guard let automation = input.automation, automation.tempoBpm > 0 else { return 60 }
-      let frames = 4 * 60 / automation.tempoBpm * fps
-      return max(24, min(180, Int(frames.rounded())))
-    }()
-    let ringCount = max(4, min(12, Int(extraStyleParamDouble(input.params, "rings", 8).rounded())))
+    // LYRIC-ONLY: no background, no concentric tunnel rings, no
+    // centre glow. The tunnel is now a depth path for the words
+    // themselves: each word flies toward the viewer — small/far
+    // at its sung start, overshooting to full size, then
+    // settling — with the beat/onset pulse on top.
     let accent = extraStyleColor(extraStyleParamString(input.params, "accent", "#C9F36B"))
-    let ringCenter = CGPoint(x: canvas.width / 2, y: canvas.height * 0.45)
-    let ringBase: CGFloat = canvas.width * 0.30
-
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.07, g: 0.08, b: 0.1, a: 1),
-        ExtraStyleRGBA(r: 0.01, g: 0.01, b: 0.02, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
-    // Concentric rings, continuous forward motion: each ring loops
-    // small → large with an opacity envelope (fade in far away,
-    // fade out as it passes the viewer), staggered by 1/N cycle
-    // so the tunnel never empties.
-    for ring in 0..<ringCount {
-      let stagger = cycleFrames * ring / ringCount
-      builder.add(extraStyleShapeNode(
-        id: "tunnel-ring-\(ring)",
-        shape: extraStyleEllipseShape(width: ringBase, height: ringBase),
-        fill: nil,
-        stroke: accent.withAlpha(0.75), strokeWidth: 3,
-        position: ringCenter, zIndex: 2,
-        tracks: [
-          ExtraStyleTrack(
-            property: .scale,
-            kind: .loop(periodFrames: cycleFrames, periodParamId: "speed", keys: [
-              ExtraStyleKeyframe(frame: 0, value: 0.15, easing: .linear),
-              ExtraStyleKeyframe(frame: cycleFrames, value: 2.4, easing: .linear),
-            ]),
-            startFrame: stagger
-          ),
-          ExtraStyleTrack(
-            property: .opacity,
-            kind: .loop(periodFrames: cycleFrames, periodParamId: "speed", keys: [
-              ExtraStyleKeyframe(frame: 0, value: 0, easing: .linear),
-              ExtraStyleKeyframe(frame: max(1, cycleFrames / 6), value: 0.9, easing: .easeOutCubic),
-              ExtraStyleKeyframe(frame: max(1, cycleFrames * 4 / 5), value: 0.9, easing: .linear),
-              ExtraStyleKeyframe(frame: cycleFrames, value: 0, easing: .easeInCubic),
-            ]),
-            startFrame: stagger
-          ),
-        ]
-      ))
-    }
-
-    // Centre glow, breathing with loudness (scaled by the glow param).
-    builder.add(ExtraStyleNode(
-      id: "tunnel-glow", kind: .gradient,
-      position: CGPoint(x: canvas.width / 2, y: canvas.height / 2),
-      anchor: CGPoint(x: 0.5, y: 0.5),
-      zIndex: 3,
-      gradient: ExtraStyleGradientContent(
-        kind: .radial(center: ringCenter, radius: max(canvas.width, canvas.height) * 0.5),
-        colors: [accent.withAlpha(0.28), accent.withAlpha(0)],
-        colorParamIds: ["accent", "accent"],
-        locations: [0, 1],
-        rect: CGRect(origin: .zero, size: canvas)
-      ),
-      tracks: [
-        ExtraStyleTrack(
-          property: .opacity,
-          kind: .reaction(input: .loudness, base: 0.25, gain: 0.5),
-          startFrame: 0,
-          paramScale: "glow"
-        ),
-      ]
-    ))
+    let speed = max(0.25, min(2, extraStyleParamDouble(input.params, "speed", 1)))
+    let flyFrames = max(8, min(28, Int((16 / speed).rounded())))
+    let ink = ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9)
+    let warmWhite = ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1)
 
     // Beat-confidence gate (the only fallback): a confident beat
     // grid pulses the text on beat phase; below 0.5 confidence
@@ -493,55 +414,82 @@ final class InfiniteTunnelExtraStyle: ExtraStyleDefinition {
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
       let sizePoints = canvas.width * 0.075
-      // Far copy of the line, half a cycle out of phase and dim —
-      // depth via scale + opacity, the second depth layer.
-      builder.add(extraStyleTextNode(
-        id: "tunnel-ghost-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.black, sizePoints: sizePoints * 0.85,
-        color: accent.withAlpha(0.45),
-        position: ringCenter,
-        zIndex: 9, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.88,
-        tracks: [
-          extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame, enterFrames: 12, exitFrames: 12),
+      let centerY = canvas.height * 0.5
+
+      let wordNodes = extraStyleWordNodes(
+        line: line, lineIndex: lineIndex, fps: fps,
+        lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
+        y: centerY, sizePoints: sizePoints,
+        color: warmWhite,
+        font: ExtraStyleFonts.black, zIndex: 10, canvasWidth: canvas.width
+      ) { _, wordStart, wordEnd in
+        var scaleKeys: [ExtraStyleKeyframe] = []
+        let settleFrame = min(wordEnd, wordStart + flyFrames)
+        typographyAppendKeyframe(&scaleKeys, frame: wordStart, value: 0.5, easing: .easeOutCubic)
+        typographyAppendKeyframe(&scaleKeys, frame: settleFrame, value: 1.12, easing: .easeOutCubic)
+        typographyAppendKeyframe(&scaleKeys, frame: min(wordEnd, settleFrame + 8), value: 1, easing: .easeInOutSine)
+        return [
           ExtraStyleTrack(
             property: .scale,
-            kind: .loop(periodFrames: cycleFrames, periodParamId: "speed", keys: [
-              ExtraStyleKeyframe(frame: 0, value: 0.55, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: cycleFrames / 2, value: 0.8, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: cycleFrames, value: 0.55, easing: .easeInOutSine),
-            ]),
-            startFrame: lineStartFrame + cycleFrames / 2
+            kind: .keyframes(keys: scaleKeys),
+            startFrame: wordStart
           ),
+          ExtraStyleTrack(
+            property: .scale,
+            kind: .reaction(input: pulseInput, base: 1, gain: 0.12),
+            startFrame: wordStart
+          ),
+          extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd, enterFrames: 6, exitFrames: 6),
         ]
-      ))
-      // The line itself, rushing toward the viewer on the same
-      // cycle, with the beat/onset pulse on top.
-      builder.add(extraStyleTextNode(
-        id: "tunnel-line-\(lineIndex)",
-        text: line.text, font: ExtraStyleFonts.black, sizePoints: sizePoints,
-        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
-        position: ringCenter,
-        zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
-        maxWidthPoints: canvas.width * 0.88,
-        tracks: [
-          extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame),
-          ExtraStyleTrack(
-            property: .scale,
-            kind: .loop(periodFrames: cycleFrames, periodParamId: "speed", keys: [
-              ExtraStyleKeyframe(frame: 0, value: 0.9, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: cycleFrames / 2, value: 1.12, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: cycleFrames, value: 0.9, easing: .easeInOutSine),
-            ]),
-            startFrame: lineStartFrame
-          ),
-          ExtraStyleTrack(
-            property: .scale,
-            kind: .reaction(input: pulseInput, base: 1, gain: 0.18),
-            startFrame: lineStartFrame
-          ),
-        ]
-      ))
+      }
+      if wordNodes.isEmpty {
+        // No word timings: the whole line flies in as one.
+        var scaleKeys: [ExtraStyleKeyframe] = []
+        let settleFrame = min(lineEndFrame, lineStartFrame + flyFrames)
+        typographyAppendKeyframe(&scaleKeys, frame: lineStartFrame, value: 0.5, easing: .easeOutCubic)
+        typographyAppendKeyframe(&scaleKeys, frame: settleFrame, value: 1.12, easing: .easeOutCubic)
+        typographyAppendKeyframe(&scaleKeys, frame: min(lineEndFrame, settleFrame + 8), value: 1, easing: .easeInOutSine)
+        builder.add(extraStyleTextNode(
+          id: "tunnel-line-\(lineIndex)",
+          text: line.text, font: ExtraStyleFonts.black, sizePoints: sizePoints,
+          color: warmWhite,
+          position: CGPoint(x: canvas.width / 2, y: centerY),
+          zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
+          maxWidthPoints: canvas.width * 0.88,
+          strokeColor: ink, strokeWidthPoints: 2,
+          tracks: [
+            ExtraStyleTrack(
+              property: .scale,
+              kind: .keyframes(keys: scaleKeys),
+              startFrame: lineStartFrame
+            ),
+            ExtraStyleTrack(
+              property: .scale,
+              kind: .reaction(input: pulseInput, base: 1, gain: 0.12),
+              startFrame: lineStartFrame
+            ),
+            extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame),
+          ]
+        ))
+        continue
+      }
+      // Legibility + emphasis: every word gets a dark outline;
+      // an emphasized word (stored intelligence) renders larger
+      // and in the accent colour. The word index comes from the
+      // node id ("word-<line>-<index>") because the helper skips
+      // zero-length words, so array position is not the index.
+      for wordNode in wordNodes {
+        var node = wordNode
+        node.text?.strokeColor = ink
+        node.text?.strokeWidthPoints = 2
+        let wordIndex = node.id.split(separator: "-").last.flatMap { Int($0) } ?? -1
+        if line.emphasisWordIndices.contains(wordIndex) {
+          node.text?.color = accent
+          node.text?.colorParamId = "accent"
+          if let size = node.text?.sizePoints { node.text?.sizePoints = size * 1.15 }
+        }
+        builder.add(node)
+      }
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }
@@ -553,7 +501,7 @@ final class PortalTypographyExtraStyle: ExtraStyleDefinition {
   let id = "portal-typography"
   let version = 1
   let name = "Portal Typography"
-  let tagline = "Every phrase opens a portal — words pass through."
+  let tagline = "Words emerge through a small ring around the line."
   let category = "typography"
   let needsAudioAutomation = false
   let needsSubjectMasks = false
@@ -561,118 +509,79 @@ final class PortalTypographyExtraStyle: ExtraStyleDefinition {
 
   var parameters: [[String: Any]] {
     [
-      extraStyleColorParam(id: "accent", label: "Portal colour", default: "#7DF9FF", affects: "appearance"),
-      extraStyleSliderParam(
-        id: "portalSize", label: "Portal size", min: 0.6, max: 1.6, step: 0.05,
-        default: 1, affects: "layout"
-      ),
+      extraStyleColorParam(id: "accent", label: "Ring colour", default: "#7DF9FF", affects: "appearance"),
       extraStyleToggleParam(id: "spin", label: "Orbit spin", default: true, affects: "motion"),
-      extraStyleSliderParam(
-        id: "glow", label: "Glow", min: 0, max: 1, step: 0.05,
-        default: 0.7, affects: "appearance"
-      ),
     ]
   }
 
   var presets: [[String: Any]] {
     [
-      ["id": "grand", "label": "Grand", "values": ["portalSize": 1.4, "glow": 1]],
-      ["id": "quiet", "label": "Quiet", "values": ["portalSize": 0.8, "glow": 0.4, "spin": false]],
+      ["id": "grand", "label": "Grand", "values": ["spin": true]],
+      ["id": "quiet", "label": "Quiet", "values": ["spin": false]],
     ]
   }
 
   var inputs: [String] { ["lines", "words", "phrases", "intelligence"] }
 
-  /// Portal size is baked into ring geometry.
-  var rebuildParamIds: [String] { ["portalSize"] }
+  /// The ring is sized from the measured lyric line at build
+  /// time; no param changes the node count anymore.
+  var rebuildParamIds: [String] { [] }
 
   func buildScene(input: ExtraStyleBuildInput) -> ExtraStyleScene {
     let canvas = input.canvas
     let fps = input.fps > 0 ? input.fps : 30
-    let portalSize = extraStyleParamDouble(input.params, "portalSize", 1)
     let accent = extraStyleColor(extraStyleParamString(input.params, "accent", "#7DF9FF"))
     var builder = ExtraStyleSceneBuilder()
 
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.04, g: 0.05, b: 0.09, a: 1),
-        ExtraStyleRGBA(r: 0.01, g: 0.01, b: 0.02, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
-
-    // Phrase boundaries: each line IS a phrase here, and each
-    // phrase opens its own portal.
+    // LYRIC-ONLY: no background, no full-frame tone glow, no
+    // disc, no cross-frame word flight. The portal is now a
+    // small ring accent hugging the lyric line: it springs open
+    // at the line start, a dashed orbit ellipse turns around it,
+    // and the words spring out of it at their sung starts.
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     for (lineIndex, line) in sortedLines.enumerated() {
       guard let (lineStartFrame, lineEndFrame) = extraStyleLineFrames(line, fps: fps, durationFrames: input.durationFrames) else { continue }
-      let toneColor = extraStyleToneColor(line.tone)
-      let radius = canvas.width * 0.26 * CGFloat(portalSize)
-      let center = CGPoint(x: canvas.width / 2, y: canvas.height * 0.45)
+      let sizePoints = canvas.width * 0.058
+      let centerY = canvas.height * 0.5
+      let center = CGPoint(x: canvas.width / 2, y: centerY)
+      let ink = ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9)
+      let warmWhite = ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1)
 
-      // Environment gradient behind the portal, in the line's tone.
-      builder.add(ExtraStyleNode(
-        id: "portal-glow-\(lineIndex)", kind: .gradient,
-        position: CGPoint(x: canvas.width / 2, y: canvas.height / 2),
-        anchor: CGPoint(x: 0.5, y: 0.5),
-        zIndex: 4,
-        visibleRange: lineStartFrame...lineEndFrame,
-        gradient: ExtraStyleGradientContent(
-          kind: .radial(center: center, radius: radius * 2.4),
-          colors: [toneColor.withAlpha(0.5), toneColor.withAlpha(0)],
-          locations: [0, 1],
-          rect: CGRect(origin: .zero, size: canvas)
-        ),
-        tracks: [
-          ExtraStyleTrack(
-            property: .opacity,
-            kind: .keyframes(keys: [ExtraStyleKeyframe(frame: 0, value: 1, easing: .linear)]),
-            startFrame: 0,
-            paramScale: "glow"
-          ),
-          extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame),
-        ]
-      ))
+      // Measured line width — the ring hugs the lyric line.
+      let lineWidth: CGFloat = {
+        let font = ExtraStyleFonts.bold
+        if line.words.isEmpty {
+          return extraStyleTextWidth(line.text, fontPostScriptName: font, sizePoints: sizePoints)
+        }
+        let space = extraStyleTextWidth(" ", fontPostScriptName: font, sizePoints: sizePoints)
+        return line.words.map {
+          extraStyleTextWidth($0.text, fontPostScriptName: font, sizePoints: sizePoints)
+        }.reduce(0, +) + space * CGFloat(max(0, line.words.count - 1))
+      }()
+      let ringWidth = min(canvas.width * 0.92, lineWidth + sizePoints * 1.8)
+      let ringHeight = sizePoints * 2.7
 
-      // Portal rings (group): spring open on the phrase start.
+      // Ring + spark (group): spring open on the line start.
       // Members are group children (addChild) — they move/scale
-      // with the portal and are evaluated exactly once.
+      // with the ring and are evaluated exactly once.
       var members: [String] = []
-      let outerId = "portal-outer-\(lineIndex)"
+      let ringId = "portal-ring-\(lineIndex)"
       builder.addChild(extraStyleShapeNode(
-        id: outerId,
-        shape: extraStyleEllipseShape(width: radius * 2, height: radius * 2),
+        id: ringId,
+        shape: extraStyleEllipseShape(width: ringWidth, height: ringHeight),
         fill: nil,
-        stroke: accent, strokeWidth: 6,
+        stroke: accent, strokeWidth: 4,
         position: .zero, zIndex: 1
       ))
-      members.append(outerId)
-      let midId = "portal-mid-\(lineIndex)"
-      builder.addChild(extraStyleShapeNode(
-        id: midId,
-        shape: extraStyleEllipseShape(width: radius * 1.4, height: radius * 1.4),
-        fill: nil,
-        stroke: accent.withAlpha(0.6), strokeWidth: 3,
-        position: .zero, zIndex: 1
-      ))
-      members.append(midId)
-      let discId = "portal-disc-\(lineIndex)"
-      builder.addChild(extraStyleShapeNode(
-        id: discId,
-        shape: extraStyleEllipseShape(width: radius * 0.84, height: radius * 0.84),
-        fill: accent.withAlpha(0.12),
-        position: .zero, zIndex: 0
-      ))
-      members.append(discId)
+      members.append(ringId)
       let sparkId = "portal-spark-\(lineIndex)"
       builder.addChild(ExtraStyleNode(
         id: sparkId, kind: .shape,
-        position: CGPoint(x: radius * 0.62, y: -radius * 0.62),
+        position: CGPoint(x: ringWidth / 2 * 0.85, y: -ringHeight / 2 * 0.85),
         anchor: CGPoint(x: 0.5, y: 0.5),
         zIndex: 2,
         shape: ExtraStyleShapeContent(
-          shape: extraStyleStarShape(outerRadius: 20, innerRadius: 8, spikes: 4),
+          shape: extraStyleStarShape(outerRadius: 14, innerRadius: 6, spikes: 4),
           fill: ExtraStyleRGBA(r: 1, g: 1, b: 1, a: 1),
           stroke: nil, strokeWidth: 0
         ),
@@ -691,12 +600,12 @@ final class PortalTypographyExtraStyle: ExtraStyleDefinition {
         ]
       ))
 
-      // Dashed orbit ring around the portal, rotating on a loop.
+      // Dashed orbit ellipse around the ring, rotating on a loop.
       // The path lives in positive local space so the anchor
-      // centres it on the portal and the rotation pivots there.
+      // centres it on the line and the rotation pivots there.
       let orbitPath: CGPath = {
         let path = CGMutablePath()
-        path.addEllipse(in: CGRect(x: 0, y: 0, width: radius * 2.3, height: radius * 2.3))
+        path.addEllipse(in: CGRect(x: 0, y: 0, width: ringWidth * 1.1, height: ringHeight * 1.45))
         return path
       }()
       builder.add(ExtraStyleNode(
@@ -724,61 +633,63 @@ final class PortalTypographyExtraStyle: ExtraStyleDefinition {
         ]
       ))
 
-      // The line's stored emoji, when it has one, rides in the
-      // portal as it opens (unconditional helper — nil only when
+      // The line's stored emoji, when it has one, rides at the
+      // line's end, small (unconditional helper — nil only when
       // the line genuinely has no stored emoji).
       if let hero = extraStyleEmojiNode(
         id: "portal-emoji-\(lineIndex)", line: line,
-        position: center, sizePoints: radius * 0.55, zIndex: 7,
+        position: CGPoint(
+          x: min(canvas.width * 0.94, center.x + ringWidth / 2 + sizePoints * 0.8),
+          y: centerY
+        ),
+        sizePoints: sizePoints * 0.9, zIndex: 7,
         visibleRange: lineStartFrame...lineEndFrame
       ) {
         builder.add(hero)
       }
 
-      // Words pass THROUGH the portal: a .path track on positionX
-      // (the only property path tracks drive — absolute canvas
-      // points) carries each word across the frame on an arc over
-      // the portal centre, shrinking to 0.35× at the centre as if
-      // swallowed, then growing back out the other side.
+      // Words emerge through the ring: spring in from small at
+      // their sung start and settle on the line.
       let wordNodes = extraStyleWordNodes(
         line: line, lineIndex: lineIndex, fps: fps,
         lineStartFrame: lineStartFrame, lineEndFrame: lineEndFrame,
-        y: center.y, sizePoints: canvas.width * 0.058,
-        color: ExtraStyleRGBA(r: 0.957, g: 0.945, b: 0.914, a: 1),
+        y: centerY, sizePoints: sizePoints,
+        color: warmWhite,
         font: ExtraStyleFonts.bold, zIndex: 10, canvasWidth: canvas.width
       ) { _, wordStart, wordEnd in
-        let span = wordEnd - wordStart
-        guard span >= 8 else {
-          return [extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd, enterFrames: 4, exitFrames: 4)]
-        }
-        var points: [CGPoint] = []
-        let steps = 8
-        for step in 0...steps {
-          let t = Double(step) / Double(steps)
-          let x = -80 + (Double(canvas.width) + 160) * t
-          let y = Double(center.y) + sin(t * Double.pi) * -46
-          points.append(CGPoint(x: x, y: y))
-        }
-        let mid = wordStart + span / 2
-        return [
-          ExtraStyleTrack(
-            property: .positionX,
-            kind: .path(points: points, durationFrames: span, easing: .easeInOutSine),
-            startFrame: wordStart
-          ),
-          ExtraStyleTrack(
-            property: .scale,
-            kind: .keyframes(keys: [
-              ExtraStyleKeyframe(frame: wordStart, value: 1, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: mid, value: 0.35, easing: .easeInOutSine),
-              ExtraStyleKeyframe(frame: wordEnd, value: 1, easing: .easeInOutSine),
-            ]),
-            startFrame: wordStart
-          ),
+        [
+          extraStyleSpringInTrack(start: wordStart, from: 0.35, stiffness: 160, damping: 11),
           extraStyleEnterExitOpacityTrack(start: wordStart, end: wordEnd, enterFrames: 4, exitFrames: 4),
         ]
       }
-      for word in wordNodes { builder.add(word) }
+      if wordNodes.isEmpty {
+        builder.add(extraStyleTextNode(
+          id: "portal-line-\(lineIndex)",
+          text: line.text, font: ExtraStyleFonts.bold, sizePoints: sizePoints,
+          color: warmWhite,
+          position: center,
+          zIndex: 10, visibleRange: lineStartFrame...lineEndFrame,
+          maxWidthPoints: canvas.width * 0.88,
+          strokeColor: ink, strokeWidthPoints: 2,
+          tracks: [
+            extraStyleSpringInTrack(start: lineStartFrame, from: 0.35, stiffness: 160, damping: 11),
+            extraStyleEnterExitOpacityTrack(start: lineStartFrame, end: lineEndFrame),
+          ]
+        ))
+        continue
+      }
+      for wordNode in wordNodes {
+        var node = wordNode
+        node.text?.strokeColor = ink
+        node.text?.strokeWidthPoints = 2
+        let wordIndex = node.id.split(separator: "-").last.flatMap { Int($0) } ?? -1
+        if line.emphasisWordIndices.contains(wordIndex) {
+          node.text?.color = accent
+          node.text?.colorParamId = "accent"
+          if let size = node.text?.sizePoints { node.text?.sizePoints = size * 1.15 }
+        }
+        builder.add(node)
+      }
     }
     return builder.build(canvas: canvas, durationFrames: input.durationFrames)
   }
@@ -860,14 +771,10 @@ final class TypographyExplosionExtraStyle: ExtraStyleDefinition {
     let shardCount = max(0, min(16, Int(extraStyleParamDouble(input.params, "shards", 8).rounded())))
     var builder = ExtraStyleSceneBuilder()
 
-    builder.add(extraStyleBackgroundGradientNode(
-      id: "background", canvas: canvas,
-      colors: [
-        ExtraStyleRGBA(r: 0.08, g: 0.06, b: 0.07, a: 1),
-        ExtraStyleRGBA(r: 0.01, g: 0.01, b: 0.02, a: 1),
-      ],
-      locations: [0, 1], zIndex: 0
-    ))
+    // LYRIC-ONLY: no background wash. The explosion is the
+    // letters themselves, plus small shards bursting from the
+    // line and fading — debris attached to the words, not a
+    // full-screen effect.
 
     let sortedLines = input.lines.sorted { $0.startSeconds < $1.startSeconds }
     let sizePoints = canvas.width * 0.08
@@ -880,6 +787,32 @@ final class TypographyExplosionExtraStyle: ExtraStyleDefinition {
         automation: input.automation
       )
       let onsetAtTrigger = input.automation?.onset(at: Double(trigger) / fps) ?? 0.5
+
+      // Which character indices belong to emphasized words
+      // (stored intelligence): those letters fly 1.4× further.
+      // Words are found in order in the line text, so the
+      // mapping survives repeated words.
+      let emphasisCharIndices: Set<Int> = {
+        var indices = Set<Int>()
+        let chars = Array(line.text)
+        var cursor = 0
+        for (wordIndex, word) in line.words.enumerated()
+        where line.emphasisWordIndices.contains(wordIndex) {
+          let wordChars = Array(word.text)
+          guard !wordChars.isEmpty else { continue }
+          var found: Int? = nil
+          var i = cursor
+          while i + wordChars.count <= chars.count {
+            if Array(chars[i..<(i + wordChars.count)]) == wordChars { found = i; break }
+            i += 1
+          }
+          if let start = found {
+            for j in start..<(start + wordChars.count) { indices.insert(j) }
+            cursor = start + wordChars.count
+          }
+        }
+        return indices
+      }()
 
       // Per-character explosion: each char flies out on a seeded
       // radial velocity from the accent frame (staggered 2 frames
@@ -902,6 +835,7 @@ final class TypographyExplosionExtraStyle: ExtraStyleDefinition {
           ^ (UInt64(index + 1) &* 0xbf58_476d_1ce4_e5b9))
         let angle = random.nextRange(min: 0, max: 2 * Double.pi)
         let distance = (70 + random.nextDouble() * 130) * force * (0.7 + 0.3 * onsetAtTrigger)
+          * (emphasisCharIndices.contains(index) ? 1.4 : 1)
         let dx = cos(angle) * distance
         let dy = sin(angle) * distance * 0.8
         let rotation = random.nextRange(min: -42, max: 42)
@@ -938,21 +872,28 @@ final class TypographyExplosionExtraStyle: ExtraStyleDefinition {
           ),
         ]
       }
-      for char in chars { builder.add(char) }
+      for char in chars {
+        var stroked = char
+        stroked.text?.strokeColor = ExtraStyleRGBA(r: 0.02, g: 0.02, b: 0.03, a: 0.9)
+        stroked.text?.strokeWidthPoints = 2
+        builder.add(stroked)
+      }
 
-      // Shards: procedural triangles that burst from the line
-      // centre at the same accent frame, spin, and fade.
+      // Shards: small procedural triangles that burst from the
+      // line centre at the same accent frame, spin, and fade.
+      // Kept close to the line (short flight, small size) so
+      // they read as debris from the words, not scenery.
       let shardEnd = min(lineEndFrame, trigger + 52)
       for shard in 0..<shardCount {
         var random = ExtraStyleSeededRandom(seed: input.seed
           ^ (UInt64(lineIndex + 1) &* 0x9e37_79b9_7f4a_7c15)
           ^ (UInt64(shard + 1) &* 0x94d0_49bb_1331_11eb))
         let angle = random.nextRange(min: 0, max: 2 * Double.pi)
-        let distance = (120 + random.nextDouble() * 180) * force * (0.7 + 0.3 * onsetAtTrigger)
+        let distance = (60 + random.nextDouble() * 90) * force * (0.7 + 0.3 * onsetAtTrigger)
         let dx = cos(angle) * distance
         let dy = sin(angle) * distance * 0.8
         let spin = random.nextRange(min: -260, max: 260)
-        let shardSize = CGFloat(18 + random.nextDouble() * 16)
+        let shardSize = CGFloat(12 + random.nextDouble() * 10)
         let shardId = "shard-\(lineIndex)-\(shard)"
         var opacityKeys: [ExtraStyleKeyframe] = []
         typographyAppendKeyframe(&opacityKeys, frame: trigger, value: 0, easing: .linear)

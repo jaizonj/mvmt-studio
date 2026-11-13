@@ -2485,6 +2485,27 @@ final class ExtraStyleSceneRenderer {
       ? (layout.totalHeight - layout.metrics.reduce(0) { $0 + $1.ascent + $1.descent })
         / CGFloat(layout.lines.count - 1)
       : 0
+    // TEXT MATRIX (mirrored-lyrics fix): Core Text glyphs live in
+    // the font's y-up space, but this context is y-flipped
+    // (mainContext/tempContext: translate + scale(1, -1)) so scene
+    // coordinates are y-down. With the default identity text
+    // matrix, CTLineDraw therefore draws every glyph upside-down
+    // — a pure vertical flip: word order stays left-to-right, but
+    // each glyph is mirrored top-to-bottom (on device: "I just
+    // popped out with this" rendered as vertically flipped
+    // glyphs). Flipping the TEXT matrix (1, -1) cancels the CTM's
+    // y-flip for the glyphs only: textMatrix x CTM is
+    // orientation-preserving, font-up maps to screen-up, advances
+    // stay left-to-right, and the baseline (y + ascent) is
+    // unchanged — the flip pivots on the text position, so the
+    // ascender top now lands exactly at the top of the line box.
+    // Shapes, images and particles are drawn in user space and
+    // are unaffected, so this is set only here, around the text
+    // draw. This is the single text path for every style (line /
+    // word / char / counter / emoji nodes all route through
+    // drawText), so it fixes preview, export and card previews
+    // together.
+    context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
     var y: CGFloat = 0 // Top of the text block in local space.
     for (index, line) in layout.lines.enumerated() {
       let metric = layout.metrics[index]
@@ -2504,6 +2525,7 @@ final class ExtraStyleSceneRenderer {
       CTLineDraw(line, context)
       y += metric.ascent + metric.descent + leading
     }
+    context.textMatrix = .identity
   }
 
   private func shapePath(_ shape: ExtraStyleShapeContent) -> CGPath? {
