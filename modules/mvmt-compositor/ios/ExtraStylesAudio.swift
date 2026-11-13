@@ -349,7 +349,7 @@ enum ExtraStylesAudio {
       real.withUnsafeMutableBufferPointer { realPointer in
         imag.withUnsafeMutableBufferPointer { imagPointer in
           var split = DSPSplitComplex(realp: realPointer.baseAddress!, imagp: imagPointer.baseAddress!)
-          vDSP_fft_zrip(setup, &split, 1, log2n, FFT_FORWARD)
+          vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
           magnitudes.withUnsafeMutableBufferPointer { magnitudePointer in
             vDSP_zvabs(&split, 1, magnitudePointer.baseAddress!, 1, vDSP_Length(windowSize / 2 + 1))
           }

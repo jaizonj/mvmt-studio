@@ -154,10 +154,8 @@ enum ExtraStylesMasks {
     } catch {
       return (nil, [])
     }
-    guard
-      let observation = segmentation.results?.first,
-      let pixelBuffer = observation.pixelBuffer
-    else { return (nil, []) }
+    guard let observation = segmentation.results?.first else { return (nil, []) }
+    let pixelBuffer = observation.pixelBuffer
     // Mask → 270×480 grayscale PNG (aspect-fit, centred; the
     // canvas is portrait 9:16 and takes conform to it, so the fit
     // is exact for normal takes).

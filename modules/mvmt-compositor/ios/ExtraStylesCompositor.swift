@@ -507,12 +507,11 @@ enum ExtraStyleEasing {
       return sin((x * Double.pi) / 2)
     case .easeInOutSine:
       return -(cos(Double.pi * x) - 1) / 2
-    case .easeOutBack: {
+    case .easeOutBack:
       let c1 = 1.70158
       let c3 = c1 + 1
       let u = x - 1
       return 1 + c3 * u * u * u + c1 * u * u
-    }
     case .cubicBezier(let x1, let y1, let x2, let y2):
       return ExtraStyleEasing.cubicBezierValue(x1: x1, y1: y1, x2: x2, y2: y2, t: x)
     }
@@ -2197,9 +2196,7 @@ final class ExtraStyleSceneRenderer {
   /// Greedy word-wrap layout for one text node. Lines carry no
   /// colour (the context supplies it at draw time).
   static func layoutText(_ content: ExtraStyleTextContent) -> ExtraStyleTextLayout {
-    guard let font = CTFontCreateWithName(content.fontPostScriptName as CFString, content.sizePoints, nil) else {
-      return ExtraStyleTextLayout(lines: [], metrics: [], totalHeight: 0, lineHeight: 0)
-    }
+    let font = CTFontCreateWithName(content.fontPostScriptName as CFString, content.sizePoints, nil)
     let leading = CTFontGetLeading(font)
     let maxWidth = content.maxWidthPoints ?? .greatestFiniteMagnitude
     // Split into words; a single unbreakable word wider than the
@@ -2273,7 +2270,7 @@ final class ExtraStyleSceneRenderer {
       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
     ) else { return nil }
     switch kind {
-    case .softCircle: {
+    case .softCircle:
       let center = CGPoint(x: size / 2, y: size / 2)
       let gradient = CGGradient(
         colorsSpace: CGColorSpaceCreateDeviceRGB(),
@@ -2291,7 +2288,6 @@ final class ExtraStyleSceneRenderer {
           options: []
         )
       }
-    }
     case .square:
       context.setFillColor(color.cgColor)
       context.fill(CGRect(x: 8, y: 8, width: size - 16, height: size - 16))
@@ -2358,7 +2354,7 @@ final class ExtraStyleSceneRenderer {
     {
       if let filter = CIFilter(name: "CIDisplacementDistortion") {
         filter.setValue(composed, forKey: kCIInputImageKey)
-        filter.setValue(map, forKey: kCIInputDisplacementImageKey)
+        filter.setValue(map, forKey: "inputDisplacementImage")
         filter.setValue(scale, forKey: kCIInputScaleKey)
         if let distorted = filter.outputImage {
           composed = distorted.cropped(to: base.extent)

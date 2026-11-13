@@ -107,7 +107,7 @@ enum ExtraStylesMetalSpike {
         let start = CFAbsoluteTimeGetCurrent()
         if let filter = CIFilter(name: "CIDisplacementDistortion") {
           filter.setValue(black, forKey: kCIInputImageKey)
-          filter.setValue(map, forKey: kCIInputDisplacementImageKey)
+          filter.setValue(map, forKey: "inputDisplacementImage")
           filter.setValue(20, forKey: kCIInputScaleKey)
           if let output = filter.outputImage, let pixelBuffer {
             ciContext.render(output.cropped(to: black.extent), to: pixelBuffer)
