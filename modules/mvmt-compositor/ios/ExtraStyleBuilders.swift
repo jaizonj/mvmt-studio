@@ -255,7 +255,7 @@ func extraStyleFlickerTrack(
 
 /// Width of one string at a font/size (CTLine typographic width).
 func extraStyleTextWidth(_ text: String, fontPostScriptName: String, sizePoints: CGFloat) -> CGFloat {
-  guard let font = CTFontCreateWithName(fontPostScriptName as CFString, sizePoints, nil) else { return 0 }
+  let font = CTFontCreateWithName(fontPostScriptName as CFString, sizePoints, nil)
   let attributed = NSAttributedString(
     string: text, attributes: [NSAttributedString.Key.font: font]
   )
