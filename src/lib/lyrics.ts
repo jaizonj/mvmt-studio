@@ -258,6 +258,30 @@ function cleanLyricText(text: string): string {
   return respellLyricProfanity(stripWhisperBracketTokens(text)).replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Whisper's descriptive annotations — [music], [upbeat music],
+ * [instrumental], [applause], [laughter], [silence]: the model
+ * describing the audio instead of transcribing it (Jaizon's case:
+ * a whole 30-second span came back as "[upbeat music]" lines).
+ * Unlike the [_BEG_] special-token family these carry real words,
+ * so cleanLyricText can't strip them — they must be dropped as
+ * whole annotations. Checked on CLEANED text, so a [_BEG_] /
+ * [_TT_n] token (already stripped) never matches here.
+ */
+function isDescriptiveAnnotation(text: string): boolean {
+  return /^\[.*\]$/.test(text.trim());
+}
+
+/** A word that is (part of) a bracketed annotation — it opens `[`,
+ *  closes `]`, or is a whole `[…]` on its own. Checked AFTER
+ *  cleanLyricText, so a word carrying a glued [_BEG_]/[_TT_n]
+ *  special token (already stripped — "me?[_TT_500]" → "me?") is
+ *  never mistaken for one. Real lyric words never carry brackets,
+ *  so dropping these can never eat a sung word. */
+function isAnnotationWord(text: string): boolean {
+  return text.includes('[') || text.includes(']');
+}
+
 // ---- Lyric intelligence (Styles Redesign Stage 2) -----------------
 // Deterministic, computed ONCE at Detect time (and re-computed on
 // manual line edits), then STORED on the line (LyricLine.decor).
@@ -469,7 +493,10 @@ export function cleanDetectedLyrics(lines: LyricLine[]): LyricLine[] {
       const words: LyricWord[] = [];
       for (const word of line.words) {
         const text = cleanLyricText(word.text);
-        if (text.length === 0) {
+        // Annotation words ([upbeat, music]) are the model
+        // describing the audio, not singing it — drop them like
+        // emptied words, so they can never form a line.
+        if (text.length === 0 || isAnnotationWord(text)) {
           changed = true;
           continue;
         }
@@ -482,8 +509,15 @@ export function cleanDetectedLyrics(lines: LyricLine[]): LyricLine[] {
       next = changed ? { ...line, text, words } : line;
     } else {
       const text = cleanLyricText(line.text);
-      if (text.length === 0) continue;
-      next = text === line.text ? line : { ...line, text };
+      // A whole-annotation line ([upbeat music]) is junk, not a
+      // lyric; a mixed line keeps only its real words.
+      if (text.length === 0 || isDescriptiveAnnotation(text)) continue;
+      const kept = text
+        .split(' ')
+        .filter((t) => !isAnnotationWord(t))
+        .join(' ');
+      if (kept.length === 0) continue;
+      next = kept === line.text ? line : { ...line, text: kept };
     }
     const prev = cleaned[cleaned.length - 1];
     if (prev && normalizeLineTextForDedup(prev.text) === normalizeLineTextForDedup(next.text)) {
@@ -494,6 +528,27 @@ export function cleanDetectedLyrics(lines: LyricLine[]): LyricLine[] {
     cleaned.push(ensureLineDecor(next));
   }
   return cleaned;
+}
+
+/**
+ * True when at least one line carries a real (non-annotation)
+ * word. The song library's guard: a detection that yields no real
+ * words must never be written to the library, or one bad detection
+ * would poison the song for every future project. Timed words win
+ * when present; a wordless line is judged on its text tokens. A
+ * word counts as real once cleanLyricText leaves it non-empty and
+ * bracket-free — so a glued [_TT_n] token ("me?[_TT_500]") still
+ * counts, while "[upbeat" / "music]" / "[music]" never do.
+ */
+export function lyricLinesHaveRealWords(lines: LyricLine[]): boolean {
+  return lines.some((line) => {
+    const tokens =
+      line.words && line.words.length > 0 ? line.words.map((w) => w.text) : line.text.split(/\s+/);
+    return tokens.some((t) => {
+      const text = cleanLyricText(t);
+      return text.length > 0 && !isAnnotationWord(text);
+    });
+  });
 }
 
 function lineFromWords(words: TimedWord[], fps: number): LyricLine {
@@ -519,21 +574,36 @@ export function groupWhisperSegments(segments: WhisperSegment[], fps: number): L
   const lines: LyricLine[] = [];
   const ordered = [...segments].sort((a, b) => a.startSeconds - b.startSeconds);
   for (const segment of ordered) {
+    // A segment that IS a descriptive annotation ([music],
+    // [upbeat music], …) is the model describing the audio, not
+    // transcribing it — drop it whole, before its words can fall
+    // through to the no-words path below and become a line.
+    if (isDescriptiveAnnotation(cleanLyricText(segment.text))) continue;
     // Sanitize at import: bracket tokens are stripped from every
     // word (and the segment text below) and emptied words drop out
     // before grouping, so junk can never form a line of its own.
+    // Annotation words ([upbeat, music]) drop out the same way.
     const words = (segment.words ?? [])
       .map((w) => ({ text: cleanLyricText(w.text), startSeconds: w.startSeconds, endSeconds: w.endSeconds }))
-      .filter((w) => w.text.length > 0)
+      .filter((w) => w.text.length > 0 && !isAnnotationWord(w.text))
       .sort((a, b) => a.startSeconds - b.startSeconds);
     if (words.length === 0) {
+      // Belt and braces with the segment-level skip above: an
+      // annotation whose words were all dropped lands here, and
+      // a mixed text keeps only its real words.
       const text = cleanLyricText(segment.text);
-      if (text.length > 0) {
+      const kept = text
+        .split(' ')
+        .filter((t) => !isAnnotationWord(t))
+        .join(' ');
+      // (kept can never be a whole annotation — every bracket
+      // token was just filtered out — so no annotation check here.)
+      if (kept.length > 0) {
         const startFrame = secondsToFrames(segment.startSeconds, fps);
         lines.push(
           refreshLineDecor({
             id: newLyricLineId(),
-            text,
+            text: kept,
             startFrame,
             endFrame: Math.max(secondsToFrames(segment.endSeconds, fps), startFrame + 1),
           }),

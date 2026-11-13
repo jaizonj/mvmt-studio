@@ -11,6 +11,7 @@ const assert = require('node:assert/strict');
 const {
   groupWhisperSegments,
   cleanDetectedLyrics,
+  lyricLinesHaveRealWords,
   respellLyricProfanity,
   songFrameToTimelineFrame,
   timelineFrameToSongFrame,
@@ -307,6 +308,131 @@ test('cleanup: a bracket token glued to a word is stripped, the word stays', () 
   assert.equal(lines.length, 1);
   assert.equal(lines[0].text, 'Hello, see me?');
   assert.equal(lines[0].words[2].text, 'me?');
+});
+
+// ---- Descriptive annotations ([music], [upbeat music], …) --------------
+// Whisper sometimes describes the audio instead of transcribing it;
+// those annotations must never become lyric lines (Jaizon's case: a
+// whole 30-second span came back as "[upbeat music]" lines, each
+// stamped with 🎵 because "music" is in the emoji dictionary).
+
+test('cleanup: a whole-annotation segment produces no line at all', () => {
+  const lines = groupWhisperSegments(
+    [{ text: '[upbeat music]', startSeconds: 0, endSeconds: 30, words: [] }],
+    FPS,
+  );
+  assert.equal(lines.length, 0);
+});
+
+test('cleanup: annotation words produce no line at all', () => {
+  const lines = groupWhisperSegments(
+    [seg([['[upbeat', 0, 0.5], ['music]', 0.5, 1]])],
+    FPS,
+  );
+  assert.equal(lines.length, 0);
+});
+
+test('cleanup: a segment mixing annotation + real words keeps only the real words', () => {
+  const lines = groupWhisperSegments(
+    [
+      seg([
+        ['[upbeat', 0, 0.5],
+        ['music]', 0.5, 1],
+        ['play', 1, 1.4],
+        ['that', 1.4, 1.8],
+        ['music', 1.8, 2.2],
+        ['loud', 2.2, 2.6],
+      ]),
+    ],
+    FPS,
+  );
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].text, 'play that music loud');
+  assert.equal(lines[0].decor?.emoji, '🎵');
+});
+
+test('cleanup: annotation variants [music], [applause], [instrumental] are dropped', () => {
+  for (const annotation of ['[music]', '[applause]', '[instrumental]']) {
+    const wordless = groupWhisperSegments(
+      [{ text: annotation, startSeconds: 0, endSeconds: 5, words: [] }],
+      FPS,
+    );
+    assert.equal(wordless.length, 0, annotation);
+    const worded = groupWhisperSegments([seg([[annotation, 0, 1]])], FPS);
+    assert.equal(worded.length, 0, annotation);
+  }
+});
+
+test('cleanup: a real line containing "music" is kept, with 🎵', () => {
+  const lines = groupWhisperSegments(
+    [seg([['play', 0, 0.4], ['that', 0.4, 0.8], ['music', 0.8, 1.2], ['loud', 1.2, 1.6]])],
+    FPS,
+  );
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].text, 'play that music loud');
+  assert.equal(lines[0].decor?.emoji, '🎵');
+});
+
+test('cleanup: cleanDetectedLyrics drops saved annotation lines on hydration', () => {
+  const line = (id, text, s, words) => ({
+    id,
+    text,
+    startFrame: s,
+    endFrame: s + 30,
+    ...(words ? { words } : {}),
+  });
+  const saved = [
+    line('a', '[upbeat music]', 0, [
+      { text: '[upbeat', startFrame: 0, endFrame: 15 },
+      { text: 'music]', startFrame: 15, endFrame: 30 },
+    ]),
+    line('b', '[music]', 30),
+    line('c', 'play that music loud', 60, [
+      { text: 'play', startFrame: 60, endFrame: 70 },
+      { text: 'that', startFrame: 70, endFrame: 80 },
+      { text: 'music', startFrame: 80, endFrame: 90 },
+      { text: 'loud', startFrame: 90, endFrame: 100 },
+    ]),
+  ];
+  const cleaned = cleanDetectedLyrics(saved);
+  assert.equal(cleaned.length, 1);
+  assert.equal(cleaned[0].text, 'play that music loud');
+  assert.equal(cleaned[0].decor?.emoji, '🎵');
+});
+
+test('guard: lyricLinesHaveRealWords is false only for annotation-only lines', () => {
+  const line = (id, text, s, words) => ({
+    id,
+    text,
+    startFrame: s,
+    endFrame: s + 30,
+    ...(words ? { words } : {}),
+  });
+  // Annotation-only, worded and wordless: no real words.
+  assert.equal(
+    lyricLinesHaveRealWords([
+      line('a', '[upbeat music]', 0, [
+        { text: '[upbeat', startFrame: 0, endFrame: 15 },
+        { text: 'music]', startFrame: 15, endFrame: 30 },
+      ]),
+      line('b', '[music]', 30),
+    ]),
+    false,
+  );
+  assert.equal(lyricLinesHaveRealWords([]), false);
+  // A real line — worded, wordless, or carrying a glued [_TT_n]
+  // token — counts, even beside an annotation line.
+  assert.equal(lyricLinesHaveRealWords([line('c', 'play that music loud', 60)]), true);
+  assert.equal(
+    lyricLinesHaveRealWords([line('a', '[upbeat music]', 0), line('c', 'play that music loud', 60)]),
+    true,
+  );
+  assert.equal(
+    lyricLinesHaveRealWords([
+      line('d', 'me?[_TT_500]', 90, [{ text: 'me?[_TT_500]', startFrame: 90, endFrame: 120 }]),
+    ]),
+    true,
+  );
 });
 
 test('cleanup: back-to-back identical lines collapse to the first (echo repeats)', () => {

@@ -544,7 +544,14 @@ export function LyricsPanel({
         const segments = await transcribe(track.uri, setProgress);
         const grouped = groupWhisperSegments(segments, DEFAULT_FPS);
         if (grouped.length === 0) {
-          studio.setLyrics({ lines: [], style: style ?? defaultLyricStyle() });
+          // A detection with no real words — annotations only, or
+          // nothing at all — is not a result: save nothing, so it
+          // can never wipe the lines the project already has. The
+          // empty lyrics object is only set for a first detection
+          // (no lines yet), where there is nothing to keep.
+          if (lines.length === 0) {
+            studio.setLyrics({ lines: [], style: style ?? defaultLyricStyle() });
+          }
           setError('No lyrics were detected in this song — you can add lines by hand below.');
           return;
         }

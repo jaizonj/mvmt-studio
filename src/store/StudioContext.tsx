@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { warmUpEqSong } from '../lib/autoEq';
 import type { Edl } from '../lib/edl';
 import { effectiveLook } from '../lib/looks';
-import { cleanDetectedLyrics, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
+import { cleanDetectedLyrics, lyricLinesHaveRealWords, respellLyricProfanity, retimeLineWordsForText, shiftLyricLines, sortLyricLines } from '../lib/lyrics';
 import { lyricTemplateById } from '../lib/lyricTemplates';
 import { resolveMixMasterStageSettings, type MixMasterStageSettings } from '../lib/mixMasterCurve';
 import {
@@ -612,7 +612,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       const sorted = next ? { ...next, lines: sortLyricLines(next.lines) } : null;
       patchActiveProject({ lyrics: sorted ?? undefined });
       const track = activeProjectRef.current?.track;
-      if (sorted && sorted.lines.length > 0 && track) {
+      // The library only ever stores lyrics with real words: an
+      // annotation-only result ([upbeat music], …) must never
+      // overwrite the song's good saved lyrics for future
+      // projects. The project itself still updates above — this
+      // guards only the library write.
+      if (sorted && sorted.lines.length > 0 && track && lyricLinesHaveRealWords(sorted.lines)) {
         setSongLibrary((current) => {
           const existing = findSongLibraryEntry(current, track.name, track.durationSeconds);
           if (

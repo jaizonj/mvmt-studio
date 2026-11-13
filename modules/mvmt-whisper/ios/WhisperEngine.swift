@@ -124,7 +124,17 @@ final class WhisperEngine {
   private func runWhisperLocked(samples: [Float], modelPath: String) throws -> WhisperTranscription {
     let ctx = try loadContextLocked(modelPath: modelPath)
 
-    var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+    // Beam search with temperature fallback (Jaizon's case: greedy
+    // decoding at temperature 0 emitted "[upbeat music]" descriptive
+    // annotations instead of transcribing the vocals). Beam search
+    // keeps several hypotheses alive instead of committing to the
+    // first token, and temperature_inc retries a failed window at
+    // higher temperatures instead of giving up on it.
+    // suppress_nst blocks non-speech tokens from being emitted at
+    // all. Language stays "auto"; everything else unchanged.
+    var params = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH)
+    params.temperature_inc = 0.2
+    params.suppress_nst = true
     params.n_threads = Int32(min(4, max(1, ProcessInfo.processInfo.activeProcessorCount)))
     params.translate = false
     params.print_special = false
