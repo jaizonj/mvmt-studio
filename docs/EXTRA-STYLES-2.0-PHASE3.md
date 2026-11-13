@@ -288,6 +288,93 @@ Integration deviations:
   does NOT export `prepare` / `cardPreviews` / `sampleClip` /
   `useExtraStyleScene` (they pull in the native bridge).
 
+Additional engine limits from the category builders' full reports
+(all verified against the engine source, not assumed):
+
+- **Typography**: loop `periodParamId` reads only numeric *params*,
+  never automation — tempo/loudness can only drive loop speed by
+  baking it into `periodFrames` at build time (Tunnel) or via
+  reaction-track amplitude (Liquid). A live loudness-driven loop
+  period needs an engine change. Shape stroke colours and
+  gradient-stop alphas have no live param binding (stroke is baked;
+  `fillColorParamId` re-resolves to alpha 1), so accent-colour
+  changes on rings/strokes/blobs need a rebuild. Displacement nodes
+  distort the whole composed frame (video included), not just the
+  text — Liquid's warp is deliberately modest (scale 0–12,
+  toggleable) but Phase 4 should confirm on-device it reads as
+  "liquid" rather than a video defect. True fluid morph is not
+  expressible — stretch/merge is keyframed scale + position.
+  Judgement call: Typography Explosion uses a single strongest
+  accent per line (chars stagger 2 frames after it), not one
+  explosion per onset peak.
+- **Music**: path amplitude can't be modulated per frame — a baked
+  path's points are static, so Soundwave layers three baked
+  amplitude variants crossfaded by loudness instead of one morphing
+  wave. Scale tracks are uniform — bars widen as they grow and
+  "stretch" is a uniform scale pulse, not a true vertical stretch.
+  `paramScale` multiplies the whole evaluated value, so it is unsafe
+  on scale reaction tracks with base 1 (it would shrink nodes to
+  the param's fraction) — scale sensitivities are baked into
+  reaction gains at build time, with those params in
+  `rebuildParamIds`; `paramScale` is used only on opacity tracks.
+  Emitter rate has no reaction binding (only `rateParamId`) —
+  audio-driven density is expressed with layered emitters whose
+  opacity tracks are audio reactions. Rhythm Typography's syllable
+  split is a vowel-group heuristic by design, never phonetic. Audio
+  Energy World's displacement scale (8–28, frequency 3) is
+  extrapolated from the Metal spike's `baseScale: 20` and needs a
+  device eyeball.
+- **Digital**: VR face tracking does NOT use `extraStyleFaceBoxTracks`
+  — the helper emits no keys for no-face samples and returns no
+  tracks at all when there are no faces, which would strand a
+  (0,0)-based panel at the top-left. A local `vrFaceTracks` sampler
+  falls back to canvas centre (upper-middle, y = 0.30H — a guess to
+  check against real face-box heights) for any sample with no face
+  box. VR perspective panels are near-full-frame trapezoids, not
+  small floating cards: the engine warps a perspective group's
+  entire full-canvas raster into its corner quad, so a small panel's
+  quad would compress the whole raster. Waveform draw progress is
+  faked via per-segment `visibleRange` reveal (no path trim).
+  Animated perspective corners don't exist (warp quad static;
+  movement via scale/position tracks). Mask animation doesn't exist
+  (slice bands baked at build time). Data Visualization bar mapping:
+  bar *i* reads band `i * bandCount / barCount` — with the default
+  8 bars / 10 bands the top two bands are unused (consider a
+  log-spaced band pick).
+- **Experimental A**: Surveillance box size is fixed (0.34W × 0.19H)
+  — no track resizes a node from the face-box size, so a near/far
+  subject gets the same box. Face tracking uses the engine's 2 fps
+  nearest-sample boxes, so the box holds between samples. A
+  displacement node's scale can only be modulated via a scale track
+  (onset reaction in Glitch, slow loop in VHS) — no per-frame
+  displacement-map control. Self-caught fixes: `override var
+  rebuildParamIds` is invalid for a protocol conformance (plain
+  `var`, matching sibling files); `extraStyleTextNode` takes no
+  `blendMode` (VHS ghost copy is a direct `ExtraStyleNode`).
+- **Cinematic**: Parallel Worlds mirrored text renders reversed
+  (mirror-writing) in the cool tint, mirrored in position across
+  the centre line — a true horizontal glyph flip is not expressible
+  (uniform scale). Split wipe via mask keyframes is not expressible
+  (masks are static on a node; no track animates them) — the wipe is
+  a sweeping divider bar + opacity crossfade. Displacement scale
+  units are uncalibrated (no reference for what `baseScale` looks
+  like visually); the spike values (6 + 34×distortion, ×1.6 at
+  switches) are reasoned guesses for the device test. Memory
+  Fragments face avoidance is optional/defensive: `maskIndex` read
+  only when present, frame pushed clear only when it would actually
+  overlap a face box.
+- **Design**: self-caught fix — the Neon halo gradient node must sit
+  at the canvas centre (not the sign centre) because its rect is the
+  full canvas in local space.
+- **Experimental B**: displacement scale tracks override `baseScale`
+  — a reaction track's value is `base + gain × reaction`, ignoring
+  the node's baked `baseScale` except as the fallback. Reality
+  Distortion therefore bakes `waveScale` into the reaction's
+  base/gain and lists `waveScale`/`waveFrequency` as rebuild params.
+  A gradient *mask* fade was unavailable (masks clip, they don't
+  fade), so the Mirror wash darkens rather than alpha-fading the
+  copy.
+
 Lint fixes made during the gate (all in Phase 3 files):
 - `react-hooks/set-state-in-effect` (4 errors): slider sync and
   card-expand sync moved to render-time adjustment; the hook's
@@ -346,6 +433,15 @@ Lint fixes made during the gate (all in Phase 3 files):
   Mirror World / Neon reflection (both fake it with faded copies).
 - Per-take mask switching (Phase 3 uses the cut's first take for
   masks); real performance sample clip replacing the generated one.
+- Face-box-driven node **sizing** (Surveillance box/ring scaling to
+  the detected face-box size) — needs an engine track kind or a
+  mask-size input; per-frame displacement-map animation (currently
+  only base scale/frequency settable at build time); animated
+  perspective corners and mask-offset tracks (Digital); live
+  loudness-driven loop period and live stroke/gradient-stop colour
+  binding (Typography); independent x/y scale (Music bars, Rhythm
+  stretch); a step/hold easing and a true blur/glow node property
+  (Design); a gradient/alpha-fade mask (Experimental B).
 - Card-preview budget measurement (540×960 @ 15fps is a Phase 4
   device decision); parallel-worlds mirrored-footage second video
   layer (deferred from this phase).
