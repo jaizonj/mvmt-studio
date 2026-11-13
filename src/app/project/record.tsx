@@ -362,19 +362,45 @@ export default function CameraScreen() {
 
 
   // Track playback — the sync master clock for takes.
-  const player = useAudioPlayer(track?.uri ?? null);
+  //
+  // keepAudioSessionActive is LOAD-BEARING on every player on this
+  // screen (Jaizon, 2026-11-13: the countdown "still bugs every
+  // other take" — the 2026-11-10 audio-mode-flip removal did NOT fix
+  // it). Why: expo-audio 58 deactivates the SHARED AVAudioSession
+  // 100ms after any of its players finishes or pauses
+  // (onPlaybackComplete / pause → deactivateSession), and its
+  // "is the session in use" check consults ONLY expo-audio's own
+  // registry — the native capture module's song player and
+  // AVCaptureSession are invisible to it. With the default false,
+  // every countdown cue schedules a setActive(false): the 'go' cue
+  // fires at the exact moment a take starts and finishes 0.22s in,
+  // so the deactivation lands ~0.3s into EVERY countdown take,
+  // silencing the song / disrupting the mic right under the native
+  // capture — while setAudioModeAsync in beginRecording only sets
+  // the category and never re-activates the session, and the native
+  // module deliberately never touches AVAudioSession. With true,
+  // each player registers as a session activity keeper on play and
+  // expo-audio can never deactivate the session while this screen
+  // is mounted; on unmount the players release and normal
+  // deactivation resumes. Do NOT remove this option.
+  const player = useAudioPlayer(track?.uri ?? null, { keepAudioSessionActive: true });
   const playerStatus = useAudioPlayerStatus(player);
 
   // Timer/count-in sounds (Jaizon asked for audible cues): a short beep
   // for each camera-timer second, a click for each count-in beat, and a
   // higher "go" tone the moment recording actually starts.
-  const beepPlayer = useAudioPlayer(require('../../../assets/sounds/beep.wav'));
-  const clickPlayer = useAudioPlayer(require('../../../assets/sounds/click.wav'));
-  const goPlayer = useAudioPlayer(require('../../../assets/sounds/go.wav'));
-  const playCue = useCallback((which: 'beep' | 'click' | 'go') => {
+  const beepPlayer = useAudioPlayer(require('../../../assets/sounds/beep.wav'), { keepAudioSessionActive: true });
+  const clickPlayer = useAudioPlayer(require('../../../assets/sounds/click.wav'), { keepAudioSessionActive: true });
+  const goPlayer = useAudioPlayer(require('../../../assets/sounds/go.wav'), { keepAudioSessionActive: true });
+  const playCue = useCallback(async (which: 'beep' | 'click' | 'go') => {
     const p = which === 'beep' ? beepPlayer : which === 'click' ? clickPlayer : goPlayer;
     try {
-      void p.seekTo(0);
+      // Await the seek: the old fire-and-forget seekTo raced play(),
+      // so on some takes play() ran while the cue player still sat at
+      // its previous END position and the cue completed instantly
+      // (never sounding) — one more source of every-other-take
+      // nondeterminism in this path.
+      await p.seekTo(0);
       p.play();
     } catch {
       /* cue sounds are best-effort */
@@ -1051,7 +1077,7 @@ export default function CameraScreen() {
     }
     if (timerWasUsedRef.current) {
       timerWasUsedRef.current = false;
-      playCue('go');
+      void playCue('go');
     }
 
     // LOCKED recording length — second attempt (Jaizon's device test:
@@ -1210,7 +1236,7 @@ export default function CameraScreen() {
     timerWasUsedRef.current = true;
     let remaining = countInBeats;
     setCountIn(remaining);
-    playCue('click');
+    void playCue('click');
     countInTimerRef.current = setInterval(() => {
       remaining -= 1;
       if (remaining <= 0) {
@@ -1219,7 +1245,7 @@ export default function CameraScreen() {
         void beginRecording();
       } else {
         setCountIn(remaining);
-        playCue('click');
+        void playCue('click');
       }
     }, 500);
   }, [beginRecording, countInBeats, playCue]);
@@ -1244,7 +1270,7 @@ export default function CameraScreen() {
     // already active, so there is nothing for the countdown to set.
     let remaining = countdown;
     setCountingDown(remaining);
-    playCue('beep');
+    void playCue('beep');
     countdownTimerRef.current = setInterval(() => {
       remaining -= 1;
       if (remaining <= 0) {
@@ -1253,7 +1279,7 @@ export default function CameraScreen() {
         beginCountIn();
       } else {
         setCountingDown(remaining);
-        playCue('beep');
+        void playCue('beep');
       }
     }, 1000);
   }, [beginCountIn, countdown, playCue]);
